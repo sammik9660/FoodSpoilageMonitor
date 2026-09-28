@@ -23,7 +23,7 @@
 // ============================================================
 
 const char* GOOGLE_SCRIPT_URL =
-  "https://script.google.com/macros/s/AKfycbzCdFmBCyBp6oqUBu2DwYQwwJa3JCJpgfH0AIgbM99_OmwLERKe13K20F_7zehVV0mq/exec";
+  "https://script.google.com/macros/s/AKfycbyrDRFYcw6KKLK2fae04ZW1nxsuBVlW9LuAaUawLq3Cxim1Qri7uZe5AEzsPwf3txLd/exec";
 
 
 // ============================================================

@@ -65,6 +65,7 @@ void initBME688()
   Serial.println("BME688 초기화 시작...");
 
   // nRF52840 I2C
+  Wire.setPins(21, 20);
   Wire.begin();
 
   // 0x76 먼저 시도
