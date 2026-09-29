@@ -1,270 +1,140 @@
 #include <bluefruit.h>
 #include <Wire.h>
-#include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
+#include <math.h>
 
-// ============================================================
-// [설정]
-// ============================================================
-
-#define DEVICE_NAME "BME688-NRF"
-
-// nice!nano 계열 기본 I2C 핀-중요!! 반드시 올바르게 연결할 것
-#define BME_SDA_PIN 31
-#define BME_SCL_PIN 29
-
-// ============================================================
-// BME688
-// ============================================================
-
-Adafruit_BME680 bme;
-
-// ============================================================
-// BLE UART (Nordic UART Service)
-// ============================================================
-
+constexpr uint8_t BME_ADDRESS = 0x76;
+constexpr uint32_t SAMPLE_INTERVAL_MS = 2000;
+constexpr uint32_t FAILURE_THRESHOLD = 3;
+constexpr uint32_t RECOVERY_MIN_MS = 5000;
+constexpr uint32_t RECOVERY_MAX_MS = 60000;
+Adafruit_BME680 bme(&Wire);  // begin(address, bool initSettings), NOT a Wire pointer.
 BLEUart bleuart;
+uint32_t bootId, validSequence = 0, failures = 0, consecutiveFailures = 0;
+uint32_t recoveryAttempts = 0, recoveries = 0, txErrors = 0;
+uint32_t nextMeasurement = 0, nextRecovery = 0, lastHealth = 0;
+uint32_t recoveryDelay = RECOVERY_MIN_MS;
+bool sensorReady = false, recoveryPending = false, lastReadOK = false;
 
-// ============================================================
-// 센서 데이터
-// ============================================================
-
-float temperature   = 0.0;
-float humidity      = 0.0;
-float pressure      = 0.0;
-float gasResistance = 0.0;
-
-bool bmeReady = false;
-
-// ============================================================
-// BLE 연결 콜백
-// ============================================================
-
-void connect_callback(uint16_t conn_handle)
-{
-  (void)conn_handle;
-
-  Serial.println("BLE connected!");
+bool sendLine(const char* line) {
+  if (!Bluefruit.connected() || !bleuart.notifyEnabled()) return false;
+  // A delimiter before every frame also terminates a previous interrupted TX.
+  if (bleuart.write((const uint8_t*)"\n", 1) != 1) { ++txErrors; return false; }
+  const size_t len = strlen(line);
+  for (size_t i = 0; i < len; i += 20) {
+    size_t n = min((size_t)20, len - i);
+    if (bleuart.write((const uint8_t*)line + i, n) != n) {
+      ++txErrors;
+      Serial.println("ERROR BLE partial TX; sample not retried, gap remains visible");
+      return false;
+    }
+    delay(5);
+  }
+  if (bleuart.write((const uint8_t*)"\n", 1) != 1) { ++txErrors; return false; }
+  return true;
 }
 
-void disconnect_callback(uint16_t conn_handle, uint8_t reason)
-{
-  (void)conn_handle;
-  (void)reason;
-
-  Serial.println("BLE disconnected");
+void sendHealth() {
+  char line[160];
+  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u",
+           (unsigned long)bootId, (unsigned long)millis(), (unsigned long)failures,
+           (unsigned long)recoveries, (unsigned long)recoveryAttempts,
+           (unsigned long)txErrors, lastReadOK ? 1 : 0);
+  sendLine(line);
 }
 
-// ============================================================
-// BME688 초기화
-// ============================================================
-
-void initBME688()
-{
-  Serial.println();
-  Serial.println("BME688 초기화 시작...");
-
-  // nRF52840 I2C
+bool initializeSensor() {
+  // Verified Feather variant: Arduino D21 -> P0.31 SDA; D20 -> P0.29 SCL.
+  Wire.end();
   Wire.setPins(21, 20);
   Wire.begin();
-
-  // 0x76 먼저 시도
-  if (!bme.begin(0x76, &Wire))
-  {
-    Serial.println("0x76에서 BME688을 찾지 못했습니다.");
-    Serial.println("0x77 주소로 다시 시도합니다...");
-
-    if (!bme.begin(0x77, &Wire))
-    {
-      Serial.println("BME688 연결 실패!");
-      Serial.println("I2C 배선 / 포고핀 접촉 / 주소를 확인하세요.");
-
-      bmeReady = false;
-      return;
-    }
-  }
-
-  Serial.println("BME688 연결 성공!");
-
-  // ----------------------------------------------------------
-  // 측정 설정
-  // ESP32에서 정상 동작 확인했던 설정을 그대로 사용
-  // ----------------------------------------------------------
-
-  bme.setTemperatureOversampling(BME680_OS_8X);
-  bme.setHumidityOversampling(BME680_OS_2X);
-  bme.setPressureOversampling(BME680_OS_4X);
-
-  bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-
-  // 가스 측정
-  bme.setGasHeater(320, 150);
-
-  bmeReady = true;
-
-  Serial.println("BME688 설정 완료!");
+  Wire.beginTransmission(BME_ADDRESS);
+  if (Wire.endTransmission() != 0) return false;
+  Wire.beginTransmission(BME_ADDRESS);
+  Wire.write(0xE0); Wire.write(0xB6);  // BME68x soft reset, verified diagnostic sequence.
+  if (Wire.endTransmission() != 0) return false;
+  delay(20);
+  return bme.begin(BME_ADDRESS, false) &&
+         bme.setTemperatureOversampling(BME680_OS_8X) &&
+         bme.setHumidityOversampling(BME680_OS_2X) &&
+         bme.setPressureOversampling(BME680_OS_4X) &&
+         bme.setIIRFilterSize(BME680_FILTER_SIZE_3) &&
+         bme.setGasHeater(320, 150);
 }
 
-// ============================================================
-// SETUP
-// ============================================================
+void recoverSensor() {
+  // DATA INTEGRITY: persistent read failures occurred on 2026-09-28 and reset/
+  // reinitialization restored operation. Keep recovery AND backoff, even if
+  // ordinary tests pass. A successful begin is not yet a successful recovery.
+  ++recoveryAttempts;
+  sensorReady = initializeSensor();
+  recoveryPending = true;
+  lastReadOK = false;
+  nextRecovery = millis() + recoveryDelay;
+  recoveryDelay = min(recoveryDelay * 2, RECOVERY_MAX_MS);
+  Serial.print("RECOVERY init="); Serial.print(sensorReady);
+  Serial.print(" attempts="); Serial.println(recoveryAttempts);
+  nextMeasurement = millis();
+}
 
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  delay(1000);
-
-  Serial.println();
-  Serial.println("================================");
-  Serial.println("nRF52840 BME688 BLE Sensor");
-  Serial.println("================================");
-
-  // ----------------------------------------------------------
-  // BME688 초기화
-  // ----------------------------------------------------------
-
-  initBME688();
-
-  // ----------------------------------------------------------
-  // BLE 초기화
-  // ----------------------------------------------------------
-
   Bluefruit.begin();
-
   Bluefruit.setTxPower(4);
-  Bluefruit.setName(DEVICE_NAME);
-
-  Bluefruit.Periph.setConnectCallback(connect_callback);
-  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
-
+  Bluefruit.setName("BME688-NRF");
+  Bluefruit.autoConnLed(false);
+  bootId = NRF_FICR->DEVICEID[0] ^ micros();
+  // SoftDevice RNG supplies a boot discriminator; gateway UID is cloud identity.
+  for (uint8_t i = 0; i < 20; ++i) {
+    if (sd_rand_application_vector_get((uint8_t*)&bootId, sizeof(bootId)) == NRF_SUCCESS) break;
+    delay(5);
+  }
   bleuart.begin();
-
   Bluefruit.Advertising.addService(bleuart);
   Bluefruit.Advertising.addName();
-
   Bluefruit.Advertising.restartOnDisconnect(true);
-
   Bluefruit.Advertising.setInterval(32, 244);
   Bluefruit.Advertising.setFastTimeout(30);
-
   Bluefruit.Advertising.start(0);
-
-  Serial.println("BLE advertising started!");
-  Serial.print("Device name: ");
-  Serial.println(DEVICE_NAME);
-
-  if (bmeReady)
-  {
-    Serial.println("BME688 ready!");
-  }
-  else
-  {
-    Serial.println("BME688 unavailable - BLE only mode");
-  }
+  Serial.println("BOOT reliability-v2; 0x76; D21/D20; heater 320C/150ms");
+  recoverSensor();
 }
 
-// ============================================================
-// LOOP
-// ============================================================
-
-void loop()
-{
-  // ----------------------------------------------------------
-  // BME688 실제 측정
-  // ----------------------------------------------------------
-
-  if (bmeReady)
-  {
-    if (bme.performReading())
-    {
-      temperature   = bme.temperature;
-      humidity      = bme.humidity;
-      pressure      = bme.pressure / 100.0;
-      gasResistance = bme.gas_resistance / 1000.0;
-
-      Serial.println("========================");
-      Serial.print("온도: ");
-      Serial.print(temperature);
-      Serial.println(" °C");
-
-      Serial.print("습도: ");
-      Serial.print(humidity);
-      Serial.println(" %");
-
-      Serial.print("압력: ");
-      Serial.print(pressure);
-      Serial.println(" hPa");
-
-      Serial.print("가스 저항: ");
-      Serial.print(gasResistance);
-      Serial.println(" kOhms");
-
-      Serial.println("========================");
-    }
-    else
-    {
-      Serial.println("BME688 측정 실패!");
-    }
+void loop() {
+  const uint32_t now = millis();
+  if (now - lastHealth >= 10000) { lastHealth = now; sendHealth(); }
+  if (!sensorReady) {
+    if ((int32_t)(now - nextRecovery) >= 0) recoverSensor();
+    delay(10);
+    return;
   }
-
-  // ----------------------------------------------------------
-  // 데이터 문자열 생성
-  // ESP32 기존 parser와 동일한 형식 유지
-  // ----------------------------------------------------------
-
-  char data[128];
-
-  snprintf(
-    data,
-    sizeof(data),
-    "T=%.2f,H=%.2f,P=%.2f,G=%.2f",
-    temperature,
-    humidity,
-    pressure,
-    gasResistance
-  );
-
-  // ----------------------------------------------------------
-  // BLE 전송
-  // ----------------------------------------------------------
-
-  if (Bluefruit.connected())
-  {
-    /*
-      20바이트를 넘는 데이터를 직접 분할 전송.
-      기존 ESP32 코드의 parser와 호환되는 방식.
-    */
-
-    size_t len = strlen(data);
-
-    for (size_t i = 0; i < len; i += 20)
-    {
-      size_t chunkSize = min(
-        (size_t)20,
-        len - i
-      );
-
-      bleuart.write(
-        (uint8_t*)&data[i],
-        chunkSize
-      );
-
-      delay(5);
+  if ((int32_t)(now - nextMeasurement) < 0) { delay(5); return; }
+  nextMeasurement = now + SAMPLE_INTERVAL_MS;  // no catch-up burst after a delay
+  const bool readOK = bme.performReading();
+  const bool finiteValues = readOK && isfinite(bme.temperature) && isfinite(bme.humidity) &&
+                            isfinite(bme.pressure) && isfinite((double)bme.gas_resistance);
+  if (!finiteValues) {
+    // DATA INTEGRITY: failed reads leave previous T/H/P/G in memory. The real
+    // 2026-09-28 incident produced stale rows. A failed read is a missing sample:
+    // no sensor frame, no valid-sequence increment, only diagnostics/recovery.
+    ++failures; ++consecutiveFailures; lastReadOK = false;
+    Serial.print("SENSOR ERROR missing sample; failures="); Serial.println(failures);
+    if (consecutiveFailures >= FAILURE_THRESHOLD) {
+      sensorReady = false;
+      // nextRecovery was set by the previous attempt; never reset every 2 s.
+      if ((int32_t)(millis() - nextRecovery) >= 0) recoverSensor();
     }
-
-    // 한 줄의 끝
-    bleuart.write(
-      (uint8_t*)"\r\n",
-      2
-    );
-
-    Serial.print("TX: ");
-    Serial.println(data);
+    sendHealth();
+    return;
   }
-  else
-  {
-    Serial.println("Waiting for BLE connection...");
-  }
-
-  delay(2000);
+  consecutiveFailures = 0;
+  lastReadOK = true;
+  recoveryDelay = RECOVERY_MIN_MS;
+  if (recoveryPending) { ++recoveries; recoveryPending = false; Serial.println("RECOVERY measurement OK"); }
+  ++validSequence;
+  char frame[180];
+  snprintf(frame, sizeof(frame), "BID=%08lX,SEQ=%lu,MS=%lu,T=%.2f,H=%.2f,P=%.2f,G=%.2f",
+           (unsigned long)bootId, (unsigned long)validSequence, (unsigned long)millis(),
+           bme.temperature, bme.humidity, bme.pressure / 100.0, bme.gas_resistance / 1000.0);
+  if (sendLine(frame)) { Serial.print("TX "); Serial.println(frame); }
 }

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font:16px system-ui;background:#f3f5f6;color:#172b36;max-width:850px;margin:32px auto;padding:0 18px}
+section{background:white;padding:20px;margin:16px 0;border-radius:12px}button,a{padding:10px;display:inline-block;margin:4px}
+input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{color:#b42318}#values{font-size:22px}
+[hidden]{display:none!important}
+</style></head><body>
+<h1>Food Spoilage Monitor</h1>
+<section><strong id="state">WAITING / UNKNOWN</strong><p id="age">No confirmed sample</p><div id="values">—</div>
+<p>Values are live telemetry, not a food-safety verdict. Stale values remain labeled as stale.</p></section>
+<section><h2 id="recording">STOPPED / loading state</h2><p id="session"></p>
+<input id="label" maxlength="120" placeholder="Experiment label" aria-label="Experiment label">
+<button id="start" onclick="control(true)">Start Recording</button><button id="stop" onclick="control(false)">Stop Recording</button>
+<p id="message" role="status"></p>
+<p>CSV page: up to 10,000 source rows. Offset 0 is the first data row.</p>
+<input id="csvOffset" type="number" min="0" step="10000" value="0" aria-label="CSV source row offset" onchange="csvLinks()">
+<a id="all" href="<?= webAppUrl ?>?download=csv" target="_blank" rel="noopener">All data CSV — selected page</a>
+<a id="sessionCsv" hidden target="_blank" rel="noopener">Current session CSV</a>
+<p>Session boundaries use capture time. Delayed batches can still complete a stopped session.
+Unknown-time samples are retained in the Unassigned sheet, outside experiments.</p></section>
+<section><h2>Diagnostics</h2><pre id="health">Waiting for gateway heartbeat</pre></section>
+<script>
+const refreshMs=<?= refreshMs ?>;
+const base=document.getElementById('all').href.split('?')[0];
+let busy=false,sessionId=null;
+function csvLinks(){const offset=Number(document.getElementById('csvOffset').value);document.getElementById('all').href=base+'?download=csv&offset='+offset+'&limit=10000';document.getElementById('sessionCsv').href=base+'?download=csv&offset='+offset+'&limit=10000&session='+encodeURIComponent(sessionId||'');}
+function error(e){document.getElementById('message').textContent=String(e.message||e);document.getElementById('message').className='error';}
+function show(d){
+ document.getElementById('state').textContent=d.state;
+ document.getElementById('age').textContent=d.age===null?'Last valid sample: unknown':'Last valid sample: '+(d.age/1000).toFixed(1)+' s ago';
+ const h=d.health||{},v=h.latest;
+ document.getElementById('values').textContent=v?`${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa · ${v.g.toFixed(2)} kΩ`:'No valid sample';
+ const r=d.recording;document.getElementById('recording').textContent=r.state;
+ document.getElementById('session').textContent=r.session_id?`${r.session_id} / ${r.experiment_label}`:'No active experiment';
+ document.getElementById('start').disabled=r.state==='RECORDING';document.getElementById('stop').disabled=r.state!=='RECORDING';
+ sessionId=r.session_id;const link=document.getElementById('sessionCsv');link.hidden=!sessionId;csvLinks();
+ document.getElementById('health').textContent=JSON.stringify(h,null,2);
+}
+function poll(){if(busy)return;busy=true;google.script.run.withSuccessHandler(d=>{busy=false;show(d);}).withFailureHandler(e=>{busy=false;document.getElementById('state').textContent='CLOUD/UPLOAD ERROR (dashboard request)';error(e);}).getDashboard();}
+function control(start){
+ const runner=google.script.run.withSuccessHandler(()=>{document.getElementById('message').textContent='Recording state updated';poll();}).withFailureHandler(error);
+ if(start)runner.startRecording(document.getElementById('label').value);else runner.stopRecording();
+}
+csvLinks();setInterval(poll,refreshMs);poll();
+</script></body></html>

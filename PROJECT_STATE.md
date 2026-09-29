@@ -1,101 +1,56 @@
 # 프로젝트 현재 상태
 
-기준일: 2026-09-25. 아래 확인 결과는 사용자가 제공한 상태이며 이번 저장소 준비 작업에서 하드웨어나 클라우드를 다시 검증한 결과는 아니다.
+갱신일: 2026-09-29. reliability v2 구현 및 자동 검증을 완료했으며, 장치/클라우드 배포와 장기 운전 검증은 아직 수행하지 않았다. 기존 baseline 및 과거 리뷰 기록은 보존했다.
 
-## 아키텍처
+## 사용자 보고로 확인된 실제 하드웨어 상태
 
-```text
-BME688
-  -> nRF52840
-  -> BLE Nordic UART Service
-  -> ESP32-S3
-  -> Wi-Fi / smartphone hotspot
-  -> Google Apps Script
-  -> Google Sheets / CSV
-  -> Colab / ML
-```
+- BME688 -> nRF52840 -> BLE NUS -> ESP32-S3 -> Wi-Fi(phone hotspot) -> Apps Script -> Google Sheets end-to-end 성공.
+- V1940 Pro Micro nRF52840 / nice!nano V2 compatible clone, `Adafruit Feather nRF52840 Express` variant.
+- `Wire.setPins(21,20)`: D21 -> P0.31 SDA, D20 -> P0.29 SCL. I2C 0x76 ACK 및 register 0xD0 chip ID 0x61 확인.
+- T/H/P oversampling 8X/2X/4X, IIR 3, heater 320°C/150ms. 약 2초 측정 목표.
+- ESP32-S3: ESP32S3 Dev Module / 4MB / Huge APP (3MB No OTA / 1MB SPIFFS) / PSRAM Disabled / USB CDC On Boot Enabled / Hardware CDC and JTAG.
+- 과거 dummy BLE, fragmentation 해결, WiFiManager compile, Web UI와 Google 다중계정 접근 검증 기록은 historical reviews를 참조한다.
 
-## 현재 작업 범위
+## 2026-09-28 BME688 incident — historical note
 
-Git 초기화 전 baseline을 준비한 상태다. 기존 원본 TXT 파일은 수정·삭제하지 않고 보존하며 Git 추적 대상에서 제외한다. 아래 세 파일은 원본 내용을 바꾸지 않고 위치와 확장자만 맞춰 복사했다. 리팩터링이나 새 기능 구현은 하지 않았다.
+정상 측정은 대략 25.91°C / 50.93% / 1004.04hPa / 71.63kΩ였다. 이후 T=31.61, H=100.00, P=735.46, G=0.00으로 급변했다. `performReading()`이 반복 실패했지만 구 펌웨어는 메모리에 남은 값을 계속 전송하여 invalid rows가 Google Sheets에 도달했다.
 
-| 보존 원본 | Baseline 복사본 |
-| --- | --- |
-| `이것이 nrf쪽 개선 코드입니다..txt` | `firmware/nrf52840/bme688_node.ino` |
-| `이것이 esp32 와이파이 연결가능 코드입니다..txt` | `firmware/esp32s3/gateway.ino` |
-| `구글 시트 웹페이지용 코드입니다..txt` | `cloud/apps_script/Code.gs` |
+사용자 하드웨어 진단 결과:
 
-세 복사본의 SHA-256을 원본과 비교하여 바이트 단위 동일성을 확인했다. 컴파일·하드웨어·클라우드 실행 검증은 이번 작업에서 수행하지 않았다. `git init`, commit, push는 아직 수행하지 않았다.
+- I2C address 0x76 ACK: OK
+- BME68x chip ID 0x61: OK
+- reset/reinitialization 후 T/H/P-only 측정: 10회 정상
+- gas heater 320°C / 150ms 측정: 27회 이상 연속 정상
+- sensor hardware 손상은 확인되지 않았다. reset/reinitialization으로 동작이 복구되었다.
 
-## Baseline 기술 부채
+입증된 것은 관찰된 실패 모드와 복구 성공이다. 정확한 root cause(전원, 접촉, 센서 내부 상태 등)는 입증되지 않았다. 따라서 failed reading을 거부하고 자동 recovery/backoff를 유지해야 한다.
 
-현재 코드 상태 보존을 위해 ESP32 설정용 AP 비밀번호와 Apps Script URL은 이번 단계에서 변경하지 않았다. 값 자체는 문서에 재기록하지 않는다. `gateway.ino`는 Git 포함 예정 파일이므로 원본 TXT를 제외하더라도 복사본 안의 credential과 endpoint는 남는다.
+사용자 보고상 2026-09-28 21:34:59 이후 반복된 31.61 / 100 / 735.46 / 0 구간은 stale-data bug의 invalid data다. 이번 작업은 기존 Google Sheets 행을 삭제하거나 수정하지 않는다. 구간 확인·정리는 사용자에게 맡긴다.
 
-- ESP32 설정용 AP credential을 추후 별도 config로 분리한다. AP 이름에도 비밀번호 값이 포함된 점을 함께 처리한다.
-- Serial에 AP password를 출력하지 않도록 변경한다.
-- Apps Script endpoint를 config로 분리한다.
-- 현재 ESP32 firmware의 Apps Script endpoint와 최신 배포 endpoint가 서로 다를 가능성이 있으므로 실제 하드웨어 테스트 전에 확인한다. 파일 검사에서 firmware URL과 별도 웹페이지 URL의 배포 ID는 서로 달랐으며, 실제 최신 배포 및 연결된 저장소는 확인하지 않았다.
-- `client.setInsecure()`는 prototype 상태이며 추후 TLS 검증 방식을 검토한다.
+## 현재 구현 변경
 
-## 현재 동작 및 제약
+- nRF: 올바른 Adafruit API, 검증된 핀/주소/측정 설정 유지, 실패 시 frame/sequence 생성 금지, 연속 3회 실패 검출, soft reset+재초기화, 5~60초 backoff, 성공 측정으로 recovery 확인.
+- BLE v2: `BID=XXXXXXXX,SEQ=n,MS=n,T=...,H=...,P=...,G=...` 및 독립 STAT 진단 프레임. NUS/chunk/newline 유지.
+- ESP: strict parser/프레임 재동기화, boot UUID+receive sequence UID, 128개 RAM queue, 최대 32개 batch, 기본 10초 upload, 정확한 application ACK 이후 해제, 10~60초 retry.
+- SPIFFS: 기존 partition 사용, CRC 검증 immutable chunk, 재부팅 FIFO replay, 최대 128 chunks/동적 byte budget, ACK 이후 파일 회수. 자동 format/미전송 데이터 overwrite 없음.
+- 시간: ESP receive 시 UTC(NTP가 유효한 경우)와 uptime 보존. unknown time은 Unassigned에 저장하여 잘못된 session 배정 방지.
+- Apps Script: 기존 SPREADSHEET_ID 필수, SensorData 비파괴 12열 확장, Sessions/IngestState/Unassigned 보조 시트, lock, bulk write, write-ahead journal, boot별 high-water dedup.
+- recording 기본 STOPPED. Start/Stop [start,stop) 구간을 capture time으로 비교. legacy short/long single POST 지원(서버 시각이라는 제한 명시).
+- Dashboard: 10초 polling, freshness/오류/recording/큐 진단, absolute deployed URL의 CSV와 session filter. Dashboard.html 추가.
+- ESP 중요 로그는 USB CDC Serial과 UART Serial0에 전달. credential 출력 제거. 전력 관련 변경은 짧은 yield와 연결 LED 억제에 한정한다.
 
-| 항목 | 현재 기준 |
-| --- | --- |
-| BLE 프로토콜 | Nordic UART Service(NUS) |
-| 샘플 형식 | `T=xx.xx,H=xx.xx,P=xxxx.xx,G=xxx.xx\n` (`\n`은 실제 줄바꿈) |
-| BLE framing | 20-byte fragmentation에 대응하는 chunk + newline framing |
-| nRF 센서 측정 주기 | 약 2초 |
-| ESP32 Google 업로드 주기 | 30초 |
-| 업로드 대상 | 30초 사이 수신한 샘플 중 가장 최신 샘플 하나 |
-| BME688 기본 테스트 API | Adafruit_BME680 호환 API |
-| heater 설정 | 320°C / 150ms, 기본 센서 동작 테스트용 |
-| I2C 및 Wire 기본 핀 | 실제 보드 매핑 확인 전 추측 금지 |
-| 측정 데이터 단위 | 임의 변경 금지. 제공된 정보만으로 개별 필드의 단위는 확정하지 않음 |
+## 검증 및 한계
 
-## 확인된 사항
+실제로 수행한 빌드/자동 테스트 결과와 정확한 capacity 계산, 수동 업로드 순서는 `docs/RELIABILITY.md`에 기록한다. 이번 개선 버전을 실제 보드에 업로드하거나 Apps Script에 배포해서 E2E/장기 시험한 것은 아니다.
 
-- nRF52840 dummy BLE 송신 동작 확인
-- ESP32-S3 BLE NUS 수신 동작 확인
-- BLE 20-byte fragmentation 문제를 chunk + newline framing으로 해결
-- ESP32 Wi-Fi 동작 확인
-- WiFiManager 기반 설정 코드 컴파일 확인
-- ESP32 -> Google Apps Script 업로드를 과거에 실제 확인
-- Apps Script Web UI 동작 확인
-- Google 다중 계정 `/u/1` 접근 문제 해결
+- nRF Feather52840 빌드 성공: flash 144,764 / 815,104 bytes, static RAM 15,984 / 237,568 bytes.
+- ESP32-S3 지정 설정 빌드 성공: flash 1,428,505 / 3,145,728 bytes, static RAM 55,884 / 327,680 bytes. 태스크/큐 등 runtime heap은 이 static RAM 수치에 포함되지 않는다.
+- Code.gs/Dashboard 실제 코드에 대한 Node 모의 테스트 15개 통과. 중복, recording 경계, 저장 실패·journal 복구, legacy POST, CSV 및 UI JS 포함.
+- C++17/MSVC 테스트 3개 실행 성공: parser/framer/sequence/ACK gate, 실제 nRF 소스의 실패·복구 주입, 실제 spool의 재부팅/CRC/용량/손상 처리. 실제 전기적 장애·SPIFFS power-cut 테스트는 아니다.
 
-컴파일 확인과 과거 업로드 성공은 최신 통합 코드의 현장 실행 또는 현재 전체 파이프라인의 연속 동작 검증을 의미하지 않는다.
-
-## 아직 실제 하드웨어 및 전체 파이프라인에서 확인되지 않은 사항
-
-- BME688와 nRF52840 실제 I2C 연결
-- nRF52840 Wire 기본 SDA/SCL 핀
-- 실제 BME688 측정값의 BLE 전달
-- 최신 통합 ESP32 코드의 현장 실행
-- Google Sheets 연속 저장
-- CSV 다운로드 파이프라인
-- BME AI-Studio raw-data 수집
-
-## ESP32-S3 Arduino 설정
-
-| 설정 | 값 |
-| --- | --- |
-| Board | ESP32S3 Dev Module |
-| Flash Size | 4MB |
-| Partition Scheme | Huge APP (3MB No OTA / 1MB SPIFFS) |
-| PSRAM | Disabled |
-| USB CDC On Boot | Enabled |
-| USB Mode | Hardware CDC and JTAG |
-
-## 개발 및 ML 기준
-
-1. 동작이 확인된 코드는 필요 없이 리팩터링하지 않는다.
-2. 변경은 최소 단위로 하고 각 계층을 독립적으로 테스트한다.
-3. 습도 임계값을 음식 부패 정답(label)로 사용하지 않는다.
-4. ML train/test는 experiment/session 단위로 분리하고 인접한 시계열 샘플을 랜덤 분할하지 않는다.
-5. 단위를 임의로 변경하지 않는다.
-
-## 이후 단계와 선행 과제
-
-- ML 데이터 수집 전에 최신 샘플 하나만 업로드하는 방식을 batch/ring-buffer 방식으로 개선해야 한다. 현재는 변경하지 않는다.
-- BME AI-Studio/BSEC 및 heater-profile raw acquisition은 이후 단계다. 현재 heater 설정은 이 단계의 수집 프로파일로 확정된 설정이 아니다.
-- 미검증 항목은 해당 계층에서 실제 확인한 후 상태를 갱신한다.
+- 진단 스케치 2개, 원본 TXT, historical review, 기존 notebook은 수정하지 않았다.
+- 기존 endpoint와 AP 설정 값은 보존했다. TLS `setInsecure()`와 서버 배포 권한/Start·Stop 접근 제어는 남은 보안 부채다.
+- filesystem mount/손상 시 자동 복구로 데이터를 버리지 않고 fault 상태로 중지한다. virgin SPIFFS 최초 준비가 필요할 수 있다.
+- 실제 flash filesystem capacity/쓰기 지연, 재부팅·전원차단, RAM overflow, BLE reconnect, NTP/session 경계, CSV 다운로드는 현장 검증 필요.
+- 보드 전력과 heater 안정 상태, 정확한 실패 원인은 미검증이다. BSEC/AI-Studio raw acquisition은 이번 범위가 아니다.
+- 기존 baseline commit 90e5cc78ead2af1474672beb6b20956ad87cc9b7 및 historical review는 재작성하지 않는다.
