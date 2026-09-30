@@ -12,7 +12,7 @@ class OutageSpool {
   uint32_t count=0, files=0, nextId=1;
   size_t budget=0, bytes=0;
   bool begin() {
-    mounted=SPIFFS.begin(false);
+    mounted=SPIFFS.begin(true);
     if(!mounted) { fault=true; return false; }
     budget=SPIFFS.totalBytes()*60/100; // leave GC/metadata and other files headroom
     File root=SPIFFS.open("/");

@@ -1,8 +1,8 @@
 // Reliability v2. Existing SensorData rows and SPREADSHEET_ID are never reset.
 const UPLOAD_SCHEMA = 2;
 const MAX_BATCH = 32;
-const DASHBOARD_REFRESH_MS = 10000;
-const STALE_MS = 30000;
+const DASHBOARD_REFRESH_MS = 2000;
+const STALE_MS = 15000;
 const HEADERS = ['timestamp','temperature','humidity','pressure','gas_resistance',
   'sample_uid','session_id','nrf_seq','nrf_ms','capture_quality','received_at','nrf_boot'];
 const SESSION_HEADERS = ['session_id','experiment_label','started_at','stopped_at'];
@@ -211,9 +211,21 @@ function ingest(payload) {
 }
 function doPost(e) {
   try {
-    if(!e||!e.postData||typeof e.postData.contents!=='string'||e.postData.contents.length>64000)throw new Error('Invalid request size');
+    if (!e || !e.postData ||
+        typeof e.postData.contents !== 'string' ||
+        e.postData.contents.length > 64000) {
+      throw new Error('Invalid request size');
+    }
+
     return json(ingest(JSON.parse(e.postData.contents)));
-  } catch(error) {return json({success:false,version:2,error:String(error.message||error)});}
+
+  } catch (error) {
+    return json({
+      success: false,
+      version: 2,
+      error: String(error.message || error)
+    });
+  }
 }
 function json(v) {return ContentService.createTextOutput(JSON.stringify(v)).setMimeType(ContentService.MimeType.JSON);}
 function getDashboard() {

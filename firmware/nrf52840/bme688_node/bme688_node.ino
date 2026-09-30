@@ -1,3 +1,200 @@
+// ============================================================
+// Food Spoilage Monitor - nRF52840 + BME688 Sensor Node
+// ============================================================
+//
+// [실제 하드웨어]
+// - MCU 보드 : V1940 Pro Micro nRF52840
+//              (nice!nano V2 호환 계열 클론)
+// - 센서     : Bosch BME688
+// - 통신     : BME688 -> I2C -> nRF52840 -> BLE NUS -> ESP32-S3
+//
+// ------------------------------------------------------------
+// [Arduino IDE 보드 설정]
+// ------------------------------------------------------------
+//
+// 실제 보드는 V1940 Pro Micro nRF52840이지만,
+// 현재 프로젝트에서는 Adafruit nRF52 BSP의 아래 보드 정의를 사용한다.
+//
+//   Tools -> Board -> Adafruit nRF52 Boards
+//         -> Adafruit Feather nRF52840 Express
+//
+// ※ "Adafruit Feather nRF52840 Express"는 실제 보드명이 아니라
+//    현재 V1940 보드를 컴파일/업로드하기 위해 사용 중인 호환 타깃이다.
+//
+// ------------------------------------------------------------
+// [Adafruit nRF52 보드 패키지 설치]
+// ------------------------------------------------------------
+//
+// Arduino IDE
+//
+//   File -> Preferences
+//        -> Additional Boards Manager URLs
+//
+// 에 Adafruit nRF52 BSP 공식 Board Manager URL을 추가한다.
+// (프로젝트 문서/코드 설명에 적힌 공식 URL 참조)
+//
+// 그 다음:
+//
+//   Tools -> Board -> Boards Manager
+//
+// 검색:
+//
+//   Adafruit nRF52
+//
+// 설치:
+//
+//   "Adafruit nRF52 by Adafruit"
+//
+// 설치 후 Arduino IDE에서:
+//
+//   Adafruit Feather nRF52840 Express
+//
+// 를 선택한다.
+//
+// ※ ESP32 설치 방법과 기본 구조는 동일하지만,
+//    ESP32는 Espressif BSP,
+//    이 nRF52840 코드는 Adafruit nRF52 BSP를 사용한다.
+//
+// ------------------------------------------------------------
+// [필요 라이브러리]
+// ------------------------------------------------------------
+//
+// Arduino IDE:
+//   Sketch -> Include Library -> Manage Libraries
+//
+// 1. "Adafruit BME680 Library"
+//    - BME680 / BME688 센서 드라이버
+//    - 이 프로젝트에서는 BME688에 사용
+//
+// 2. "Adafruit Unified Sensor"
+//    - Adafruit 센서 공통 인터페이스
+//
+// 3. "Adafruit BusIO"
+//    - Adafruit 센서의 I2C/SPI 통신 지원
+//    - BME680 Library 설치 시 의존성으로 함께 설치될 수 있음
+//
+// 라이브러리 설치 창에서 의존 라이브러리 설치 여부를 물으면
+// "Install All"을 선택해도 된다.
+//
+// ------------------------------------------------------------
+// [별도 설치할 필요가 없는 것]
+// ------------------------------------------------------------
+//
+// #include <bluefruit.h>
+//
+//   -> Adafruit nRF52 BSP에 포함되어 있음.
+//      별도의 Bluefruit 라이브러리를 Library Manager에서
+//      추가 설치할 필요 없음.
+//
+// #include <Wire.h>
+//
+//   -> Arduino/nRF52 Core에 포함되어 있음.
+//      별도 설치 불필요.
+//
+// ------------------------------------------------------------
+// [BME688 I2C 설정 - 현재 하드웨어]
+// ------------------------------------------------------------
+//
+// BME688 I2C Address : 0x76
+//
+// 실제 nRF52840 핀:
+//   SDA = P0.31
+//   SCL = P0.29
+//
+// 현재 Adafruit Feather nRF52840 Express variant 기준 Arduino 핀:
+//   SDA = D21 -> P0.31
+//   SCL = D20 -> P0.29
+//
+// 따라서 이 프로젝트에서는:
+//
+//   Wire.setPins(21, 20);
+//   Wire.begin();
+//
+// 을 사용한다.
+//
+// ※ 031, 029를 C++ 숫자로 직접 쓰지 말 것.
+//    코드에서는 현재 BSP의 Arduino pin number인 21, 20을 사용한다.
+//
+// ------------------------------------------------------------
+// [BME688 측정 설정]
+// ------------------------------------------------------------
+//
+// 현재 프로젝트의 주요 설정:
+// - 측정 주기       : 약 2초
+// - Gas Heater     : 320 °C
+// - Heater Duration: 150 ms
+//
+// initializeSensor()에서 begin() 성공 후
+// oversampling / filter / gas heater 설정을 다시 적용한다.
+//
+// ------------------------------------------------------------
+// [센서 이상 및 자동 복구 정책]
+// ------------------------------------------------------------
+//
+// performReading() 실패:
+//   -> 해당 샘플 폐기
+//   -> SEQ 증가하지 않음
+//   -> BLE 전송하지 않음
+//
+// NaN / Inf / gas_resistance == 0:
+//   -> 유효하지 않은 측정으로 취급
+//   -> 해당 샘플 폐기
+//
+// 연속 측정 실패:
+//   -> BME688 Soft Reset
+//   -> 센서 재초기화
+//   -> 측정 설정 재적용
+//   -> 정상 측정 확인 후 자동 복귀
+//
+// BME688 Soft Reset:
+//   Register 0xE0 <- Command 0xB6
+//
+// 데이터 신뢰성 원칙:
+//   "잘못된 값을 전송하는 것보다 missing sample이 낫다."
+//
+// ------------------------------------------------------------
+// [BLE 설정]
+// ------------------------------------------------------------
+//
+// BLE 통신:
+// - Nordic UART Service (NUS)
+// - ESP32-S3가 BLE Central/Client
+// - nRF52840이 BLE Peripheral/Sensor Node
+//
+// 한 프레임을 20-byte chunk로 전송한다.
+//
+// 중요:
+// BLE Notify TX buffer가 일시적으로 가득 찰 수 있으므로
+// bleuart.write() 실패 시 즉시 샘플을 포기하지 않는다.
+//
+// 현재 구현:
+//   write 실패
+//      -> 잠시 대기
+//      -> 같은 chunk 재시도
+//      -> 성공 후 다음 chunk
+//
+// 기존 "BLE partial TX" 데이터 유실 문제 때문에
+// 이 retry 로직을 제거하지 말 것.
+//
+// ------------------------------------------------------------
+// [주의]
+// ------------------------------------------------------------
+//
+// 1. 실제 보드는 Adafruit Feather가 아니라 V1940 클론이다.
+//    보드 정의만 Feather nRF52840 Express를 사용한다.
+//
+// 2. 현재 정상 동작이 확인된 I2C 핀 설정을 임의 변경하지 말 것.
+//
+// 3. BME688가 G=0 등의 비정상 상태에 고착될 수 있으므로
+//    측정 성공 여부만 믿지 말고 measurement validity를 검사한다.
+//
+// 4. 센서 읽기 실패 시 이전 정상값을 다시 전송하지 말 것.
+//
+// 5. BLE TX retry 로직을 제거하면 sequence gap / malformed frame이
+//    다시 발생할 수 있다.
+//
+// ============================================================
+
 #include <bluefruit.h>
 #include <Wire.h>
 #include <Adafruit_BME680.h>
@@ -16,21 +213,89 @@ uint32_t nextMeasurement = 0, nextRecovery = 0, lastHealth = 0;
 uint32_t recoveryDelay = RECOVERY_MIN_MS;
 bool sensorReady = false, recoveryPending = false, lastReadOK = false;
 
-bool sendLine(const char* line) {
-  if (!Bluefruit.connected() || !bleuart.notifyEnabled()) return false;
-  // A delimiter before every frame also terminates a previous interrupted TX.
-  if (bleuart.write((const uint8_t*)"\n", 1) != 1) { ++txErrors; return false; }
-  const size_t len = strlen(line);
-  for (size_t i = 0; i < len; i += 20) {
-    size_t n = min((size_t)20, len - i);
-    if (bleuart.write((const uint8_t*)line + i, n) != n) {
-      ++txErrors;
-      Serial.println("ERROR BLE partial TX; sample not retried, gap remains visible");
+bool bleWriteRetry(const uint8_t* data, size_t len) {
+  // BLE Notify TX 슬롯이 잠깐 꽉 차더라도
+  // 즉시 샘플을 버리지 않고 최대 약 300 ms 동안 재시도한다.
+  constexpr int MAX_RETRIES = 15;
+  constexpr int RETRY_DELAY_MS = 20;
+
+  for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+
+    if (!Bluefruit.connected() ||
+        !bleuart.notifyEnabled()) {
       return false;
     }
-    delay(5);
+
+    size_t written = bleuart.write(data, len);
+
+    if (written == len) {
+      return true;
+    }
+
+    // 이전 Notify가 완료되어 TX packet slot이 반환될 시간을 준다.
+    delay(RETRY_DELAY_MS);
   }
-  if (bleuart.write((const uint8_t*)"\n", 1) != 1) { ++txErrors; return false; }
+
+  ++txErrors;
+
+  Serial.print("ERROR BLE TX timeout len=");
+  Serial.println(len);
+
+  return false;
+}
+
+
+bool sendLine(const char* line) {
+  if (!Bluefruit.connected() ||
+      !bleuart.notifyEnabled()) {
+    return false;
+  }
+
+  // ------------------------------------------------------------
+  // 이전에 잘린 frame이 남아 있더라도 newline으로 먼저 끊는다.
+  // ------------------------------------------------------------
+  const uint8_t newline = '\n';
+
+  if (!bleWriteRetry(&newline, 1)) {
+    return false;
+  }
+
+  // ------------------------------------------------------------
+  // BLE 기본 ATT payload에 맞춰 20 byte씩 전송.
+  //
+  // 기존에는 5 ms 후 다음 chunk를 바로 전송했기 때문에
+  // Notify packet slot이 반환되기 전에 다음 write가 들어가면서
+  // 전송 실패가 발생할 수 있었다.
+  //
+  // 이제 실패하면 동일 chunk를 기다렸다가 재시도한다.
+  // ------------------------------------------------------------
+  const size_t len = strlen(line);
+
+  for (size_t i = 0; i < len; i += 20) {
+
+    size_t n = min((size_t)20, len - i);
+
+    if (!bleWriteRetry(
+          (const uint8_t*)line + i,
+          n
+        )) {
+
+      Serial.println(
+        "ERROR BLE frame TX failed after retries"
+      );
+
+      return false;
+    }
+
+    // 다음 Notify 전에 약간의 여유
+    delay(10);
+  }
+
+  // frame 종료
+  if (!bleWriteRetry(&newline, 1)) {
+    return false;
+  }
+
   return true;
 }
 
@@ -60,6 +325,32 @@ bool initializeSensor() {
          bme.setPressureOversampling(BME680_OS_4X) &&
          bme.setIIRFilterSize(BME680_FILTER_SIZE_3) &&
          bme.setGasHeater(320, 150);
+}
+
+// ============================================================
+// BME688 강제 소프트 리셋
+// - 이상값(G=0 등)이 지속될 때 센서 내부 상태를 초기화
+// - BME688 I2C 주소: 0x76
+// ============================================================
+
+bool softResetBME688() {
+  Wire.beginTransmission(0x76);
+  Wire.write(0xE0);   // Soft-reset register
+  Wire.write(0xB6);   // Soft-reset command
+
+  uint8_t err = Wire.endTransmission();
+
+  // Bosch reset 이후 충분히 대기
+  delay(20);
+
+  if (err != 0) {
+    Serial.print("RECOVERY soft reset I2C error=");
+    Serial.println(err);
+    return false;
+  }
+
+  Serial.println("RECOVERY BME688 soft reset OK");
+  return true;
 }
 
 void recoverSensor() {
