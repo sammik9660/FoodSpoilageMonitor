@@ -73,6 +73,13 @@
 //    - Adafruit 센서의 I2C/SPI 통신 지원
 //    - BME680 Library 설치 시 의존성으로 함께 설치될 수 있음
 //
+// 4. "Adafruit SSD1306"
+//    - I2C OLED 디스플레이 드라이버
+//
+// 5. "Adafruit GFX Library"
+//    - SSD1306 화면의 문자/그래픽 출력 지원
+//    - SSD1306 Library 설치 시 의존성으로 함께 설치될 수 있음
+//
 // 라이브러리 설치 창에서 의존 라이브러리 설치 여부를 물으면
 // "Install All"을 선택해도 된다.
 //
@@ -116,6 +123,16 @@
 //    코드에서는 현재 BSP의 Arduino pin number인 21, 20을 사용한다.
 //
 // ------------------------------------------------------------
+// [SSD1306 OLED 설정 - BME688과 I2C 버스 공유]
+// ------------------------------------------------------------
+//
+// OLED도 Wire.setPins(21, 20)으로 설정한 동일 버스를 사용한다.
+// 사용자 하드웨어에서 정상 동작을 확인한 현재 설정:
+//   I2C Address : 0x3C
+//   Resolution  : 128 x 32
+// OLED 초기화 실패는 센서 측정/BLE 전송 실패로 취급하지 않는다.
+//
+// ------------------------------------------------------------
 // [BME688 측정 설정]
 // ------------------------------------------------------------
 //
@@ -136,7 +153,7 @@
 //   -> SEQ 증가하지 않음
 //   -> BLE 전송하지 않음
 //
-// NaN / Inf / gas_resistance == 0:
+// NaN / Inf / gas_resistance <= 0:
 //   -> 유효하지 않은 측정으로 취급
 //   -> 해당 샘플 폐기
 //
@@ -199,19 +216,116 @@
 #include <Wire.h>
 #include <Adafruit_BME680.h>
 #include <math.h>
+#if !defined(_MSC_VER)  // Windows host sensor test에는 OLED 하드웨어가 없다.
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#endif
 
 constexpr uint8_t BME_ADDRESS = 0x76;
+constexpr uint8_t OLED_ADDRESS = 0x3C;
+constexpr int16_t OLED_WIDTH = 128;
+constexpr int16_t OLED_HEIGHT = 32;
+constexpr int8_t OLED_RESET_PIN = -1;
+constexpr uint32_t OLED_REFRESH_INTERVAL_MS = 750;
 constexpr uint32_t SAMPLE_INTERVAL_MS = 2000;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
 Adafruit_BME680 bme(&Wire);  // begin(address, bool initSettings), NOT a Wire pointer.
 BLEUart bleuart;
+#if !defined(_MSC_VER)
+Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
+#endif
 uint32_t bootId, validSequence = 0, failures = 0, consecutiveFailures = 0;
 uint32_t recoveryAttempts = 0, recoveries = 0, txErrors = 0;
 uint32_t nextMeasurement = 0, nextRecovery = 0, lastHealth = 0;
 uint32_t recoveryDelay = RECOVERY_MIN_MS;
 bool sensorReady = false, recoveryPending = false, lastReadOK = false;
+#if !defined(_MSC_VER)
+uint32_t lastOledRefresh = 0;
+bool oledReady = false;
+#endif
+
+bool isMeasurementValid(bool readOK, double temperature, double humidity,
+                        double pressure, double gasResistance) {
+  // H=100% or low pressure can be physically real; do not hard-code the old
+  // incident signature. G<=0 is the confirmed invalid condition.
+  return readOK && isfinite(temperature) && isfinite(humidity) &&
+         isfinite(pressure) && isfinite(gasResistance) && gasResistance > 0;
+}
+
+#if !defined(_MSC_VER)
+void initializeOled() {
+  // Wire는 initializeSensor()가 검증된 D21/D20 핀으로 이미 시작했다.
+  // 주소 ACK를 먼저 확인해 OLED가 없어도 센서 노드를 계속 실행한다.
+  Wire.beginTransmission(OLED_ADDRESS);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("OLED unavailable; sensor/BLE continue");
+    return;
+  }
+
+  // periphBegin=false: SSD1306가 Wire.begin()을 다시 호출하지 않게 한다.
+  oledReady = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, true, false);
+  if (!oledReady) {
+    Serial.println("OLED init failed; sensor/BLE continue");
+    return;
+  }
+
+  oled.cp437(true);
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setTextWrap(false);
+  oled.setCursor(0, 0);
+  oled.println(F("BME688 node starting"));
+  oled.display();
+  Serial.print("OLED ready: SSD1306 0x"); Serial.print(OLED_ADDRESS, HEX);
+  Serial.print(" "); Serial.print(OLED_WIDTH); Serial.print("x"); Serial.println(OLED_HEIGHT);
+}
+
+void formatOledCounter(uint32_t value, char* out, size_t outSize) {
+  if (value < 1000) snprintf(out, outSize, "%lu", (unsigned long)value);
+  else if (value < 1000000) snprintf(out, outSize, "%luk", (unsigned long)(value / 1000));
+  else if (value < 1000000000) snprintf(out, outSize, "%luM", (unsigned long)(value / 1000000));
+  else snprintf(out, outSize, "%luG", (unsigned long)(value / 1000000000));
+}
+
+void updateOled(uint32_t now) {
+  if (!oledReady || (uint32_t)(now - lastOledRefresh) < OLED_REFRESH_INTERVAL_MS) {
+    return;
+  }
+  lastOledRefresh = now;
+
+  char line[22];  // 기본 6 px 글꼴 기준 128 px에 최대 21자.
+  char seqText[6], failText[6], recoveryText[6], txText[6];
+  formatOledCounter(validSequence, seqText, sizeof(seqText));
+  formatOledCounter(failures, failText, sizeof(failText));
+  formatOledCounter(recoveries, recoveryText, sizeof(recoveryText));
+  formatOledCounter(txErrors, txText, sizeof(txText));
+  const char* sensorText = !sensorReady ? "REC" : recoveryPending ? "CHK" : lastReadOK ? "OK" : "ERR";
+
+  oled.clearDisplay();
+  oled.setCursor(0, 0);
+  snprintf(line, sizeof(line), "BLE:%s BME:%s X=%s", Bluefruit.connected() ? "ON" : "OFF", sensorText, txText);
+  oled.println(line);
+
+  // 실패한 performReading() 뒤에는 bme 객체의 이전 값을 표시하지 않는다.
+  // 화면에서도 stale 값을 현재 측정값으로 오인하지 않게 명시적으로 비운다.
+  if (lastReadOK) {
+    snprintf(line, sizeof(line), "Tem:%.1fC Hum:%.1f%%", bme.temperature, bme.humidity);
+    oled.println(line);
+    snprintf(line, sizeof(line), "hPa:%.1f G:%.1fk", bme.pressure / 100.0, bme.gas_resistance / 1000.0);
+    oled.println(line);
+  } else {
+    oled.println(F("T:--.-C H:--.-%"));
+    oled.println(F("P:----.- G:---.-k"));
+  }
+
+  snprintf(line, sizeof(line), "Seq:%s Fail:%s Re:%s", seqText, failText, recoveryText);
+  oled.println(line);
+  oled.display();
+}
+#endif
 
 bool bleWriteRetry(const uint8_t* data, size_t len) {
   // BLE Notify TX 슬롯이 잠깐 꽉 차더라도
@@ -389,6 +503,9 @@ void setup() {
   Bluefruit.Advertising.start(0);
   Serial.println("BOOT reliability-v2; 0x76; D21/D20; heater 320C/150ms");
   recoverSensor();
+#if !defined(_MSC_VER)
+  initializeOled();
+#endif
 }
 
 void loop() {
@@ -396,26 +513,47 @@ void loop() {
   if (now - lastHealth >= 10000) { lastHealth = now; sendHealth(); }
   if (!sensorReady) {
     if ((int32_t)(now - nextRecovery) >= 0) recoverSensor();
+#if !defined(_MSC_VER)
+    updateOled(millis());
+#endif
     delay(10);
     return;
   }
-  if ((int32_t)(now - nextMeasurement) < 0) { delay(5); return; }
+  if ((int32_t)(now - nextMeasurement) < 0) {
+#if !defined(_MSC_VER)
+    updateOled(now);
+#endif
+    delay(5);
+    return;
+  }
   nextMeasurement = now + SAMPLE_INTERVAL_MS;  // no catch-up burst after a delay
   const bool readOK = bme.performReading();
-  const bool finiteValues = readOK && isfinite(bme.temperature) && isfinite(bme.humidity) &&
-                            isfinite(bme.pressure) && isfinite((double)bme.gas_resistance);
-  if (!finiteValues) {
+  const double gasResistance = (double)bme.gas_resistance;
+  const bool validMeasurement = isMeasurementValid(readOK, bme.temperature, bme.humidity,
+                                                    bme.pressure, gasResistance);
+  if (!validMeasurement) {
     // DATA INTEGRITY: failed reads leave previous T/H/P/G in memory. The real
-    // 2026-09-28 incident produced stale rows. A failed read is a missing sample:
-    // no sensor frame, no valid-sequence increment, only diagnostics/recovery.
+    // G=0 lockup can also return numeric values with performReading()==true.
+    // Either case is a missing sample: no frame/SEQ, only diagnostics/recovery.
     ++failures; ++consecutiveFailures; lastReadOK = false;
-    Serial.print("SENSOR ERROR missing sample; failures="); Serial.println(failures);
+    if (!readOK) {
+      Serial.print("SENSOR ERROR performReading failed");
+    } else if (!isfinite(bme.temperature) || !isfinite(bme.humidity) ||
+               !isfinite(bme.pressure) || !isfinite(gasResistance)) {
+      Serial.print("SENSOR ERROR non-finite measurement");
+    } else {
+      Serial.print("SENSOR ERROR invalid gas resistance G="); Serial.print(gasResistance);
+    }
+    Serial.print("; failures="); Serial.println(failures);
     if (consecutiveFailures >= FAILURE_THRESHOLD) {
       sensorReady = false;
       // nextRecovery was set by the previous attempt; never reset every 2 s.
       if ((int32_t)(millis() - nextRecovery) >= 0) recoverSensor();
     }
     sendHealth();
+#if !defined(_MSC_VER)
+    updateOled(millis());
+#endif
     return;
   }
   consecutiveFailures = 0;
@@ -428,4 +566,7 @@ void loop() {
            (unsigned long)bootId, (unsigned long)validSequence, (unsigned long)millis(),
            bme.temperature, bme.humidity, bme.pressure / 100.0, bme.gas_resistance / 1000.0);
   if (sendLine(frame)) { Serial.print("TX "); Serial.println(frame); }
+#if !defined(_MSC_VER)
+  updateOled(millis());
+#endif
 }

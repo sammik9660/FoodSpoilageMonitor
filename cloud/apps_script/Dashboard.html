@@ -16,7 +16,7 @@ input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{
 <p>CSV page: up to 10,000 source rows. Offset 0 is the first data row.</p>
 <input id="csvOffset" type="number" min="0" step="10000" value="0" aria-label="CSV source row offset" onchange="csvLinks()">
 <a id="all" href="<?= webAppUrl ?>?download=csv" target="_blank" rel="noopener">All data CSV — selected page</a>
-<a id="sessionCsv" hidden target="_blank" rel="noopener">Current session CSV</a>
+<a id="sessionCsv" hidden target="_blank" rel="noopener">Session CSV — selected page</a>
 <p>Session boundaries use capture time. Delayed batches can still complete a stopped session.
 Unknown-time samples are retained in the Unassigned sheet, outside experiments.</p></section>
 <section><h2>Diagnostics</h2><pre id="health">Waiting for gateway heartbeat</pre></section>
@@ -32,9 +32,10 @@ function show(d){
  const h=d.health||{},v=h.latest;
  document.getElementById('values').textContent=v?`${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa · ${v.g.toFixed(2)} kΩ`:'No valid sample';
  const r=d.recording;document.getElementById('recording').textContent=r.state;
- document.getElementById('session').textContent=r.session_id?`${r.session_id} / ${r.experiment_label}`:'No active experiment';
+ document.getElementById('session').textContent=r.session_id?`${r.session_id} / ${r.experiment_label}`:r.download_session_id?`Latest: ${r.download_session_id} / ${r.download_experiment_label}`:'No recorded experiment';
  document.getElementById('start').disabled=r.state==='RECORDING';document.getElementById('stop').disabled=r.state!=='RECORDING';
- sessionId=r.session_id;const link=document.getElementById('sessionCsv');link.hidden=!sessionId;csvLinks();
+ sessionId=r.download_session_id;const link=document.getElementById('sessionCsv');link.hidden=!sessionId;
+ link.textContent=r.download_kind==='CURRENT'?'Current Session CSV — selected page':'Latest Session CSV — selected page';csvLinks();
  document.getElementById('health').textContent=JSON.stringify(h,null,2);
 }
 function poll(){if(busy)return;busy=true;google.script.run.withSuccessHandler(d=>{busy=false;show(d);}).withFailureHandler(e=>{busy=false;document.getElementById('state').textContent='CLOUD/UPLOAD ERROR (dashboard request)';error(e);}).getDashboard();}

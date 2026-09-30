@@ -32,7 +32,7 @@ function environment(){
   SpreadsheetApp:{openById:id=>{assert.equal(id,'existing-id');return book;},flush(){}},
   Utilities:{getUuid:()=>String(++uuid).padStart(32,'0')},
   CacheService:{getScriptCache:()=>({get:k=>cache.get(k),put:(k,v)=>cache.set(k,v)})},
-  ContentService:{MimeType:{JSON:'json',CSV:'csv'},createTextOutput:text=>({text,setMimeType(){return this;},downloadAsFile(){return this;}})},
+  ContentService:{MimeType:{JSON:'json',CSV:'csv'},createTextOutput:text=>({text,filename:null,setMimeType(){return this;},downloadAsFile(name){this.filename=name;return this;}})},
   ScriptApp:{getService:()=>({getUrl:()=> 'https://example.invalid/exec'})},
   HtmlService:{createTemplateFromFile:name=>({evaluate(){return {setTitle(){return {name,url:this.webAppUrl};}};}})}
  };
@@ -78,8 +78,12 @@ test('one active session, STOP idempotent, no auto recreate',()=>{
  e.props.delete('SPREADSHEET_ID');assert.throws(()=>send(e,[]),/missing/);assert.equal(e.sensor.getLastRow(),2);
 });
 test('CSV route, session filter and absolute deployed link template',()=>{
- const e=environment();const r=e.api.startRecording('A');send(e,[sample(1,e.now())]);const csv=e.api.doGet({parameter:{download:'csv',session:r.session_id}}).text;
- assert(csv.includes('sample_uid'));assert(csv.includes(boot+'-1'));assert(!csv.includes('historical'));
+ const e=environment();const r=e.api.startRecording('냉장 사과:01/테스트');send(e,[sample(1,e.now())]);const session=e.api.doGet({parameter:{download:'csv',session:r.session_id}});
+ assert(session.text.includes('sample_uid'));assert(session.text.includes(boot+'-1'));assert(!session.text.includes('historical'));
+ assert.equal(session.filename,'냉장 사과_01_테스트.csv');
+ assert.equal(e.api.doGet({parameter:{download:'csv'}}).filename,'food-spoilage-all.csv');
+ e.api.stopRecording();const stopped=e.api.getDashboard().recording;
+ assert.equal(stopped.state,'STOPPED');assert.equal(stopped.download_session_id,r.session_id);assert.equal(stopped.download_kind,'LATEST');
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');assert(html.includes('<?= webAppUrl ?>?download=csv'));
 });
 test('dashboard cannot report live solely from successful RPC',()=>{const e=environment();assert(!e.api.getDashboard().state.includes('ONLINE'));e.api.ingest({version:2,samples:[],health:{ble_connected:true,sensor_ok:false,last_valid_age_ms:100}});assert.equal(e.api.getDashboard().state,'SENSOR ERROR');e.setTime(e.now()+31000);assert(e.api.getDashboard().state.startsWith('STALE'));});
@@ -98,5 +102,10 @@ test('dashboard JavaScript executes and builds absolute paged session links',()=
  vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','10000'),ctx);
  assert(el('all').href.startsWith('https://example.invalid/exec?download=csv&offset=0'));
  ctx.control(true);assert.equal(el('recording').textContent,'RECORDING');assert(el('sessionCsv').href.includes('&session=EXP-'));
+ assert(el('sessionCsv').textContent.startsWith('Current Session CSV'));const currentHref=el('sessionCsv').href;
+ ctx.control(false);assert.equal(el('recording').textContent,'STOPPED');assert.equal(el('sessionCsv').hidden,false);
+ assert(el('sessionCsv').textContent.startsWith('Latest Session CSV'));assert.equal(el('sessionCsv').href,currentHref);
+ ctx.control(true);assert.equal(el('recording').textContent,'RECORDING');assert(el('sessionCsv').textContent.startsWith('Current Session CSV'));
+ assert.notEqual(el('sessionCsv').href,currentHref);
 });
 console.log(`${tests} cloud tests passed (mock Sheets, no external services).`);

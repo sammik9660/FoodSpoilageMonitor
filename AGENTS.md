@@ -23,7 +23,7 @@ BME688 Food Spoilage Monitor의 단일 저장소다. 작업 전에 `PROJECT_STAT
 
 이 규칙은 구현 취향이 아니다. 2026-09-28 실제 BME688 연속 읽기 실패와 reset/reinitialization 복구에서 나온 요구사항이다. 정확한 고장 원인은 입증되지 않았다.
 
-1. `performReading()` 실패 후 메모리에 남은 T/H/P/G를 절대 전송·저장하지 않는다. 실패한 측정은 유효값이 아니라 missing sample이다.
+1. `performReading()` 실패, T/H/P/G non-finite, 또는 `gas_resistance <= 0` 측정은 절대 전송·저장하지 않는다. 실패한 측정은 유효값이 아니라 missing sample이다.
 2. valid sensor sequence는 성공한 측정에만 증가한다. 정상 운전이 잘 된다는 이유로 연속 실패 검출·recovery·backoff를 제거하지 않는다.
 3. 유효한 application-level cloud ACK 전에 pending 샘플을 제거하지 않는다. retry/reboot replay는 같은 sample UID를 유지하며 cloud dedup과 함께 검증한다.
 4. recording session은 capture time으로 배정한다. HTTP arrival time으로 지난 샘플을 새 실험에 넣지 않는다. 시각 미확정 샘플은 명시적으로 Unassigned에 보존한다.

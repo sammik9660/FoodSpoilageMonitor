@@ -91,8 +91,12 @@ function recoverTransactions(ctx) {
 }
 function setupReliability() { return locked(()=>{const ctx=sheets();recoverTransactions(ctx);return {success:true,spreadsheet_id:ctx.b.getId()};}); }
 function recordingResult(ctx) {
-  const active=activeSession(sessionsList(ctx.sessions));
-  return {state:active?'RECORDING':'STOPPED',session_id:active?active.id:null,experiment_label:active?active.label:null};
+  const list=sessionsList(ctx.sessions), active=activeSession(list);
+  const latest=active?null:(list.slice().reverse().find(s=>s.stop!==null)||null);
+  const download=active||latest;
+  return {state:active?'RECORDING':'STOPPED',session_id:active?active.id:null,experiment_label:active?active.label:null,
+    download_session_id:download?download.id:null,download_experiment_label:download?download.label:null,
+    download_kind:active?'CURRENT':latest?'LATEST':null};
 }
 function startRecording(label) {
   if(typeof label!=='string' || !label.trim() || label.length>120 || /^[=+@\-]/.test(label)) throw new Error('Invalid experiment label');
@@ -244,10 +248,22 @@ function getDashboard() {
 }
 function getSensorData() {return getDashboard();}
 function csvCell(v) {if(v instanceof Date)v=v.toISOString();return '"'+String(v===null?'':v).replace(/"/g,'""')+'"';}
-function getCsvData(sessionId, offset, limit) {
+function csvFilename(label) {
+  if(label===null)return 'food-spoilage-all.csv';
+  let name=String(label);
+  if(name.normalize)name=name.normalize('NFC');
+  name=name.replace(/[\u0000-\u001F\u007F<>:"/\\|?*]/g,'_').replace(/\s+/g,' ').trim().replace(/[. ]+$/g,'');
+  name=name.replace(/\.csv$/i,'').replace(/[. ]+$/g,'');
+  if(!name)name='session';
+  if(/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name))name='_'+name;
+  name=Array.from(name).slice(0,100).join('');
+  return name+'.csv';
+}
+function getCsvPage(sessionId, offset, limit) {
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
-    if(sessionId && !sessionsList(ctx.sessions).some(s=>s.id===sessionId))throw new Error('Unknown session');
+    const session=sessionId?sessionsList(ctx.sessions).find(s=>s.id===sessionId):null;
+    if(sessionId&&!session)throw new Error('Unknown session');
     const total=ctx.sensor.getLastRow()-1;
     if(offset===undefined && total>10000)throw new Error('CSV exceeds 10000 rows: use explicit offset/limit pages (see dashboard)');
     offset=offset===undefined?0:Number(offset);limit=limit===undefined?10000:Number(limit);
@@ -255,12 +271,16 @@ function getCsvData(sessionId, offset, limit) {
     const n=Math.max(0,Math.min(limit,total-offset));
     const rows=n?ctx.sensor.getRange(offset+2,1,n,HEADERS.length).getValues():[];
     const selected=[HEADERS].concat(rows.filter(r=>!sessionId||r[6]===sessionId));
-    return selected.map(r=>r.map(csvCell).join(',')).join('\r\n');
+    return {csv:selected.map(r=>r.map(csvCell).join(',')).join('\r\n'),
+      filename:session?csvFilename(session.label):csvFilename(null)};
   });
 }
+function getCsvData(sessionId, offset, limit) {return getCsvPage(sessionId,offset,limit).csv;}
 function doGet(e) {
-  if(e&&e.parameter&&e.parameter.download==='csv')return ContentService.createTextOutput('\uFEFF'+getCsvData(e.parameter.session||'',e.parameter.offset,e.parameter.limit))
-    .setMimeType(ContentService.MimeType.CSV).downloadAsFile('food-spoilage.csv');
+  if(e&&e.parameter&&e.parameter.download==='csv') {
+    const page=getCsvPage(e.parameter.session||'',e.parameter.offset,e.parameter.limit);
+    return ContentService.createTextOutput('\uFEFF'+page.csv).setMimeType(ContentService.MimeType.CSV).downloadAsFile(page.filename);
+  }
   const template=HtmlService.createTemplateFromFile('Dashboard');
   template.webAppUrl=ScriptApp.getService().getUrl();
   template.refreshMs=DASHBOARD_REFRESH_MS;
