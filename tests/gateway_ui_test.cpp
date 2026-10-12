@@ -1,0 +1,48 @@
+#include <cassert>
+#include <cstring>
+#include "../firmware/esp32s3/gateway/GatewayUi.h"
+
+using namespace gateway_ui;
+
+static void linesAreFixed(const char* a,const char* b) {
+  assert(strlen(a)==LCD_COLUMNS);assert(strlen(b)==LCD_COLUMNS);
+}
+
+int main() {
+  char a[LCD_COLUMNS+1],b[LCD_COLUMNS+1];
+
+  formatSensor(false,0,0,0,0,a,b);linesAreFixed(a,b);
+  assert(strstr(a,"T:--")&&strstr(b,"G:--"));
+  formatSensor(true,31.0f,42.2f,1005.6f,123.4f,a,b);linesAreFixed(a,b);
+  assert(strstr(a,"T:31.0 H:42.2")==a);assert(strstr(b,"P:1006 G:123k")==b);
+  formatSensor(true,-40.0f,100.0f,1100.0f,9999999.0f,a,b);linesAreFixed(a,b);
+
+  formatDebug(true,true,CLOUD_OK,0,0,true,false,a,b);linesAreFixed(a,b);
+  assert(strstr(a,"B:OK W:OK C:OK")==a);assert(strstr(b,"Q0 SP0 R0"));
+  formatDebug(true,true,CLOUD_WAIT,999999,999999,true,true,a,b);linesAreFixed(a,b);
+  assert(strstr(a,"C:WAIT"));assert(strstr(b,"Q999k SP999k R1"));
+  formatDebug(false,false,CLOUD_OFF,0xffffffffu,0xffffffffu,false,false,a,b);linesAreFixed(a,b);
+
+  assert(pixelState(false,false,CLOUD_WAIT,true)==PIXEL_BLE_OFF);
+  assert(pixelState(true,false,CLOUD_WAIT,true)==PIXEL_WIFI_OFF);
+  assert(pixelState(true,true,CLOUD_WAIT,false)==PIXEL_WAIT);
+  assert(pixelState(true,true,CLOUD_OK,true)==PIXEL_WAIT);
+  assert(pixelState(true,true,CLOUD_OK,false)==PIXEL_OK);
+
+  ActiveLowButton shortButton;
+  assert(!shortButton.update(true,0).shortPress);
+  shortButton.update(false,10);assert(!shortButton.update(false,39).shortPress);
+  assert(!shortButton.update(false,40).shortPress);
+  shortButton.update(true,100);ButtonEvents shortRelease=shortButton.update(true,130);
+  assert(shortRelease.shortPress&&!shortRelease.longPress);
+  assert(!shortButton.update(true,200).shortPress);
+
+  ActiveLowButton longButton;
+  longButton.update(false,0);longButton.update(false,BUTTON_DEBOUNCE_MS);
+  ButtonEvents held=longButton.update(false,BUTTON_DEBOUNCE_MS+BUTTON_LONG_PRESS_MS);
+  assert(held.longPress&&!held.shortPress);assert(!longButton.update(false,4000).longPress);
+  longButton.update(true,4100);ButtonEvents longRelease=longButton.update(true,4130);
+  assert(!longRelease.shortPress&&!longRelease.longPress);
+
+  puts("PASS gateway UI: fixed 16x2 formatting, no-sample state, button debounce/edges, pixel priority");
+}

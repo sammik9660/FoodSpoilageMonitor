@@ -1,5 +1,6 @@
 # Actual experiment data
 /data/**
+/firmware/esp32s3/gateway/build/
 
 # Python caches and virtual environments
 __pycache__/

@@ -11,8 +11,11 @@ class OutageSpool {
   bool mounted=false, fault=false, full=false;
   uint32_t count=0, files=0, nextId=1;
   size_t budget=0, bytes=0;
+  bool mountFailedAtBoot() const { return fault && !mounted; }
   bool begin() {
-    mounted=SPIFFS.begin(true);
+    // Mount failure is not evidence of an empty filesystem. Formatting here
+    // would silently erase unacknowledged v2/v3 chunks.
+    mounted=SPIFFS.begin(false);
     if(!mounted) { fault=true; return false; }
     budget=SPIFFS.totalBytes()*60/100; // leave GC/metadata and other files headroom
     File root=SPIFFS.open("/");
@@ -36,12 +39,21 @@ class OutageSpool {
   }
   bool validate(File& f, Header& h) {
     f.seek(0);
-    if(f.read((uint8_t*)&h,sizeof(h))!=sizeof(h) || h.magic!=0x46534d32 || h.version!=2 ||
+    if(f.read((uint8_t*)&h,sizeof(h))!=sizeof(h) ||
+       !((h.magic==0x46534d32 && h.version==2) || (h.magic==0x46534d33 && h.version==3)) ||
        !h.count || h.count>integrity::BATCH_SIZE ||
-       h.checksum!=integrity::crc(&h,12) || f.size()!=sizeof(h)+h.count*sizeof(integrity::Sample)) return false;
-    integrity::Sample s;
-    for(uint32_t i=0;i<h.count;++i)
-      if(f.read((uint8_t*)&s,sizeof(s))!=sizeof(s)||!integrity::intact(s)) return false;
+       h.checksum!=integrity::crc(&h,12) ||
+       f.size()!=sizeof(h)+h.count*(h.version==2?sizeof(integrity::LegacySample):sizeof(integrity::Sample))) return false;
+    for(uint32_t i=0;i<h.count;++i) {
+      if(h.version==2) {
+        integrity::LegacySample s;
+        if(f.read((uint8_t*)&s,sizeof(s))!=sizeof(s)||!integrity::intact(s)) return false;
+      } else {
+        integrity::Sample s;
+        if(f.read((uint8_t*)&s,sizeof(s))!=sizeof(s)||!integrity::intact(s)||
+           (s.schema!=2&&s.schema!=3&&s.schema!=4)||s.reserved!=0) return false;
+      }
+    }
     return true;
   }
   bool save(const integrity::Sample* samples, uint32_t n, String& path) {
@@ -53,7 +65,7 @@ class OutageSpool {
     char name[32]; snprintf(name,sizeof(name),"/q%010lu",(unsigned long)nextId++);
     String temp=String(name)+".tmp"; path=String(name)+".bin";
     if(SPIFFS.exists(temp)||SPIFFS.exists(path)) { fault=true; return false; }
-    Header h={0x46534d32,2,n,0}; h.checksum=integrity::crc(&h,12);
+    Header h={0x46534d33,3,n,0}; h.checksum=integrity::crc(&h,12);
     File f=SPIFFS.open(temp,FILE_WRITE);
     bool ok=f && f.write((uint8_t*)&h,sizeof(h))==sizeof(h) &&
       f.write((const uint8_t*)samples,n*sizeof(*samples))==n*sizeof(*samples);
@@ -73,13 +85,22 @@ class OutageSpool {
     File f=SPIFFS.open(path,FILE_READ); Header h={};
     if(!f||!validate(f,h)) { fault=true; return false; }
     f.seek(sizeof(h)); n=h.count;
-    if(f.read((uint8_t*)samples,n*sizeof(*samples))!=n*sizeof(*samples)) { fault=true; return false; }
+    if(h.version==2) {
+      for(uint32_t i=0;i<n;++i) {
+        integrity::LegacySample old;
+        if(f.read((uint8_t*)&old,sizeof(old))!=sizeof(old)) { fault=true; return false; }
+        samples[i]=integrity::promote(old); // preserve original UID, values and capture time
+      }
+    } else if(f.read((uint8_t*)samples,n*sizeof(*samples))!=n*sizeof(*samples)) { fault=true; return false; }
     return true;
   }
   bool acknowledge(const String& path, uint32_t n) {
     // DATA INTEGRITY: call only after exact application ACK; crashes before
     // deletion intentionally replay the same UIDs for cloud deduplication.
+    File f=SPIFFS.open(path,FILE_READ); Header h={};
+    if(!f||!validate(f,h)||h.count!=n) { fault=true; return false; }
+    const size_t reclaimed=f.size(); f.close();
     if(!SPIFFS.remove(path)) { fault=true; return false; }
-    --files; count-=n; bytes-=sizeof(Header)+n*sizeof(integrity::Sample); full=false; return true;
+    --files; count-=n; bytes-=reclaimed; full=false; return true;
   }
 };

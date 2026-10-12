@@ -43,8 +43,63 @@ function environment(){
 const boot='a'.repeat(32);
 function sample(seq,time,extra={}){return {uid:boot+'-'+seq,seq,ms:seq*2000,nrf_boot:42,captured_at:time,quality:'ntp',t:25,h:50,p:1000,g:70,...extra};}
 function send(e,ss){return e.api.ingest({version:2,samples:ss});}
+function v3(seq,step,time){return {...sample(seq,time,{ms:seq*140}),sample_schema:3,
+ scan_seq:1,heater_step:step,gas_index:step,meas_index:step,sensor_status:0xb0,
+ gas_valid:true,heater_stable:true,measurement_valid:true,profile_id:354};}
 function test(name,f){f();tests++;console.log('PASS '+name);}
-test('migration preserves historical rows and extends headers',()=>{const e=environment();assert.deepEqual(e.sensor.rows[1],['historical',20,40,1000,70]);assert.equal(e.sensor.rows[0].length,12);});
+test('migration preserves historical rows and extends headers',()=>{const e=environment();assert.deepEqual(e.sensor.rows[1],['historical',20,40,1000,70]);assert.equal(e.sensor.rows[0].length,22);});
+test('migration refuses occupied columns without recognized headers',()=>{
+ const e=environment();e.sensor.rows[0]=e.sensor.rows[0].slice(0,12);e.sensor.rows[1][12]='unknown data';
+ assert.throws(()=>e.api.setupReliability(),/occupied column/);assert.equal(e.sensor.rows[1][12],'unknown data');
+});
+test('v2 pending journal replays into wider schema without resetting rows',()=>{
+ const e=environment(),row=[new Date(e.now()).toISOString(),25,50,1000,70,boot+'-1','EXP-OLD',1,140,'ntp',new Date(e.now()).toISOString(),42];
+ e.sensor.rows[0]=e.sensor.rows[0].slice(0,12);
+ e.all.get('IngestState').rows[1]=[boot,0,JSON.stringify({high:1,groups:[{sheet:'SensorData',start:3,rows:[row]}]})];
+ e.api.setupReliability();assert.equal(e.sensor.rows[0].length,22);
+ assert.deepEqual(e.sensor.rows[2].slice(0,12),row);assert(e.sensor.rows[2].slice(12).every(x=>x===''));
+ assert.equal(e.all.get('IngestState').rows[1][1],1);
+});
+test('v3 ten-step records preserve fingerprint columns and exact ACK',()=>{
+ const e=environment(),t=e.now();e.api.startRecording('fridge apple');
+ const samples=Array.from({length:10},(_,i)=>v3(i+1,i,t));
+ const payload={version:3,samples};
+ const fullBatch={version:3,samples:Array.from({length:32},(_,i)=>({...v3(i+1,i%10,t),rx_ms:4294967295})),
+  health:{ble_connected:true,sensor_ok:true,queue_depth:128,spool_depth:4096,
+   latest:{t:-40,h:100,p:1100,g:1000000000},gateway_uptime_ms:4294967295}};
+ assert(JSON.stringify(fullBatch).length<64000);
+ const r=e.api.ingest(payload);assert.equal(r.version,3);assert.equal(r.acks.length,10);
+ assert.equal(e.sensor.getLastRow(),12);
+ for(let i=0;i<10;i++){const row=e.sensor.rows[i+2];assert.equal(row[12],3);assert.equal(row[13],1);
+  assert.equal(row[14],i);assert.equal(row[15],i);assert.equal(row[17],0xb0);assert.equal(row[21],354);}
+ assert.equal(e.api.ingest(payload).acks[0].status,'duplicate');assert.equal(e.sensor.getLastRow(),12);
+ const csv=e.api.getCsvData();assert(csv.includes('scan_seq'));assert(csv.includes('heater_step'));
+ assert.throws(()=>e.api.ingest({version:3,samples:[v3(12,0,t),v3(11,1,t)]}),/Batch must/);
+});
+test('shared BLE vector maps through v3 ingest and CSV metadata',()=>{
+ const line=fs.readFileSync(path.join(__dirname,'v3_vector.txt'),'utf8').trim();
+ const fields=Object.fromEntries(line.split(',').map(part=>part.split('=')));
+ const e=environment();e.api.startRecording('vector');
+ const s={...sample(Number(fields.SEQ),e.now(),{ms:Number(fields.MS),nrf_boot:parseInt(fields.BID,16),
+  t:Number(fields.T),h:Number(fields.H),p:Number(fields.P),g:Number(fields.G)}),sample_schema:Number(fields.V),
+  scan_seq:Number(fields.SCAN),heater_step:Number(fields.STEP),gas_index:Number(fields.GI),
+  meas_index:Number(fields.MI),sensor_status:Number(fields.ST),profile_id:Number(fields.PID),
+  gas_valid:true,heater_stable:true,measurement_valid:true};
+ assert.equal(e.api.ingest({version:3,samples:[s]}).acks[0].status,'stored');
+ const row=e.sensor.rows[2];assert.equal(row[8],123456);assert.equal(row[13],2);
+ assert.equal(row[14],3);assert.equal(row[16],44);assert(e.api.getCsvData().includes(',"354"'));
+});
+test('v3 rejects false status, invalid index/profile and gas=0',()=>{
+ const e=environment(),t=e.now();for(const change of [{sensor_status:0x80},{gas_valid:false},
+  {heater_step:10},{gas_index:1},{profile_id:999},{g:0},{measurement_valid:false}])
+  assert.throws(()=>e.api.ingest({version:3,samples:[{...v3(1,0,t),...change}]}));
+ assert.equal(e.sensor.getLastRow(),2);
+});
+test('v3 upload can replay a v2 spool record with original UID',()=>{
+ const e=environment();e.api.startRecording('legacy');const old={...sample(1,e.now()),sample_schema:2};
+ const r=e.api.ingest({version:3,samples:[old]});assert.equal(r.version,3);assert.equal(r.acks[0].uid,old.uid);
+ assert.equal(e.sensor.rows[2][12],2);assert.equal(e.sensor.rows[2][13],'');
+});
 test('STOPPED samples ACKed but not saved to SensorData',()=>{const e=environment();let r=send(e,[sample(1,e.now())]);assert.equal(r.acks[0].status,'not_recording');assert.equal(e.sensor.getLastRow(),2);});
 test('duplicate retry retains one row; ACK retry after restart',()=>{const e=environment();e.api.startRecording('food A');const s=sample(1,e.now());send(e,[s]);let r=send(e,[s]);assert.equal(e.sensor.getLastRow(),3);assert.equal(r.acks[0].status,'duplicate');assert.equal(e.sensor.rows[2][5],s.uid);});
 test('capture-time Start/Stop boundaries and delayed prior session',()=>{
@@ -107,5 +162,46 @@ test('dashboard JavaScript executes and builds absolute paged session links',()=
  assert(el('sessionCsv').textContent.startsWith('Latest Session CSV'));assert.equal(el('sessionCsv').href,currentHref);
  ctx.control(true);assert.equal(el('recording').textContent,'RECORDING');assert(el('sessionCsv').textContent.startsWith('Current Session CSV'));
  assert.notEqual(el('sessionCsv').href,currentHref);
+});
+test('environment history uses schema 4 without gas, keeps SensorData and ACK identity',()=>{
+ const e=environment(),t=e.now();const env={...sample(1,t),sample_schema:4};delete env.g;
+ const reply=e.api.ingest({version:3,samples:[env]});
+ assert.equal(reply.acks[0].status,'stored');assert.equal(e.sensor.getLastRow(),2);
+ const history=e.all.get('EnvironmentHistory');assert.equal(history.getLastRow(),2);
+ assert.equal(history.rows[1][4],'');assert.equal(history.rows[1][12],4);
+ assert.equal(e.api.ingest({version:3,samples:[env]}).acks[0].status,'duplicate');
+ assert.equal(history.getLastRow(),2);
+ for(const extra of [{g:0},{heater_step:0},{scan_seq:1},{gas_index:0},
+                     {meas_index:0},{sensor_status:0},{profile_id:354},
+                     {gas_valid:false},{heater_stable:false},{measurement_valid:false}])
+  assert.throws(()=>e.api.ingest({version:3,samples:[{...env,uid:boot+'-2',seq:2,...extra}]}));
+});
+test('environment journal retries without losing existing SensorData',()=>{
+ const e=environment(),env={...sample(1,e.now()),sample_schema:4};delete env.g;
+ e.setFail(name=>name==='EnvironmentHistory');
+ assert.throws(()=>e.api.ingest({version:3,samples:[env]}));
+ assert.equal(e.sensor.getLastRow(),2);
+ assert.equal(e.api.ingest({version:3,samples:[env]}).acks[0].status,'duplicate');
+ assert.equal(e.all.get('EnvironmentHistory').getLastRow(),2);
+});
+test('delayed environment history keeps capture-time session membership',()=>{
+ const e=environment(),first=e.api.startRecording('first'),captured=e.now();
+ e.setTime(captured+1000);e.api.stopRecording();e.api.startRecording('second');
+ const env={...sample(1,captured),sample_schema:4};delete env.g;
+ assert.equal(e.api.ingest({version:3,samples:[env]}).acks[0].status,'stored');
+ assert.equal(e.all.get('EnvironmentHistory').rows[1][6],first.session_id);
+});
+test('dashboard labels scan and cooling as paused with aged ambient telemetry',()=>{
+ const e=environment(),t=e.now();
+ e.api.ingest({version:3,samples:[],health:{ble_connected:true,sensor_ok:false,
+  sensor_mode:'GAS',environment_ok:false,environment:{t:25,h:50,p:1000,age_ms:6000}}});
+ const scan=e.api.getDashboard();assert.equal(scan.state,'GAS SCAN / ENVIRONMENT PAUSED');
+ assert.equal(scan.age,6000);assert.equal(scan.health.environment.g,undefined);
+ e.setTime(t+5000);e.api.ingest({version:3,samples:[],health:{ble_connected:true,
+  sensor_mode:'COOL',environment:{t:25,h:50,p:1000,age_ms:11000}}});
+ assert.equal(e.api.getDashboard().state,'COOLING / ENVIRONMENT PAUSED');
+ const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
+ assert(html.includes('Last measured (not current): '));assert(html.includes('id="measurement"'));
+ assert(html.includes("GAS:'HP-354 gas scan'"));assert(!html.includes('v.g.toFixed'));
 });
 console.log(`${tests} cloud tests passed (mock Sheets, no external services).`);

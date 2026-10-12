@@ -1,6 +1,8 @@
 # Food Spoilage Monitor
 
-BME688 기반 음식 상태 측정 프로젝트. 현재 저장소의 reliability v2 구현은 장기 수집을 위한 신뢰성 개선 버전이며, **컴파일·호스트 모의 테스트 통과와 실제 하드웨어 장기 검증은 구분한다.** 새 버전의 장치 업로드/Apps Script 배포는 사용자가 수행해야 한다.
+BME688 기반 음식 상태 측정 프로젝트. 현재 작업 트리는 히터 OFF 환경 측정(기본 2초)과 HP-354 가스 스캔(기본 2분)을 분리한다. **컴파일·호스트 모의 테스트와 실제 하드웨어/클라우드 검증은 구분한다.** 장치/클라우드 확인 결과는 `PROJECT_STATE.md`에 기록한다.
+
+사용자 검증 ESP32-S3 정상 보드 설정은 **Flash Size 16MB / Huge APP (3MB No OTA / 1MB SPIFFS) / PSRAM Disabled / USB CDC On Boot Enabled / Hardware CDC and JTAG**다. 파티션 선택을 바꾸면 미전송 spool 접근성이 달라질 수 있으므로 그대로 유지한다.
 
 ```text
 BME688 -> nRF52840 -> BLE Nordic UART Service -> ESP32-S3
@@ -12,34 +14,40 @@ BME688 -> nRF52840 -> BLE Nordic UART Service -> ESP32-S3
 
 ```text
 firmware/nrf52840/bme688_node/bme688_node.ino
+firmware/nrf52840/bme688_node/Scan.h
 firmware/esp32s3/gateway/gateway.ino
 firmware/esp32s3/gateway/Integrity.h
 firmware/esp32s3/gateway/Spool.h
 cloud/apps_script/Code.gs
 cloud/apps_script/Dashboard.html
 tests/                         # 실제 코드에 대한 호스트 테스트와 mock
-analysis/                      # 향후 분석 코드
+analysis/fingerprints.py        # CSV complete/incomplete scan 판정 (모델 아님)
 mltest.ipynb                    # 기존 수동 POST/CSV/그래프 탐색 예제
 docs/RELIABILITY.md             # 프로토콜, 한계, 검증, 수동 배포 절차
+docs/GAS_SCAN_V3.md              # Bosch 근거, v3 프로토콜/마이그레이션/검증 절차
+docs/ENVIRONMENT_AND_GAS.md       # 환경 측정/저빈도 스캔, schema 4 및 남은 현장 검증
+firmware/nrf52840/bme688_node/src/Bosch-BME68x-Library/ # 스케치 내 Bosch 공식 드라이버 고정본
 data/                          # Git 제외 실험 데이터
 ```
 
 기존 진단 스케치, 루트 원본 TXT와 과거 리뷰는 보존한다. 진단 스케치는 production firmware와 별개다. 빈 디렉터리는 Git이 추적하지 않는다.
 
-## 현재 동작
+## 현재 구현 목표
 
-- 검증된 I2C D21/D20, 0x76, heater 320°C/150ms와 약 2초 측정 목표를 유지한다.
-- 실패한 BME688 측정은 누락으로 처리하며 stale frame/valid sequence를 만들지 않는다. 연속 실패 시 복구와 backoff를 수행한다.
-- NUS chunk/newline framing에 BID/SEQ/MS를 추가했다. nRF와 ESP v2를 함께 배포해야 한다.
-- ESP는 모든 수신 valid sample을 큐에 넣고 약 10초마다 배치 업로드한다. application ACK 이후에만 해제하며 outage spool은 제한된 임시 저장소다.
+- 검증된 I2C D21/D20, 0x76 및 OLED는 유지한다. 평상시 Bosch forced-mode T/H/P 측정은 히터 OFF, 2분마다 HP-354 parallel mode를 사용한다. 과거 320°C/150ms·약 2초 고정 히터 측정은 v2 방식이다.
+- 실패한 BME688 step은 누락으로 처리하며 stale frame/valid sequence를 만들지 않는다. 연속 실패 시 복구와 backoff를 수행한다.
+- NUS 20-byte chunk/newline framing을 유지한다. 환경 프레임은 `ENV` T/H/P만 보내며, v3는 한 heater step당 BID/SEQ/SCAN/STEP/GI/MI/ST/PID/T/H/P/G 프레임 하나다.
+- ESP는 v2/v3 수신과 v2 미전송 스풀 replay를 지원하며, v3 JSON을 약 5초 간격으로 배치 업로드한다. application ACK 이후에만 해제한다.
 - recording 기본 STOPPED. Start/Stop과 capture-time session 구간을 사용하며 unknown-time 샘플은 Unassigned에 저장한다.
-- 기존 SensorData 첫 5열과 과거 행은 보존한다. 세션/UID 등의 열과 보조 시트를 추가한다.
+- 기존 SensorData 첫 12열과 과거 행을 보존한다. 환경 이력은 5분마다 별도 `EnvironmentHistory` 시트에 저장한다.
 - CSV는 실제 배포 URL을 사용한다. 10,000행을 넘는 자료는 명시적인 offset/limit 페이지로 내려받는다.
 
 ## 먼저 읽을 문서
 
 - [PROJECT_STATE.md](PROJECT_STATE.md): 사용자 검증 상태, 2026-09-28 실제 센서 장애, 현재 구현 및 남은 검증
-- [docs/RELIABILITY.md](docs/RELIABILITY.md): 정확한 프로토콜·ACK·spool 용량/손실 한계, 빌드·테스트, 수동 배포 순서
+- [docs/GAS_SCAN_V3.md](docs/GAS_SCAN_V3.md): Bosch 근거, v3 프로토콜·스풀/Sheets 전환·수동 검증 순서
+- [docs/ENVIRONMENT_AND_GAS.md](docs/ENVIRONMENT_AND_GAS.md): 현재 환경/가스 모드, 실시간 표시·이력 분리, 남은 현장 검증
+- [docs/RELIABILITY.md](docs/RELIABILITY.md): reliability v2 설계와 당시 검증 기록
 - [AGENTS.md](AGENTS.md): hardware mapping과 Data Integrity Invariants
 - [BASELINE_CODE_REVIEW_2026-09-25.md](BASELINE_CODE_REVIEW_2026-09-25.md): 수정하지 않는 과거 baseline 리뷰
 

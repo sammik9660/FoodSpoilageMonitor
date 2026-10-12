@@ -1,4 +1,6 @@
-# Reliability v2 — operation, limits, validation
+# Reliability v2 — historical operation, limits, validation
+
+This document records the fixed-heater v2 implementation and its validation at the time. For the current HP-354 gas-scan worktree, read [GAS_SCAN_V3.md](GAS_SCAN_V3.md). The v2 build sizes, cadence and capacity below are historical and do not describe the v3 code.
 
 ## Scope and preserved hardware
 

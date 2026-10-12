@@ -7,7 +7,7 @@ input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{
 [hidden]{display:none!important}
 </style></head><body>
 <h1>Food Spoilage Monitor</h1>
-<section><strong id="state">WAITING / UNKNOWN</strong><p id="age">No confirmed sample</p><div id="values">—</div>
+<section><strong id="state">WAITING / UNKNOWN</strong><p id="measurement">Measurement mode: unknown</p><p id="age">No confirmed sample</p><p id="updated">Last update: unknown</p><div id="values">—</div><p id="gas">No valid gas sample</p>
 <p>Values are live telemetry, not a food-safety verdict. Stale values remain labeled as stale.</p></section>
 <section><h2 id="recording">STOPPED / loading state</h2><p id="session"></p>
 <input id="label" maxlength="120" placeholder="Experiment label" aria-label="Experiment label">
@@ -19,7 +19,7 @@ input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{
 <a id="sessionCsv" hidden target="_blank" rel="noopener">Session CSV — selected page</a>
 <p>Session boundaries use capture time. Delayed batches can still complete a stopped session.
 Unknown-time samples are retained in the Unassigned sheet, outside experiments.</p></section>
-<section><h2>Diagnostics</h2><pre id="health">Waiting for gateway heartbeat</pre></section>
+<section><h2>Diagnostics</h2><p id="transport">Wi-Fi / BLE / cloud ACK: unknown</p><pre id="health">Waiting for gateway heartbeat</pre></section>
 <script>
 const refreshMs=<?= refreshMs ?>;
 const base=document.getElementById('all').href.split('?')[0];
@@ -28,14 +28,24 @@ function csvLinks(){const offset=Number(document.getElementById('csvOffset').val
 function error(e){document.getElementById('message').textContent=String(e.message||e);document.getElementById('message').className='error';}
 function show(d){
  document.getElementById('state').textContent=d.state;
- document.getElementById('age').textContent=d.age===null?'Last valid sample: unknown':'Last valid sample: '+(d.age/1000).toFixed(1)+' s ago';
- const h=d.health||{},v=h.latest;
- document.getElementById('values').textContent=v?`${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa · ${v.g.toFixed(2)} kΩ`:'No valid sample';
+ const h=d.health||{};
+ const modes={ENV:'Environment sampling',GAS:'HP-354 gas scan',COOL:'Cooling / settling',REC:'Sensor recovery',LEGACY:'Legacy gas stream'};
+ document.getElementById('measurement').textContent='Measurement mode: '+(modes[h.sensor_mode]||'unknown');
+ document.getElementById('age').textContent=d.age===null?'Last environment sample: unknown':'Last environment sample: '+(d.age/1000).toFixed(1)+' s ago';
+ document.getElementById('updated').textContent=d.age===null?'Last update: unknown':'Last update: '+new Date(d.server_time-d.age).toLocaleString();
+ const v=h.environment||(!h.sensor_mode||h.sensor_mode==='LEGACY'?h.latest:null);
+ const prefix=d.state==='LIVE / ONLINE'?'':'Last measured (not current): ';
+ document.getElementById('values').textContent=v?`${prefix}${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa`:'No valid environment sample';
+ const gasAge=h.last_valid_age_ms!=null&&h.server_seen_at!=null?h.last_valid_age_ms+d.server_time-h.server_seen_at:null;
+ document.getElementById('gas').textContent=h.latest&&h.latest.g>0&&gasAge!=null?`Last valid gas: ${h.latest.g.toFixed(2)} kΩ · ${(gasAge/1000).toFixed(0)} s ago`:'No valid gas sample';
  const r=d.recording;document.getElementById('recording').textContent=r.state;
  document.getElementById('session').textContent=r.session_id?`${r.session_id} / ${r.experiment_label}`:r.download_session_id?`Latest: ${r.download_session_id} / ${r.download_experiment_label}`:'No recorded experiment';
  document.getElementById('start').disabled=r.state==='RECORDING';document.getElementById('stop').disabled=r.state!=='RECORDING';
  sessionId=r.download_session_id;const link=document.getElementById('sessionCsv');link.hidden=!sessionId;
  link.textContent=r.download_kind==='CURRENT'?'Current Session CSV — selected page':'Latest Session CSV — selected page';csvLinks();
+ const seen=h.server_seen_at?new Date(h.server_seen_at).toLocaleString():'unknown';
+ const ackAge=h.gateway_uptime_ms&&h.last_ack_ms?((h.gateway_uptime_ms-h.last_ack_ms)/1000).toFixed(1)+' s at last contact':'unknown';
+ document.getElementById('transport').textContent=`Wi-Fi: ${h.wifi_connected_ms?'connected at gateway uptime '+Math.round(h.wifi_connected_ms/1000)+' s':'unknown'} · BLE: ${h.ble_connected===true?'connected':h.ble_connected===false?'disconnected':'unknown'} · cloud ACK age: ${ackAge} · last cloud contact: ${seen}`;
  document.getElementById('health').textContent=JSON.stringify(h,null,2);
 }
 function poll(){if(busy)return;busy=true;google.script.run.withSuccessHandler(d=>{busy=false;show(d);}).withFailureHandler(e=>{busy=false;document.getElementById('state').textContent='CLOUD/UPLOAD ERROR (dashboard request)';error(e);}).getDashboard();}
