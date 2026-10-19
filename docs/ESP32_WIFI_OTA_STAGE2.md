@@ -1,5 +1,20 @@
 # ESP32-S3 Wi-Fi OTA — Stage 2
 
+## v2.0.7 to v2.0.8 validation
+
+The user reports USB-installed 2.0.7/build 2026101905 with BLE, cloud ACK and spool drain working. Its OTA receiver is still unverified. Version 2.0.8/build 2026101906 changes only the release identifiers; retain the settings and custom partition below.
+
+Build the current sketch, then copy its application-only `gateway.ino.bin` into `data/ota-2.0.8/`. Never use the merged image, bootloader or an earlier application binary. Sign and verify from the repository root in PowerShell 7:
+
+```powershell
+.\tools\sign_esp32_ota.ps1 -FirmwareBin .\data\ota-2.0.8\gateway.ino.bin -Version 2.0.8 -BuildNumber 2026101906
+.\tests\ota_package_test.ps1 -FirmwareBin .\data\ota-2.0.8\gateway.ino.bin
+```
+
+Select that folder's `gateway.ino.manifest` in Manifest and `gateway.ino.bin` in Firmware. Keep recording STOPPED and let PREPARE drain pending data; do not bypass safety checks. Observe `OTA manifest received`, then either `OTA manifest verified` or `OTA manifest verify failed stage=...`. FORMAT means field/header/canonical format, TARGET means wrong target, VERSION means syntax or unchanged version, BUILD means non-increasing build, BASE64 means decoding failure, HASH means SHA operation failure, KEY means public-key parsing failure, and SIGNATURE means ECDSA verification failure. These stage logs are emitted by the installed receiver, not by the file being uploaded.
+
+After acceptance, require `FIRMWARE build=2.0.8`, SPIFFS mount, BLE reconnect, cloud ACK, and `OTA boot self-check passed; rollback cancelled`. Confirm the rainbow and normal LED return visually. A package test is not evidence of a successful hardware OTA. Preserve earlier packages unchanged.
+
 ## v2.0.7 build settings
 
 Build the gateway with ESP32 Arduino core 3.3.12, ESP32S3 Dev Module, Flash Size 16MB, OPI PSRAM, USB CDC On Boot enabled, Hardware CDC and JTAG, and Erase All Flash disabled. The sketch-local `partitions.csv` remains authoritative: both OTA slots are 3MiB and the existing SPIFFS region stays at `0x310000`/`0xE0000`. Version 2.0.7 uses build `2026101905`, which is strictly newer than the installed 2.0.5/build `2026101903` and the rejected 2.0.6/build `2026101904` package under the existing anti-rollback check. Hardware boot, wireless installation and the new manifest diagnostics/lease cleanup ordering remain unverified until the user tests the signed matching image.

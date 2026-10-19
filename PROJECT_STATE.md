@@ -2,6 +2,14 @@
 
 갱신일: 2026-10-19. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-19 v2.0.8 OTA 시험 준비
+
+- 사용자 보고: v2.0.7/build 2026101905를 USB로 설치한 뒤 BLE, HTTPS application ACK, spool 및 backlog drain을 확인했다. v2.0.7 OTA 수신은 아직 실기 미검증이다. v2.0.5의 generic HTTP 400만으로 실패 검증 단계를 확정할 수 없다.
+- feature/multi-device-support의 cf76088에서 버전만 2.0.8/build 2026101906으로 올렸다. 서명, build 증가 검사, 파티션, OPI PSRAM 및 데이터 경로는 변경하지 않았다. tests/ota_package_test.ps1은 배포 BIN/manifest의 형식, 버전, build, SHA-256, 내장 공개키 서명과 변조 거부를 검사한다. 이는 장치의 mbedTLS/sscanf 실행 검증을 대신하지 않는다.
+- 클라우드 모의 테스트 30개, fingerprint 5개, MSVC gateway_ui/integrity/spool, OTA 서명 도구 및 파티션 테스트와 git diff --check 통과. 새 패키지 검사기를 기존 2.0.7 패키지에 적용하여 내장 공개키 검증 및 변조 거부를 확인했다.
+- 빌드: Codex CLI 빌드는 샌드박스의 Arduino15 경로 변경으로 초기화에 실패했고 외부 환경에서도 의존성 탐색이 길어져 중단했다. 이후 사용자가 Arduino IDE에서 application BIN을 export했다. 해당 BIN은 현재 소스보다 새롭고 ESP 이미지 헤더 `0xE9`, `2.0.8` 문자열, manifest 단계 진단 및 지연 lease 정리 코드를 포함하며 `2.0.7` 문자열은 없다. 크기는 1,496,960 bytes, SHA-256은 `26d4e336637207052703f93319465562cc1e5de4209407fadcde512664b02f8c`다.
+- `data/ota-2.0.8/`에 application BIN과 기존 개인키로 생성한 manifest를 준비했다. manifest는 target esp32s3, version 2.0.8, build 2026101906, LF-only/no-BOM, BIN SHA-256 일치이며 펌웨어 내장 공개키 ECDSA 검증 및 canonical hash 변조 거부가 통과했다. 이는 실제 OTA 설치 성공 증거가 아니다. 장치 접근/설치, SPIFFS/NVS 변경 및 운영 배포는 수행하지 않았다.
+
 ## 2026-10-19 OTA manifest 진단 및 lease 정리 직렬화 (2.0.7 소스, 실기 미검증)
 
 - 실기 v2.0.5/build 2026101903은 v2.0.6 manifest 수신 후 generic `manifest signature, version, or format invalid`로 거부했다. 로컬에서는 v2.0.6 package의 형식, build 증가, BIN SHA-256과 내장 공개키 서명이 모두 통과했지만, v2.0.5 수신기는 세부 실패 조건을 기록하지 않아 장치 실패 원인은 아직 확정할 수 없다.
