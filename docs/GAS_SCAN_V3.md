@@ -4,7 +4,7 @@ The original v3 work described below was a **coding and host-test result**. The 
 
 The continuous-scan cadence and capacity estimates below describe the original v3 worktree. The current heater-off ambient / periodic-scan implementation is documented in [ENVIRONMENT_AND_GAS.md](ENVIRONMENT_AND_GAS.md); v3 step fields, Bosch profile and fingerprint completeness rules remain applicable.
 
-**Current verified setting (user report, 2026-10-12):** ESP32-S3 Flash Size 16MB with Huge APP, PSRAM disabled, USB CDC enabled, Hardware CDC/JTAG. The installed core's Huge APP CSV places SPIFFS at `0x310000` with `0xE0000` bytes. The 2026-10-11 read-only device dump below captured an earlier `no_ota` state; it does not describe the user's newly verified working configuration. Do not change partition selection with pending spool data.
+**Current gateway v2.0.7 build setting:** ESP32-S3 Flash Size 16MB with the sketch custom OTA table, OPI PSRAM, USB CDC enabled, Hardware CDC/JTAG and Erase All Flash disabled. The custom table keeps SPIFFS at `0x310000` with `0xE0000` bytes and adds two 3MiB OTA slots. The 2026-10-12 user-verified Huge APP/PSRAM-disabled setup and the 2026-10-11 read-only `no_ota` dump are historical states; they do not prove the new OPI-PSRAM build on hardware. Do not change partition selection with pending spool data.
 
 ## Bosch basis and units
 
@@ -48,7 +48,7 @@ Safe deployment order (this coding task performs none of these):
 
 1. Inspect and back up existing Spreadsheet and ESP SPIFFS; verify `SPOOL pending/fault` and free space. Keep historical SensorData and the existing Apps Script deployment URL.
 2. Update the **same** Apps Script project/deployment to the dual v2/v3 Code.gs and Dashboard.html; run mock tests locally first, then verify its live v2 response and unchanged rows manually.
-3. Preserve the user's currently verified 16MB / Huge APP selection for future builds and uploads. Keep PSRAM disabled, USB CDC enabled, Hardware CDC/JTAG, and **Erase All Flash disabled**. Verify v2 replay/ACK, SPIFFS counts, Wi-Fi/BLE and live stage logs before changing nRF.
+3. For gateway v2.0.7, use 16MB flash, the sketch custom OTA table, OPI PSRAM, USB CDC enabled, Hardware CDC/JTAG, and **Erase All Flash disabled**. Confirm the generated partition binary still preserves NVS and SPIFFS before installation. Verify replay/ACK, SPIFFS counts, Wi-Fi/BLE and live stage logs before changing nRF.
 4. Upload nRF firmware using the existing Feather nRF52840 Express target and D21/D20 wiring. Check `HP354 parallel shared heater ms=...`, `TX V=3...`, ten distinct GI/STEP values, MI continuity, no overflow/gap, and one physical scan duration measured from Serial timestamps.
 5. Start a named recording. Verify exactly ten rows for a candidate scan in Sheets/CSV, all v3 metadata, positive gas, original UID, session capture-time membership and CSV reconstruction. Inject a controlled network outage and gateway restart with expendable test data; observe FIFO replay and dedup. Test sensor invalid status/G=0 without unsafe shorts. Run a 24-hour soak before a long food experiment.
 

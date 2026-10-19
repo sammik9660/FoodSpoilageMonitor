@@ -223,16 +223,20 @@ constexpr int16_t OLED_HEIGHT = 32;
 constexpr int8_t OLED_RESET_PIN = -1;
 constexpr uint32_t OLED_REFRESH_INTERVAL_MS = 750;
 constexpr uint32_t ENV_INTERVAL_MS = 2000;
-constexpr uint32_t GAS_SCAN_INTERVAL_MS = 120000;
+constexpr uint32_t GAS_SCAN_INTERVAL_MS = 600000;
 constexpr uint32_t GAS_SCAN_TIMEOUT_MS = 60000;
 constexpr uint32_t COOLING_MS = 60000; // provisional stabilization delay; validate on hardware
 constexpr uint32_t ENV_CONVERSION_TIMEOUT_MS = 200;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.5";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 bme68xData lastEnvData={};
+#if !defined(_MSC_VER)
+BLEDfu bledfu; // Buttonless entry into the existing Adafruit legacy BLE DFU bootloader.
+#endif
 BLEUart bleuart;
 #if !defined(_MSC_VER)
 Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
@@ -573,7 +577,11 @@ void setup() {
   Serial.begin(115200);
   Bluefruit.begin();
   Bluefruit.setTxPower(4);
-  Bluefruit.setName("BME688-NRF");
+  char sensorName[24];
+  snprintf(sensorName,sizeof(sensorName),"BME688-%08lx%08lx",
+    (unsigned long)NRF_FICR->DEVICEID[0],(unsigned long)NRF_FICR->DEVICEID[1]);
+  Bluefruit.setName(sensorName);
+  Serial.print("BLE sensor ID: ");Serial.println(sensorName+7);
   Bluefruit.autoConnLed(false);
   bootId = NRF_FICR->DEVICEID[0] ^ micros();
   // SoftDevice RNG supplies a boot discriminator; gateway UID is cloud identity.
@@ -581,14 +589,20 @@ void setup() {
     if (sd_rand_application_vector_get((uint8_t*)&bootId, sizeof(bootId)) == NRF_SUCCESS) break;
     delay(5);
   }
+#if !defined(_MSC_VER)
+  // Adafruit requires the OTA DFU service to be registered before other GATT services.
+  // This only enters the existing bootloader; it does not replace bootloader/SoftDevice.
+  bledfu.begin();
+#endif
   bleuart.begin();
   Bluefruit.Advertising.addService(bleuart);
-  Bluefruit.Advertising.addName();
+  Bluefruit.ScanResponse.addName();
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.setInterval(32, 244);
   Bluefruit.Advertising.setFastTimeout(30);
   Bluefruit.Advertising.start(0);
-  Serial.println("BOOT gas-scan-v3; 0x76; D21/D20; HP354 parallel");
+  Serial.print("BOOT gas-scan-v3 version=");Serial.print(SENSOR_FIRMWARE_VERSION);
+  Serial.println("; 0x76; D21/D20; HP354 parallel; BLE DFU service");
   nextGasScan = millis() + 10000;  // 부팅 10초 후 첫 가스 스캔
   recoverSensor();
 #if !defined(_MSC_VER)

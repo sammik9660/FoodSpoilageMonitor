@@ -1,6 +1,90 @@
 # 프로젝트 현재 상태
 
-갱신일: 2026-10-12. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
+갱신일: 2026-10-19. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
+
+## 2026-10-19 OTA manifest 진단 및 lease 정리 직렬화 (2.0.7 소스, 실기 미검증)
+
+- 실기 v2.0.5/build 2026101903은 v2.0.6 manifest 수신 후 generic `manifest signature, version, or format invalid`로 거부했다. 로컬에서는 v2.0.6 package의 형식, build 증가, BIN SHA-256과 내장 공개키 서명이 모두 통과했지만, v2.0.5 수신기는 세부 실패 조건을 기록하지 않아 장치 실패 원인은 아직 확정할 수 없다.
+- 2.0.7/build 2026101905는 기존 형식·서명·anti-rollback 조건을 바꾸지 않고 manifest 실패를 FORMAT/TARGET/VERSION/BUILD/BASE64/HASH/KEY/SIGNATURE로 구분한다. 수신 바이트, HTTP upload가 보고한 예상 바이트와 고정 버퍼 용량만 기록하며 키·서명·토큰 내용은 출력하지 않는다.
+- OTA 실패 callback은 cloud lease 해제 HTTPS를 직접 실행하지 않는다. lease 해제를 예약하고 `handleClient()`가 반환된 다음 한 loop를 더 지난 뒤 main loop에서 한 번 수행한다. 예약·해제 시도와 그 직후 loop에서는 일반 upload job을 시작하지 않으며, 실패 시 기존처럼 이후 정상 cloud health가 상태 복구를 재시도한다. queue/spool을 삭제하지 않고 v2.0.6의 빈 `samples:[]` POST 차단을 유지한다.
+- 호스트/정적 테스트만 수행한다. 새 ESP BIN과 manifest, 실제 USB 설치, OTA 성공, 실패 로그와 TLS 힙 회복은 Arduino IDE export 및 사용자 실기 전까지 미검증이다. 기존 `data/ota-2.0.6/` package는 변경하지 않는다.
+
+## 2026-10-19 ESP OTA 우선 및 빈 HTTPS 제거 (2.0.6 소스, 실기 미검증)
+
+- 실기 설치된 2.0.5에서 RAM queue와 SPIFFS spool이 비어도 일반 업로드 스케줄러가 5초마다 `samples:[]` job을 만들었다. HTTPS 동안 `busy`가 CLOUD_WAIT를 만들어 GPIO48이 노란색, ACK 뒤 CLOUD_OK가 초록색이 되어 네트워크 시간을 포함한 약 7초 반복과 일치한다. nRF의 2초 ENV는 모두 저장되지 않고 5분마다 schema 4 한 건만 queue에 들어가므로 이 빈 요청 반복의 직접 원인이 아니다.
+- 2.0.6/build 2026101904는 active/staged/spool/RAM 중 실제 데이터가 하나라도 있을 때만 일반 UploadJob을 만든다. 데이터가 있으면 기존 UID, application ACK, retry, spool replay 및 실패 보존 경로를 그대로 사용한다. OTA용 cloud lease 요청은 녹화 STOPPED를 검증하므로 별도 유지한다.
+- `/prepare`를 새 일반 job 스케줄보다 먼저 처리하고, PREPARE부터 BLE를 연결 해제해 신규 유입을 멈춘다. 요청 전에 이미 수신된 RAM/spool과 진행 중 HTTP는 기존 ACK 정책으로 비운 뒤, BLE 단절·queue/spool/active/staged/results 비움·HTTP idle·SPIFFS 정상·Wi-Fi 연결을 모두 확인한 시점에만 cloud STOPPED lease를 얻는다. lease와 최종 drain 검사가 모두 통과해야 manifest에서 ACTIVE로 전환한다. 실패·취소·timeout은 NORMAL로 돌아가 BLE를 재연결하며 기존 데이터는 삭제하지 않는다.
+- nRF에는 전송 실패분을 보존하는 애플리케이션 큐가 없으므로 PREPARE/ACTIVE 동안 생성된 센서 측정값 자체를 게이트웨이가 보존할 수는 없다. 이 구간은 의도적으로 BLE를 끊고 `OTA measurement gap`으로 명시한다. OTA 전에 ESP가 이미 받은 sample은 모두 ACK 또는 spool/RAM에 보존하며, ACTIVE 중 SPIFFS 쓰기와 OTA 플래시 쓰기를 겹치지 않는다.
+- 호스트 gateway UI/스케줄 테스트, integrity 테스트, spool CRC/FIFO/reboot/ACK 테스트와 mock cloud 30개가 통과했다. ESP32 Arduino CLI OPI build는 설치 환경에서 90초 이상 출력 없이 진행되어 장시간 실행을 중단했으므로 펌웨어 컴파일은 미검증이다. 장치 접근·업로드·OTA·SPIFFS/NVS 변경은 수행하지 않았다.
+- 사용자가 Arduino IDE로 export한 ESP32 core 3.3.12 산출물은 컴파일 입력과 BIN에서 version `2.0.6`, build `2026101904`를 확인했고, 16MB/custom partition/OPI PSRAM/erase disabled 설정 및 프로젝트 파티션 CSV 적용을 확인했다. 1,495,872-byte BIN을 `data/ota-2.0.6/`에 복사해 기존 키로 서명했으며, 원본·복사본 SHA-256, manifest 메타데이터와 내장 공개키 ECDSA 서명을 검증했다. 실제 OTA 설치와 장치 동작은 아직 검증하지 않았다.
+
+## 2026-10-19 가스 10분 주기 및 OTA 2.0.5 준비 (ESP 패키지 대기)
+
+- nRF의 실제 HP-354 시작 간격을 `GAS_SCAN_INTERVAL_MS=600000`으로 변경했다. 첫 스캔은 부팅 10초 후로 유지하고, 히터 OFF forced-mode 환경 측정은 2초 start-to-start, 가스 스캔 poll 140ms, timeout 60초, cooling 60초를 유지한다. ENV에는 가스값을 넣지 않으며 새 가스 step만 기존 `SCAN`/`STEP`/`SEQ`로 송신한다. 이 변경은 ESP OTA로 nRF에 전달되지 않으므로 nRF 펌웨어는 별도로 설치해야 한다.
+- ESP gateway는 2.0.5/build 2026101903으로 올렸다. core 3.3.12의 빌드 설정은 Flash 16MB, sketch custom OTA partition, OPI PSRAM, CDC enabled, Hardware CDC/JTAG, Erase All Flash disabled다. 부팅 `FIRMWARE` 로그에 런타임 PSRAM 크기를 추가해 실제 초기화를 확인할 수 있게 했다. 기존 NVS, SPIFFS `0x310000`/`0xE0000`, 두 3MiB OTA 슬롯, spool/UID/ACK/서명/anti-rollback 로직은 변경하지 않았다. 실제 OTA 설치와 하드웨어 PSRAM 초기화는 사용자 장치 검증 전까지 미검증이다.
+- 센서 실제 소스를 포함하는 MSVC 호스트 테스트, mock cloud 30개, fingerprint 5개, OTA partition 검사와 dummy-image 서명 검사가 통과했다. DFU 서비스 추가 전 nRF 빌드는 Flash 159,208/815,104 bytes, RAM 16,308/237,568 bytes였고, DFU 서비스 추가 후 최종 `adafruit:nrf52:feather52840` 빌드는 Flash 160,368/815,104 bytes, RAM 16,420/237,568 bytes로 성공했다. ESP OPI 빌드는 Codex 샌드박스 밖에서 한 번 시작했으나 약 9분간 완료 출력 없이 지속되어 장시간 빌드 금지에 따라 중단했다. 따라서 2.0.5 ESP BIN/manifest는 생성·서명하지 않았고, 기존 1,490,000-byte BIN은 2.0.5가 아님을 확인해 재사용하지 않았다. Arduino IDE에서 OPI PSRAM 설정으로 새 BIN을 export한 뒤에만 `data/ota-2.0.5/` 패키지를 만들 수 있다.
+
+## 2026-10-19 nRF52840 BLE DFU 준비 (실기 미검증)
+
+- 사용자 보고 장치는 V1940/nice!nano V2 호환 nRF52840 clone, Board-ID `nRF52840-nicenano`, UF2 bootloader 0.6.0, S140 6.1.1이다. nice!nano 문서와 Adafruit upstream은 이 계열이 Adafruit nRF52 bootloader를 사용하며 BLE OTA를 지원한다고 설명한다. 설치된 Adafruit core 1.7.0의 Feather target도 S140 6.1.1/FWID `0x00B6`와 application max 815,104 bytes를 사용한다.
+- 기존 부트로더를 재사용하도록 애플리케이션에 core `BLEDfu` 서비스를 NUS보다 먼저 등록했다. 이 서비스는 `GPREGRET=0xB1`로 기존 bootloader에 진입할 뿐 bootloader/SoftDevice/플래시 레이아웃을 쓰지 않는다. NUS 광고, 프레임, 측정 및 ESP 파서는 변경하지 않았다.
+- core가 생성하는 DFU ZIP은 application BIN/DAT만 포함하고 manifest의 device type은 `0x0052`, SoftDevice requirement는 `0x00B6`이다. 이는 legacy DFU이며 기본 구성에서 암호학적 서명을 보장하지 않으므로 ESP32 signed OTA와 별도 신뢰 경로로 관리한다. 첫 DFU-enabled application 설치에는 USB가 필요하다. 실제 clone에서 buttonless 진입, 스마트폰 전송, 전원 중단 복구는 아직 검증하지 않았다.
+- 최종 nRF 빌드는 Flash 160,368/815,104 bytes, RAM 16,420/237,568 bytes로 통과했다. 생성 ZIP을 `data/nrf-dfu-2.0.5/bme688-node-2.0.5-legacy-dfu.zip`에 별도 보존했다. ZIP은 161,238 bytes이며 application BIN 160,376 bytes, DAT 14 bytes와 manifest만 포함한다. manifest의 device type 82, SoftDevice requirement 182와 DFU format 0.5를 확인했고, BIN에서 `2.0.5` 및 `BLE DFU service` 문자열을 확인했다. 같은 폴더의 `SHA256SUMS.txt`는 전송 무결성 확인용이며 legacy DFU에 서명 인증을 추가하지 않는다.
+
+## 2026-10-19 HTTPS TLS 메모리 최소화 (2.0.4 소스, 실기 미검증)
+
+- 2.0.3 실기 진단에서 POST 직전 internal 8-bit 최대 연속 블록은 31,732 bytes였고 TLS가 `-32512` (`SSL - Memory allocation failed`)로 실패했다. ESP32 core 설정의 TLS content 길이는 16KiB이며, 직전 요청 객체에 serialized JSON과 별도로 120-byte `Sample` 32개 전체 복사본(3,840 bytes)이 유지되고 있었다. 네트워크 작업은 ACK 확인에 `boot`와 `rx`만 사용하므로 2.0.4/build 2026101902에서는 이를 36-byte ACK identity 32개(1,152 bytes)로 바꿔 POST TLS handshake 동안의 job 점유를 2,688 bytes 줄였다. ACK UID와 허용 상태 비교도 임시 Arduino `String` 없이 고정 버퍼/`strcmp`로 수행한다. POST가 요청 본문을 모두 소비한 뒤 serialized JSON도 즉시 해제해 redirect GET의 두 번째 TLS handshake 동안 유지하지 않는다. UID, ACK 판정, SPIFFS 형식과 삭제 조건, OTA 및 Wi-Fi 로직은 변경하지 않았다.
+- POST/GET 전후의 existing heap diagnostics를 유지하고 JSON 해제 직후 `POST-body-free` 진단을 추가했다. 따라서 2.0.4 실기에서는 `HTTPS heap POST-pre`의 `largest8`가 기존 31,732보다 증가하는지, `POST-body-free`에서 GET 전 가용 연속 블록이 회복되는지, POST 302/GET 200/application ACK가 반복 성공하는지를 확인해야 한다. Arduino IDE 컴파일 및 장치 시험은 사용자가 수행하며, 이 변경만으로 TLS 문제가 해결됐다고 아직 검증하지 않았다.
+- spool에는 application ACK 뒤 한 파일만 제거하는 기능만 있고 수동 전체 삭제 명령은 없다. 자동 삭제나 포맷은 추가하지 않았다. Wi-Fi는 부팅 시 NVS의 slot 0부터 각 20초 동안 순서대로 시도하고 실패하면 다음 slot으로 이동하며, 연결된 뒤에는 스캔하거나 전환하지 않는다. 이번 변경에서 Wi-Fi 코드는 수정하지 않았다.
+
+## 2026-10-19 HTTPS TLS 메모리 진단 (소스 수정, 실기 미검증)
+
+- 사용자 실기 로그에서 2.0.2가 한 차례 POST 302/redirect GET 200/application ACK에 성공해 spool을 796에서 790으로 줄인 뒤, POST TLS 단계에서 mbedTLS `-32512` (`SSL - Memory allocation failed`)를 반복 반환했다. 실패 후 표시된 free heap은 약 67~69KiB였으나 ESP32 core 3.3.12는 TLS 연결 실패 시 `NetworkClientSecure::connect()` 안에서 `stop()`으로 TLS context를 먼저 해제하므로 이 수치만으로 handshake 직전 메모리나 누수를 판정할 수 없다.
+- gateway의 POST/GET `HTTPClient`, `WiFiClientSecure`, 응답 `String`, ACK cJSON은 각 요청에서 scope 종료 또는 명시적 `end()`/`stop()`/`cJSON_Delete()`로 정리된다. 현재 소스에서 성공·오류별 조기 return으로 이를 건너뛰는 경로는 확인되지 않았다. 명백한 소유권 누수는 확인되지 않았고, 16KiB TLS content buffer가 필요한 환경에서 연속 최대 할당 블록 부족, 힙 단편화 또는 동시 할당에 의한 순간 부족을 아직 구분하지 못했다.
+- 전송·ACK·UID·spool·OTA 동작은 유지하고 2.0.3/build 2026101901 진단 소스에서 POST 전/정리 후, GET 전/정리 후, job 해제 후의 internal 및 `MALLOC_CAP_8BIT` free/largest/minimum heap을 기록한다. 기존 2.0.2 BIN/manifest는 변경하지 않았다. `git diff --check`만 통과했으며 Arduino IDE 컴파일, 장치 설치와 새 로그 실기 검증은 사용자가 수행해야 한다.
+
+## 2026-10-18 OTA 수신 안전 상태 수정 (소스 및 로컬 검증)
+
+- 사용자가 Arduino IDE에서 내보낸 2.0.2/build 2026101801 BIN을 `data/ota-2.0.2/`에 별도 보존하고 기존 도구로 서명 manifest를 생성했다. 빌드 설정은 ESP32-S3 16MB, custom partition, PSRAM disabled, Hardware CDC/JTAG, erase disabled이며 BIN은 1,490,000 bytes로 3MiB OTA 슬롯에 들어간다. BIN 복사본 SHA-256, manifest SHA-256, 펌웨어 내장 공개키의 ECDSA 서명, target/version/build 형식과 2.0.1/build 2026101702 대비 anti-rollback 조건을 독립 검증했다. BIN이 소스보다 늦게 생성됐고 2.0.2 및 HTTPS 단계 진단 문자열을 포함함을 확인했다. 기존 `data/ota-2.0.1/` 파일은 변경하지 않았으며 실제 장치 OTA는 수행하지 않았다.
+- HTTPS `-1` 장기 장애를 DNS/TCP/TLS 단계로 구분하기 위해 진단 빌드를 2.0.2/build 2026101801로 식별하고, 기존 POST 및 redirect client의 실패 직후 `WiFiClientSecure::lastError()`만 기록한다. 새 DNS 조회나 진단 소켓을 만들지 않으며 대상 host/port, DNS 성공 여부, 단계, secure 오류 코드·설명, Wi-Fi 상태/RSSI/heap만 출력한다. endpoint 경로·payload·token은 출력하지 않고 POST/redirect/ACK/retry/spool 동작은 변경하지 않았다. 기존 서명된 2.0.1 패키지는 변경하지 않았다. Arduino IDE 컴파일은 사용자가 완료했으며 장치 설치와 이 변경의 실기 결과는 미검증이다.
+- **사용자 OTA 실기 검증 및 후속 클라우드 장애:** 사용자는 2.0.0/build 2026101701에서 서명된 2.0.1/build 2026101702로 OTA 설치, 재부팅, 부팅 자체 검사와 rollback 해제, SPIFFS 마운트, BLE 및 Wi-Fi 연결을 확인했다. 이후 일반 업로드가 `HTTP POST result=-1`/`connection refused`로 반복 실패하며 ACK 전 UID와 spool을 보존하고 있다. 2.0.1 BIN에는 현 소스와 같은 Apps Script endpoint가 들어 있고 일반 `networkTask()`는 정상 기준 커밋 `ee14429`와 공백 정규화 후 동일하다. ESP32 core 3.3.12의 이 오류는 HTTPS client의 `connect(host, port, timeout)`가 false인 DNS/TCP/TLS 연결 단계 공통 오류라 기존 로그만으로 세부 원인은 확정할 수 없다. OTA rollback 해제 코드는 같은 부팅의 정상 application ACK를 요구하므로 영구적인 URL/포트 오류와도 맞지 않는다. 앱 슬롯 변경은 NVS/SPIFFS를 변경하지 않으며 endpoint는 펌웨어 상수다.
+- `OTA?` 파서는 줄바꿈이 들어온 `Serial`만 읽지만 진단 로그는 `Serial`과 `Serial0` 양쪽에 출력한다. 따라서 `Serial0` 쪽 모니터 또는 `No line ending` 설정에서는 로그가 보여도 명령 응답이 없을 수 있다. 실제 사용 포트/line-ending 상태는 확인하지 않아 원인으로 확정하지 않았다.
+- 기존 서명된 2.0.1 패키지의 build `2026101702`와 USB 설치한 수신 펌웨어의 build가 같아 anti-rollback 조건(`manifest build > running build`)에서 manifest가 거부됨을 확인했다. 패키지의 형식, BIN SHA-256, 공개키 서명은 모두 유효했다. 재사용할 수 있도록 수신용 2.0.0의 build만 `2026101701`로 복구했으며, 컴파일·장치 설치·OTA 재시험은 사용자가 수행해야 한다.
+- ESP32 OTA에 NORMAL → OTA_PREPARE → OTA_ACTIVE를 추가했다. PREPARE는 클라우드가 녹화 STOPPED를 확인한 뒤 기존 RAM·SPIFFS·HTTP 작업의 ACK/완료를 기다린다. ACTIVE 진입은 BLE 샘플 큐 등록과 같은 mutex 안에서 최종 빈 상태를 검사한다. ACTIVE에는 BLE 수집 공백을 명시적으로 기록하고 큐/스풀 신규 쓰기 및 일반 업로드를 중지한다. 실패·취소·타임아웃에는 OTA 쓰기를 중단하고 NORMAL 수집 및 클라우드 상태 복귀를 시도한다. 기존 미승인 UID, spool 파일, BLE 프로토콜, Wi-Fi 설정과 파티션은 변경하지 않았다.
+- BIN 실제 수신 바이트 수와 WebServer 보고 크기, `Update.write()` 결과, 서명된 manifest의 SHA-256을 검사한 뒤에만 `Update.end(true)`를 호출한다. HTTP 409 안전 조건과 HTTP 400 패키지·기록·이미지 오류는 별도 로그로 남긴다. `Update.end(true)`의 이미지 검증 경로는 설치된 ESP32 core 3.3.12 소스에서 확인했다.
+- `node --test tests/cloud.test.cjs` 30개, `python tests/ota_partition_test.py`, `tests/ota_signing_test.ps1`, 수정 ESP 파일의 `git diff --check`가 통과했다. 이는 모의 서버/정적 구성을 다루는 로컬 검증이며, 변경된 ESP 펌웨어의 실제 OTA 및 하드웨어 동작은 아직 검증하지 않았다. 장치 접근·펌웨어 업로드·플래시 쓰기는 하지 않았다.
+
+## 2026-10-17 ESP32 OTA 현장 준비와 상태 표시
+
+- **2.0.1 최초 OTA 실기 시험 준비(후속 읽기 전용 진단):** 사용자 승인 후 COM10에서 `0x8000` 파티션 테이블 4KiB만 `esptool --no-stub read-flash`로 읽었다. 실제 장치 테이블은 NVS `0x9000`/20KiB, otadata `0xE000`/8KiB, app0 `0x10000`/3MiB, SPIFFS `0x310000`/896KiB, coredump `0x3F0000`/64KiB, app1 `0x400000`/3MiB이고 로컬 빌드 테이블의 3072바이트와 일치한다(나머지 1024바이트는 `0xFF`). 플래시는 쓰지 않았다. 현재 실행 앱 슬롯/다음 OTA 슬롯은 이 테이블만으로는 확정하지 않았다.
+- 기존 2.0.1 `.bin`(1,487,616 bytes)을 `data/ota-2.0.1/`에 복사하고 기존 서명 스크립트로 `.manifest`를 만들었다. 실제 파일의 version `2.0.1`, build `2026101702`, SHA-256과 펌웨어에 내장된 공개키에 대한 ECDSA 서명을 검증했다. 개인키/토큰은 출력하지 않았다.
+- 진단 재시작 뒤 COM10 `OTA?` 응답은 `upload=disabled version=2.0.0 build=2026101701`이었다. 이전 IP `192.168.0.142` 접속은 timeout이며 현재 IP는 미확인이다. 실시간 로그에서 `Batch upload start n=1 spool=4` 뒤 `HTTP -1 application ACK=0 samples=1`, `spool=8`, 30초 재시도가 관찰됐다. 과거 backlog drained/STOPPED 로그는 현시점 준비 증거가 아니다. 따라서 OTA 안전 조건(인증 설정, Wi-Fi/클라우드 연결, RAM/spool 완전 배출, 녹화 중지)을 충족하지 못해 **실제 OTA 전송은 보류**했다. 미승인 spool은 유지했고 추가 업로드/포맷/삭제는 하지 않았다.
+
+- **사용자 실기 보고:** ESP32 펌웨어 2.0.0을 USB 업로드했고 부팅 로그에서 버전, SPIFFS 마운트, 로컬 OTA 주소, Wi-Fi/클라우드 ACK를 확인했다. 실제 장치의 파티션 테이블·실행 앱 슬롯·다음 OTA 슬롯·Wi-Fi OTA 성공/롤백은 아직 읽거나 시험하지 않았다.
+- 설치된 ESP32 Arduino core 3.3.12에서 `esp32s3`/16MB/Huge APP/PSRAM disabled/USB CDC enabled/Hardware CDC-JTAG로 빌드할 때 스케치의 `partitions.csv`가 core 기본 CSV보다 우선한다. 빌드 산출물에서 app0/app1 각 3MiB, `otadata` `0xE000`, SPIFFS `0x310000`/`0xE0000`를 확인했다. N16R8의 PSRAM은 현재 검증된 펌웨어 설정대로 사용하지 않는다.
+- 다음 OTA 이미지의 버전/빌드를 2.0.1/2026101702로 올리고, OTA 부팅 self-check와 rollback 확정 성공 후에만 GPIO48 NeoPixel이 3초간 비차단 무지개 표시 후 기존 상태색으로 복귀하게 했다. 장치 업로드/OTA 전송은 하지 않았다.
+- 노란색(주황색)은 BLE와 Wi-Fi가 연결됐으나 클라우드 ACK 대기 또는 미전송 backlog가 있을 때의 `PIXEL_WAIT`이다. nRF `MODE_COOL` 타이머는 60초이고 스캔 timeout은 60초, 주기는 120초다. ESP는 BLE 단절 시 마지막 `sensorHealth.mode`를 지우지 않으므로 대시보드 COOL 표시가 오래 남을 가능성은 있으나, 보고된 약 12분 현상의 실제 원인은 해당 구간의 `STAT MODE`/스캔/복구/BLE 로그와 화면 경과 시각 없이 확정할 수 없다. 안전 타이머와 주기는 바꾸지 않았다.
+- `arduino-cli compile` ESP32 2.0.1 통과(Flash 1,487,461/3,145,728 bytes; RAM 61,756/327,680 bytes; OTA용 `.bin` 1,487,616 bytes). 생성된 `partitions.bin`을 복호화해 NVS `0x9000`, otadata `0xE000`, app0 `0x10000`/3MiB, SPIFFS `0x310000`/896KiB, coredump `0x3F0000`, app1 `0x400000`/3MiB를 확인했다. `gateway_ui_test.cpp`, mock cloud 30개, 파티션 검사, 서명 검사, `git diff --check` 통과. 이는 로컬 검증이며 새 펌웨어의 실기 부팅/OTA 동작은 미검증이다.
+
+## 2026-10-17 다중 장치 대시보드 초기 조회 (로컬 검증)
+
+- 기존 22열 `EnvironmentHistory`가 있으면 `getDashboardDevices()`의 `sheets()`가 헤더 불일치로 실패하는 경로를 호스트 테스트에서 재현했다. 기존 행은 유지하고 마지막 `device_id` 헤더만 확장하도록 수정했다. 0대·오류·잘못된 응답·응답 지연은 대시보드 메시지로 표시한다. 모의 Sheets/브라우저 테스트 30개와 `git diff --check`가 통과했다. 운영 Apps Script 배포·실제 Sheets 조회는 이번 작업에서 수행하지 않았으며, 운영 화면의 정확한 실패 원인은 콘솔/Apps Script 실행 기록으로 확인해야 한다.
+
+## 2026-10-17 다중 장치/ESP32 OTA stage 2 (OTA 구현 준비, 실기 미검증)
+
+- Arduino IDE가 보고한 OTA SHA-256 컴파일 오류 3건에 대해 설치된 ESP32 core 3.3.12의 `mbedtls/sha256.h`를 확인했다. `mbedtls_sha256_starts`, `mbedtls_sha256_update`, `mbedtls_sha256_finish`가 모두 `int`를 반환하며 0은 성공이다. 펌웨어의 `_ret` 호출 3곳만 해당 선언으로 변경했고 기존 실패 시 reset 및 이미지 digest 비교는 유지했다. 호스트 테스트 28개, 파티션 검사, 서명/무결성 검사, `git diff --check`가 통과했다. CLI 재빌드는 `xtensa-esp32s3-elf-g++.exe` 실행 전 Windows `Illegal System DLL Relocation`에서 멈춰 OTA 소스 컴파일 성공은 아직 확인되지 않았다. 장치 업로드는 하지 않았다.
+- 사용자는 컴퓨터 재부팅 후 다중 장치 stage 1의 nRF와 ESP32 Arduino IDE 컴파일 성공을 보고했다. 새 OTA source의 ESP32 컴파일을 CLI로 시도했지만 `xtensa-esp32s3-elf-g++.exe` 시작 시 Windows `Illegal System DLL Relocation`이 재현됐다. sandbox 외 CLI 재시도는 60초 이상 출력 없이 진행되어 중단했으며 성공으로 보지 않는다. OTA 변경의 펌웨어 빌드는 아직 미확인이다.
+- ESP32 로컬 OTA updater, USB serial `OTA TOKEN` 인증, ECDSA P-256 서명 manifest + SHA-256 이미지 검증, 업데이트 중 명시적 사용자 승인, SPIFFS/큐 비어 있음 검사, 부팅 self-check 후 rollback 확정 경로를 준비했다. 앱 파티션 0/1은 각각 3 MiB이고 app1은 `0x400000`에 둔다. NVS/otadata/app0/SPIFFS/coredump의 현재 Huge APP 오프셋과 크기를 그대로 유지한 후보 `partitions.csv`를 추가했다. 현재 ESP32-S3 sdkconfig는 app rollback을 활성화한다.
+- Apps Script는 장치별 `UPDATING`/`VERIFYING` 상태를 `DeviceRegistry` 마지막 열에 보존하고, recording 시작과 OTA 예약을 script lock 안에서 상호 배타적으로 확인한다. dashboard에는 장치의 local IP updater 링크와 OTA 상태를 표시한다. production Apps Script 배포는 하지 않았다.
+- `node --test tests/cloud.test.cjs`: 28개 통과(mock Sheets); `python tests/ota_partition_test.py` 통과; `tests/ota_signing_test.ps1` 통과(임시 더미 이미지); `git diff --check` 통과. OTA source 빌드와 실제 rollback, 실제 partition table, OTA 성공/실패, 운영 배포는 미검증이다. USB를 통한 최초 파티션 표 설치는 현재 실기 table/SPIFFS 읽기 전용 백업과 별도 명시적 승인 후에만 진행해야 한다. 상세 실행 전제와 절차는 [ESP32 Wi-Fi OTA stage 2](docs/ESP32_WIFI_OTA_STAGE2.md)에 있다.
+
+## 2026-10-15 다중 장치 stage 1 (구현 완료, Arduino 빌드·실기 미검증)
+
+- 기준 `ee14429df974724311634cb6b7357a2cbda498a0`에서 `feature/multi-device-support` 브랜치를 만들었다. ESP32 eFuse MAC 기반 안정 `device_id`, nRF 공장 ID를 넣은 NUS 광고 이름, 별도 NVS namespace의 ESP 센서 pairing target, Apps Script 장치별 live/recording cache와 Sessions, 추가 `device_id` 열, 장치별 CSV 및 세로형 dashboard panel을 구현했다. 기존 gateway boot UID·ACK high-water·journal/retry와 Wi-Fi NVS namespace는 유지했다. 기존 행의 빈 device ID는 `legacy`로 취급한다.
+- 가상 장치 cloud/UI 테스트 `node --test tests/cloud.test.cjs`: 27개 통과(mock Sheets only; 실제 운영 배포/Sheets 변경 아님). `python tests/fingerprint_test.py`: 5개 통과. MSVC C++17 integrity/sensor/spool/gateway_ui 4개 통과. `git diff --check`: 통과.
+- 현재 실행 환경에서 Arduino CLI는 installed cores를 찾았으나 nRF/ESP 빌드의 컴파일러 실행이 Windows `Illegal System DLL Relocation`으로 중단되어 펌웨어 빌드는 확인하지 못했다. Apps Script 배포도 하지 않았다. 현재 실기기는 1호기만 있고, 새 pairing·동시 BLE 연결은 미검증이다.
+- Apps Script 첫 실행 때 SensorData/EnvironmentHistory/Unassigned 마지막 열과 Sessions의 다섯 번째 열을 추가하고 `DeviceRegistry` 탭을 만든다. 기존 데이터와 열 순서는 보존하도록 설계했다. 변경·마이그레이션 및 롤백·2호기 점검 절차는 [MULTI_DEVICE_STAGE1.md](docs/MULTI_DEVICE_STAGE1.md)에 있다.
+- ESP OTA, nRF BLE DFU, ESP 중계는 이번 단계에서 구현하지 않았다. 정상 설정 복구를 위해서는 정확한 파티션/바이너리 용량 비교와 nice!nano의 실제 bootloader DFU 호환성 확인 후 별도 승인을 받아야 한다.
 
 ## 2026-10-12 정상 동작 기준선 보존
 

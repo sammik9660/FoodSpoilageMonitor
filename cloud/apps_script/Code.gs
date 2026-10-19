@@ -5,10 +5,12 @@ const STALE_MS = 15000;
 const HEADERS = ['timestamp','temperature','humidity','pressure','gas_resistance',
   'sample_uid','session_id','nrf_seq','nrf_ms','capture_quality','received_at','nrf_boot',
   'sample_schema','scan_seq','heater_step','gas_index','meas_index','sensor_status',
-  'gas_valid','heater_stable','measurement_valid','profile_id'];
+  'gas_valid','heater_stable','measurement_valid','profile_id','device_id'];
 const LEGACY_WIDTH = 12;
-const SESSION_HEADERS = ['session_id','experiment_label','started_at','stopped_at'];
+const SESSION_HEADERS = ['session_id','experiment_label','started_at','stopped_at','device_id'];
 const INGEST_HEADERS = ['gateway_boot_id','ack_high_water','pending_transaction'];
+const DEVICE_HEADERS = ['device_id','first_seen_at','last_seen_at','firmware_version','sensor_id','ota_state'];
+const LEGACY_DEVICE_ID = 'legacy';
 
 function locked(fn) {
   const lock = LockService.getScriptLock();
@@ -42,31 +44,33 @@ function extendHeaders(s, headers, legacyWidth) {
     if((actual[i]!=='' && actual[i]!==headers[i]) || (actual[i]==='' && i<usedColumns))
       throw new Error('Schema extension would overwrite occupied column');
   if(actual.some((v,i)=>v!==headers[i]))s.getRange(1,1,1,headers.length).setValues([headers]);
+  return s;
 }
 function sheets() {
   const b=book(), sensor=b.getSheetByName('SensorData');
   // Never silently create/reset SensorData on reboot, missing config, or ingest.
   if (!sensor || !sensor.getLastRow()) throw new Error('Existing SensorData/header missing; manual repair required');
   extendHeaders(sensor,HEADERS,LEGACY_WIDTH);
-  return {b, sensor, sessions:auxiliary(b,'Sessions',SESSION_HEADERS),
+  return {b, sensor, sessions:extendHeaders(auxiliary(b,'Sessions',SESSION_HEADERS.slice(0,4)),SESSION_HEADERS,4),
     ingest:auxiliary(b,'IngestState',INGEST_HEADERS), unassigned:auxiliary(b,'Unassigned',HEADERS),
-    environment:auxiliary(b,'EnvironmentHistory',HEADERS)};
+    environment:extendHeaders(auxiliary(b,'EnvironmentHistory',HEADERS.slice(0,22)),HEADERS,22),
+    devices:extendHeaders(auxiliary(b,'DeviceRegistry',DEVICE_HEADERS.slice(0,5)),DEVICE_HEADERS,5)};
 }
 function dataRows(s) { return s.getLastRow()<2?[]:s.getRange(2,1,s.getLastRow()-1,s.getLastColumn()).getValues(); }
 function millis(v) { return v instanceof Date?v.getTime():typeof v==='number'?v:Date.parse(v); }
 function sessionsList(s) {
-  return dataRows(s).map(r=>({id:r[0],label:r[1],start:millis(r[2]),stop:r[3]?millis(r[3]):null}));
+  return dataRows(s).map(r=>({id:r[0],label:r[1],start:millis(r[2]),stop:r[3]?millis(r[3]):null,device_id:r[4]||LEGACY_DEVICE_ID}));
 }
-function activeSession(list) {
-  const active=list.filter(s=>s.stop===null);
+function activeSession(list, deviceId) {
+  const active=list.filter(s=>s.stop===null&&(!deviceId||s.device_id===deviceId));
   if(active.length>1) throw new Error('Multiple active sessions; manual repair required');
   return active[0]||null;
 }
-function sessionFor(sample, sessions) {
+function sessionFor(sample, sessions, deviceId) {
   // DATA INTEGRITY: capture time, NOT HTTP arrival, assigns session membership.
   // Late retries must not move samples across a subsequent Start/Stop boundary.
   if(sample.captured_at===null) return null;
-  const matches=sessions.filter(s=>sample.captured_at>=s.start && (s.stop===null || sample.captured_at<s.stop));
+  const matches=sessions.filter(s=>s.device_id===deviceId&&sample.captured_at>=s.start && (s.stop===null || sample.captured_at<s.stop));
   if(matches.length>1) throw new Error('Overlapping session intervals');
   return matches[0]||null;  // intervals are [start, stop)
 }
@@ -108,36 +112,56 @@ function recoverTransactions(ctx) {
   });
 }
 function setupReliability() { return locked(()=>{const ctx=sheets();recoverTransactions(ctx);return {success:true,spreadsheet_id:ctx.b.getId()};}); }
-function recordingResult(ctx) {
-  const list=sessionsList(ctx.sessions), active=activeSession(list);
+function recordingResult(ctx, deviceId) {
+  const list=sessionsList(ctx.sessions).filter(s=>s.device_id===deviceId), active=activeSession(list,deviceId);
   const latest=active?null:(list.slice().reverse().find(s=>s.stop!==null)||null);
   const download=active||latest;
-  return {state:active?'RECORDING':'STOPPED',session_id:active?active.id:null,experiment_label:active?active.label:null,
+  return {device_id:deviceId,state:active?'RECORDING':'STOPPED',session_id:active?active.id:null,experiment_label:active?active.label:null,
     download_session_id:download?download.id:null,download_experiment_label:download?download.label:null,
     download_kind:active?'CURRENT':latest?'LATEST':null};
 }
 function cacheRecording(record) {
-  try {CacheService.getScriptCache().put('RECORDING_V1',JSON.stringify(record),600);} catch(_) {}
+  try {CacheService.getScriptCache().put('RECORDING_V1:'+record.device_id,JSON.stringify(record),600);} catch(_) {}
   return record;
 }
-function startRecording(label) {
+function validDeviceId(value) {
+  if(value===undefined||value===null||value==='')return LEGACY_DEVICE_ID;
+  if(value===LEGACY_DEVICE_ID)return value;
+  if(typeof value!=='string'||! /^[a-f0-9]{12}$/.test(value))throw new Error('Invalid device ID');
+  return value;
+}
+function startRecording(label, requestedDeviceId) {
+  const deviceId=validDeviceId(requestedDeviceId);
   if(typeof label!=='string' || !label.trim() || label.length>120 || /^[=+@\-]/.test(label)) throw new Error('Invalid experiment label');
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
-    if(activeSession(sessionsList(ctx.sessions))) throw new Error('A session is already active');
+    const device=dataRows(ctx.devices).find(r=>r[0]===deviceId);
+    if(device&&(device[5]==='UPDATING'||device[5]==='VERIFYING')) throw new Error('Firmware update is active for this device');
+    if(activeSession(sessionsList(ctx.sessions),deviceId)) throw new Error('A session is already active for this device');
     const id='EXP-'+Utilities.getUuid(), now=new Date().toISOString();
     const row=ctx.sessions.getLastRow()+1;ensureRoom(ctx,ctx.sessions,row);
-    ctx.sessions.getRange(row,1,1,4).setValues([[id,label.trim(),now,'']]);
-    SpreadsheetApp.flush();return cacheRecording(recordingResult(ctx));
+    ctx.sessions.getRange(row,1,1,5).setValues([[id,label.trim(),now,'',deviceId]]);
+    SpreadsheetApp.flush();return cacheRecording(recordingResult(ctx,deviceId));
   });
 }
-function stopRecording() {
+function stopRecording(requestedDeviceId) {
+  const deviceId=validDeviceId(requestedDeviceId);
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
-    const list=sessionsList(ctx.sessions), active=activeSession(list);
+    const list=sessionsList(ctx.sessions), active=activeSession(list,deviceId);
     if(active) ctx.sessions.getRange(list.indexOf(active)+2,4).setValue(new Date().toISOString());
-    SpreadsheetApp.flush();return cacheRecording(recordingResult(ctx));
+    SpreadsheetApp.flush();return cacheRecording(recordingResult(ctx,deviceId));
   });
+}
+function registerDevice(ctx, deviceId, payload, now) {
+  if(deviceId===LEGACY_DEVICE_ID)return;
+  const rows=dataRows(ctx.devices), index=rows.findIndex(r=>r[0]===deviceId), row=index<0?ctx.devices.getLastRow()+1:index+2;
+  const old=index<0?null:rows[index], health=payload.health||{};
+  ensureRoom(ctx,ctx.devices,row);
+  const otaState=health.ota_state==='UPDATING'||health.ota_state==='VERIFYING'?health.ota_state:'IDLE';
+  ctx.devices.getRange(row,1,1,6).setValues([[deviceId,old?old[1]:new Date(now).toISOString(),
+    new Date(now).toISOString(),typeof health.firmware_version==='string'?health.firmware_version:(old?old[3]:''),
+    typeof payload.sensor_id==='string'?payload.sensor_id:(old?old[4]:''),otaState]]);
 }
 function number(v,min,max,name) {
   if(typeof v!=='number'||!Number.isFinite(v)||v<min||v>max) throw new Error('Invalid '+name);
@@ -193,7 +217,7 @@ function normalize(payload, now) {
     if(!Array.isArray(payload.samples)||payload.samples.length>MAX_BATCH)throw new Error('Invalid batch size');
     const samples=payload.samples.map(s=>payload.version===3?validateV3Sample(s,now):validateSample(s,now));
     for(let i=1;i<samples.length;i++)if(samples[i].boot!==samples[0].boot||samples[i].rx<=samples[i-1].rx)throw new Error('Batch must be strictly FIFO in one gateway boot');
-    return samples;
+    return {deviceId:validDeviceId(payload.device_id),sensorId:typeof payload.sensor_id==='string'?payload.sensor_id:'',samples};
   }
   // Legacy manual POST has no capture clock or retry identity. Preserve both old
   // key spellings, explicitly tag arrival-time quality; no retry dedup guarantee.
@@ -201,7 +225,7 @@ function normalize(payload, now) {
   const s={uid:Utilities.getUuid().replace(/-/g,'')+'-1',seq:1,ms:0,nrf_boot:0,
     captured_at:now,quality:'legacy_server',t:short?payload.T:payload.temperature,
     h:short?payload.H:payload.humidity,p:short?payload.P:payload.pressure,g:short?payload.G:payload.gas};
-  return [validateSample(s,now)];
+  return {deviceId:LEGACY_DEVICE_ID,sensorId:'',samples:[validateSample(s,now)]};
 }
 function healthSnapshot(h, now) {
   const out={server_seen_at:now};
@@ -220,13 +244,21 @@ function healthSnapshot(h, now) {
     h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),
     age_ms:number(x.age_ms,0,1e12,'environment age')};}catch(_) {}}
   if(h.latest) {const x=h.latest;try {out.latest={t:number(x.t,-40,85,'T'),h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),g:number(x.g,0,1e9,'G')};}catch(_) {}}
+  if(typeof h.firmware_version==='string')out.firmware_version=h.firmware_version;
+  if(typeof h.sensor_id==='string')out.sensor_id=h.sensor_id;
+  out.ota_state=h.ota_state==='UPDATING'||h.ota_state==='VERIFYING'?h.ota_state:'IDLE';
+  if(typeof h.local_ip==='string'&&/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h.local_ip))out.local_ip=h.local_ip;
   return out;
 }
 function ingest(payload) {
-  const now=Date.now(), samples=normalize(payload,now); // validate ALL before any mutation
+  const now=Date.now(), normalized=normalize(payload,now), samples=normalized.samples, deviceId=normalized.deviceId; // validate ALL before any mutation
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
-    const list=sessionsList(ctx.sessions);activeSession(list);
+    const health=payload.health||{};
+    const active=activeSession(sessionsList(ctx.sessions),deviceId);
+    if(health.ota_state==='UPDATING'&&active)throw new Error('Cannot update firmware while recording');
+    registerDevice(ctx,deviceId,payload,now);
+    const list=sessionsList(ctx.sessions);
     const acks=[];let saved=0;
     if(samples.length) {
       const boot=samples[0].boot, states=dataRows(ctx.ingest);
@@ -236,7 +268,7 @@ function ingest(payload) {
       samples.forEach(s=>{
         let status='duplicate';
         if(s.rx>high) {
-          const session=sessionFor(s,list);
+          const session=sessionFor(s,list,deviceId);
           status=s.captured_at===null?'unassigned_time':s.sample_schema===4||session?'stored':'not_recording';
           if(status==='stored'||status==='unassigned_time') {
             const values=[s.captured_at===null?'':new Date(s.captured_at).toISOString(),s.t,s.h,s.p,
@@ -246,7 +278,7 @@ function ingest(payload) {
               s.sample_schema===3?s.gas_index:'',s.sample_schema===3?s.meas_index:'',
               s.sample_schema===3?s.sensor_status:'',s.sample_schema===3?true:'',
               s.sample_schema===3?true:'',s.sample_schema===3?true:'',
-              s.sample_schema===3?s.profile_id:''];
+              s.sample_schema===3?s.profile_id:'',deviceId];
             groups[status==='unassigned_time'?'Unassigned':s.sample_schema===4?'EnvironmentHistory':'SensorData'].push(values);++saved;
           }
         }
@@ -266,14 +298,15 @@ function ingest(payload) {
         finishTransaction(ctx,row,boot,high,pending);
       }
     }
-    const record=cacheRecording(recordingResult(ctx));
+    const record=cacheRecording(recordingResult(ctx,deviceId));
     try {
       const snap=healthSnapshot(payload.health,now);
       // Health uses a bounded cache, never raw samples in ScriptProperties.
       if(!snap.latest && payload.version!==2 && payload.version!==3 && samples.length) {
         const s=samples[0];snap.latest={t:s.t,h:s.h,p:s.p,g:s.g};snap.last_valid_age_ms=0;
       }
-      CacheService.getScriptCache().put('LIVE_V2',JSON.stringify(snap),600);
+      snap.device_id=deviceId;snap.sensor_id=normalized.sensorId;
+      CacheService.getScriptCache().put('LIVE_V2:'+deviceId,JSON.stringify(snap),600);
     } catch(_) {} // storage ACK must not fail solely because dashboard cache failed
     return {success:true,version:payload.version===3?3:2,acks,stored:saved,recording:record,server_time:now};
   });
@@ -300,12 +333,13 @@ function doPost(e) {
   }
 }
 function json(v) {return ContentService.createTextOutput(JSON.stringify(v)).setMimeType(ContentService.MimeType.JSON);}
-function getDashboard() {
+function getDashboard(requestedDeviceId) {
+  const deviceId=validDeviceId(requestedDeviceId);
   const cache=CacheService.getScriptCache();
-  const cached=cache.get('RECORDING_V1');
+  const cached=cache.get('RECORDING_V1:'+deviceId);
   const recording=cached?JSON.parse(cached):locked(()=>{
-    const ctx=sheets();recoverTransactions(ctx);return cacheRecording(recordingResult(ctx));});
-  const raw=cache.get('LIVE_V2'), h=raw?JSON.parse(raw):null;
+    const ctx=sheets();recoverTransactions(ctx);return cacheRecording(recordingResult(ctx,deviceId));});
+  const raw=cache.get('LIVE_V2:'+deviceId), h=raw?JSON.parse(raw):null;
   const now=Date.now(), transportStale=!h||now-h.server_seen_at>STALE_MS;
   const env=h&&h.environment;
   const age=env?env.age_ms+now-h.server_seen_at:
@@ -322,9 +356,18 @@ function getDashboard() {
   else if(h.sensor_ok===false)state='SENSOR ERROR';
   else if(age===null||age>STALE_MS)state='STALE';
   else state='LIVE / ONLINE';
-  return {state,age,health:h,recording,server_time:now};
+  return {device_id:deviceId,state,age,health:h,recording,server_time:now};
 }
-function getSensorData() {return getDashboard();}
+function getDashboardDevices() {
+  return locked(()=>{
+    const ctx=sheets(), rows=dataRows(ctx.devices);
+    const ids=rows.map(r=>r[0]).filter(x=>typeof x==='string'&&/^[a-f0-9]{12}$/.test(x));
+    sessionsList(ctx.sessions).forEach(s=>{if(s.device_id===LEGACY_DEVICE_ID||/^[a-f0-9]{12}$/.test(s.device_id))ids.push(s.device_id);});
+    const unique=Array.from(new Set(ids));if(!unique.length)unique.push(LEGACY_DEVICE_ID);
+    return unique.map(id=>({device_id:id,first_seen_at:(rows.find(r=>r[0]===id)||[])[1]||null}));
+  });
+}
+function getSensorData(deviceId) {return getDashboard(deviceId);}
 function csvCell(v) {if(v instanceof Date)v=v.toISOString();return '"'+String(v===null?'':v).replace(/"/g,'""')+'"';}
 function csvFilename(label) {
   if(label===null)return 'food-spoilage-all.csv';
@@ -337,7 +380,8 @@ function csvFilename(label) {
   name=Array.from(name).slice(0,100).join('');
   return name+'.csv';
 }
-function getCsvPage(sessionId, offset, limit) {
+function getCsvPage(sessionId, offset, limit, requestedDeviceId) {
+  const deviceId=requestedDeviceId===undefined||requestedDeviceId===null||requestedDeviceId===''?null:validDeviceId(requestedDeviceId);
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
     const session=sessionId?sessionsList(ctx.sessions).find(s=>s.id===sessionId):null;
@@ -348,15 +392,16 @@ function getCsvPage(sessionId, offset, limit) {
     if(!Number.isInteger(offset)||offset<0||!Number.isInteger(limit)||limit<1||limit>10000)throw new Error('Invalid CSV page');
     const n=Math.max(0,Math.min(limit,total-offset));
     const rows=n?ctx.sensor.getRange(offset+2,1,n,HEADERS.length).getValues():[];
-    const selected=[HEADERS].concat(rows.filter(r=>!sessionId||r[6]===sessionId));
+    const selected=[HEADERS].concat(rows.filter(r=>(!sessionId||r[6]===sessionId)&&
+      (deviceId===null||(deviceId===LEGACY_DEVICE_ID?(r[22]||LEGACY_DEVICE_ID)===LEGACY_DEVICE_ID:r[22]===deviceId))));
     return {csv:selected.map(r=>r.map(csvCell).join(',')).join('\r\n'),
       filename:session?csvFilename(session.label):csvFilename(null)};
   });
 }
-function getCsvData(sessionId, offset, limit) {return getCsvPage(sessionId,offset,limit).csv;}
+function getCsvData(sessionId, offset, limit, deviceId) {return getCsvPage(sessionId,offset,limit,deviceId).csv;}
 function doGet(e) {
   if(e&&e.parameter&&e.parameter.download==='csv') {
-    const page=getCsvPage(e.parameter.session||'',e.parameter.offset,e.parameter.limit);
+    const page=getCsvPage(e.parameter.session||'',e.parameter.offset,e.parameter.limit,e.parameter.device);
     return ContentService.createTextOutput('\uFEFF'+page.csv).setMimeType(ContentService.MimeType.CSV).downloadAsFile(page.filename);
   }
   const template=HtmlService.createTemplateFromFile('Dashboard');

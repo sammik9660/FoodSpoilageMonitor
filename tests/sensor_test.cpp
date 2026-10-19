@@ -27,6 +27,7 @@ static void endCooling(){
  assert(sensorMode==MODE_ENV && !(testGas1&BME68X_RUN_GAS_MSK));
 }
 int main(){
+ assert(GAS_SCAN_INTERVAL_MS==600000);
  assert(isMeasurementValid(true,25,50,100000,70000));
  assert(!isMeasurementValid(true,25,50,100000,0));
  assert(!isMeasurementValid(true,NAN,50,100000,70000));
@@ -78,7 +79,7 @@ int main(){
  assert(sensorReady&&sensorMode==MODE_COOL);
  endCooling();envCycle(testMillis+10);assert(recoveries>=2);
  // A bounded scan with no real gas result resets the sensor instead of idling
- // with the heater on until the next 2-minute slot.
+ // with the heater on until the next 10-minute slot.
  nextGasScan=testMillis+1000;dueScan();const uint32_t attemptsBeforeTimeout=recoveryAttempts;
  testMillis=scanStartedAt+GAS_SCAN_TIMEOUT_MS;lastHealth=testMillis;loop();
  assert(recoveryAttempts>attemptsBeforeTimeout&&sensorMode==MODE_COOL);
@@ -109,5 +110,5 @@ int main(){
  gas_scan::Tracker tracker;assert(tracker.observe(0,254,true));
  assert(tracker.observe(2,255,true));assert(tracker.observe(2,0,true));
  tracker.observe(9,1,true);assert(tracker.complete==0&&tracker.incomplete==1);
- puts("PASS nRF real source: ENV/GAS/COOL, heater-off, 2s/2m schedules, incomplete scan, recovery, watchdog and wrap");
+ puts("PASS nRF real source: ENV/GAS/COOL, heater-off, 2s/10m schedules, incomplete scan, recovery, watchdog and wrap");
 }

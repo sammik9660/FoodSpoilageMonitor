@@ -2,56 +2,63 @@
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body{font:16px system-ui;background:#f3f5f6;color:#172b36;max-width:850px;margin:32px auto;padding:0 18px}
-section{background:white;padding:20px;margin:16px 0;border-radius:12px}button,a{padding:10px;display:inline-block;margin:4px}
-input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{color:#b42318}#values{font-size:22px}
+section.device{background:white;padding:20px;margin:16px 0;border-radius:12px}button,a{padding:10px;display:inline-block;margin:4px}
+input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{color:#b42318}.values{font-size:22px}
 [hidden]{display:none!important}
 </style></head><body>
-<h1>Food Spoilage Monitor</h1>
-<section><strong id="state">WAITING / UNKNOWN</strong><p id="measurement">Measurement mode: unknown</p><p id="age">No confirmed sample</p><p id="updated">Last update: unknown</p><div id="values">—</div><p id="gas">No valid gas sample</p>
-<p>Values are live telemetry, not a food-safety verdict. Stale values remain labeled as stale.</p></section>
-<section><h2 id="recording">STOPPED / loading state</h2><p id="session"></p>
-<input id="label" maxlength="120" placeholder="Experiment label" aria-label="Experiment label">
-<button id="start" onclick="control(true)">Start Recording</button><button id="stop" onclick="control(false)">Stop Recording</button>
-<p id="message" role="status"></p>
-<p>CSV page: up to 10,000 source rows. Offset 0 is the first data row.</p>
-<input id="csvOffset" type="number" min="0" step="10000" value="0" aria-label="CSV source row offset" onchange="csvLinks()">
-<a id="all" href="<?= webAppUrl ?>?download=csv" target="_blank" rel="noopener">All data CSV — selected page</a>
-<a id="sessionCsv" hidden target="_blank" rel="noopener">Session CSV — selected page</a>
-<p>Session boundaries use capture time. Delayed batches can still complete a stopped session.
-Unknown-time samples are retained in the Unassigned sheet, outside experiments.</p></section>
-<section><h2>Diagnostics</h2><p id="transport">Wi-Fi / BLE / cloud ACK: unknown</p><pre id="health">Waiting for gateway heartbeat</pre></section>
+<h1>Food Spoilage Monitor</h1><p id="loading">Loading devices…</p><div id="devices"></div>
 <script>
-const refreshMs=<?= refreshMs ?>;
-const base=document.getElementById('all').href.split('?')[0];
-let busy=false,sessionId=null;
-function csvLinks(){const offset=Number(document.getElementById('csvOffset').value);document.getElementById('all').href=base+'?download=csv&offset='+offset+'&limit=10000';document.getElementById('sessionCsv').href=base+'?download=csv&offset='+offset+'&limit=10000&session='+encodeURIComponent(sessionId||'');}
-function error(e){document.getElementById('message').textContent=String(e.message||e);document.getElementById('message').className='error';}
-function show(d){
- document.getElementById('state').textContent=d.state;
- const h=d.health||{};
+const refreshMs=<?= refreshMs ?>,base='<?= webAppUrl ?>';
+const panels=new Map(),polling=new Set();
+function panelMarkup(id,index){return `<section class="device" id="panel-${id}"><h2>Device ${index+1} · ${id}</h2>
+<strong id="state-${id}">WAITING / UNKNOWN</strong><p id="measurement-${id}">Measurement mode: unknown</p><p id="age-${id}">No confirmed sample</p><p id="updated-${id}">Last update: unknown</p><div class="values" id="values-${id}">—</div><p id="gas-${id}">No valid gas sample</p>
+<p>Values are live telemetry, not a food-safety verdict. Stale values remain labeled as stale.</p>
+<h3 id="recording-${id}">STOPPED / loading state</h3><p id="session-${id}"></p>
+<input id="label-${id}" maxlength="120" placeholder="Experiment label" aria-label="Experiment label for ${id}">
+<button id="start-${id}" onclick="control('${id}',true)">Start Recording</button><button id="stop-${id}" onclick="control('${id}',false)">Stop Recording</button><p id="message-${id}" role="status"></p>
+<p>CSV page: up to 10,000 source rows. Offset 0 is the first data row.</p><input id="offset-${id}" type="number" min="0" step="10000" value="0" aria-label="CSV source row offset for ${id}" onchange="csvLinks('${id}')">
+<a id="all-${id}" href="${base}?download=csv" target="_blank" rel="noopener">Device data CSV — selected page</a><a id="sessionCsv-${id}" hidden target="_blank" rel="noopener">Session CSV — selected page</a>
+<p>Session boundaries use capture time. Delayed batches can still complete a stopped session. Unknown-time samples remain Unassigned.</p>
+<h3>Firmware</h3><p id="firmware-${id}">Version: unknown</p><p id="ota-${id}">OTA: unavailable</p><a id="otaLink-${id}" hidden target="_blank" rel="noopener">Open local signed updater</a>
+<h3>Diagnostics</h3><p id="transport-${id}">Wi-Fi / BLE / cloud ACK: unknown</p><pre id="health-${id}">Waiting for gateway heartbeat</pre></section>`;}
+function el(id,suffix){return document.getElementById(suffix+'-'+id);}
+function csvLinks(id){const offset=Number(el(id,'offset').value),session=panels.get(id)?.sessionId||'';
+ el(id,'all').href=base+'?download=csv&offset='+offset+'&limit=10000&device='+encodeURIComponent(id);
+ el(id,'sessionCsv').href=base+'?download=csv&offset='+offset+'&limit=10000&session='+encodeURIComponent(session)+'&device='+encodeURIComponent(id);}
+function deviceError(message){const loading=document.getElementById('loading');loading.textContent=message;loading.className='error';}
+function renderDevices(list){
+ if(!Array.isArray(list)||list.some(x=>!x||typeof x.device_id!=='string'||!/^(legacy|[a-f0-9]{12})$/.test(x.device_id))){deviceError('CLOUD ERROR: Invalid device list response');return;}
+ const root=document.getElementById('devices'),ids=list.map(x=>x.device_id);
+ for(const id of panels.keys())if(!ids.includes(id)){document.getElementById('panel-'+id)?.remove();panels.delete(id);}
+ ids.forEach((id,index)=>{if(!panels.has(id)){root.insertAdjacentHTML('beforeend',panelMarkup(id,index));panels.set(id,{sessionId:null});}pollDevice(id);});
+ const loading=document.getElementById('loading');loading.textContent=ids.length?'':'No devices registered yet';loading.className='';}
+function show(id,d){el(id,'state').textContent=d.state;const h=d.health||{};
  const modes={ENV:'Environment sampling',GAS:'HP-354 gas scan',COOL:'Cooling / settling',REC:'Sensor recovery',LEGACY:'Legacy gas stream'};
- document.getElementById('measurement').textContent='Measurement mode: '+(modes[h.sensor_mode]||'unknown');
- document.getElementById('age').textContent=d.age===null?'Last environment sample: unknown':'Last environment sample: '+(d.age/1000).toFixed(1)+' s ago';
- document.getElementById('updated').textContent=d.age===null?'Last update: unknown':'Last update: '+new Date(d.server_time-d.age).toLocaleString();
- const v=h.environment||(!h.sensor_mode||h.sensor_mode==='LEGACY'?h.latest:null);
- const prefix=d.state==='LIVE / ONLINE'?'':'Last measured (not current): ';
- document.getElementById('values').textContent=v?`${prefix}${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa`:'No valid environment sample';
+ el(id,'measurement').textContent='Measurement mode: '+(modes[h.sensor_mode]||'unknown');
+ el(id,'age').textContent=d.age===null?'Last environment sample: unknown':'Last environment sample: '+(d.age/1000).toFixed(1)+' s ago';
+ el(id,'updated').textContent=d.age===null?'Last update: unknown':'Last update: '+new Date(d.server_time-d.age).toLocaleString();
+ const v=h.environment||(!h.sensor_mode||h.sensor_mode==='LEGACY'?h.latest:null),prefix=d.state==='LIVE / ONLINE'?'':'Last measured (not current): ';
+ el(id,'values').textContent=v?`${prefix}${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa`:'No valid environment sample';
  const gasAge=h.last_valid_age_ms!=null&&h.server_seen_at!=null?h.last_valid_age_ms+d.server_time-h.server_seen_at:null;
- document.getElementById('gas').textContent=h.latest&&h.latest.g>0&&gasAge!=null?`Last valid gas: ${h.latest.g.toFixed(2)} kΩ · ${(gasAge/1000).toFixed(0)} s ago`:'No valid gas sample';
- const r=d.recording;document.getElementById('recording').textContent=r.state;
- document.getElementById('session').textContent=r.session_id?`${r.session_id} / ${r.experiment_label}`:r.download_session_id?`Latest: ${r.download_session_id} / ${r.download_experiment_label}`:'No recorded experiment';
- document.getElementById('start').disabled=r.state==='RECORDING';document.getElementById('stop').disabled=r.state!=='RECORDING';
- sessionId=r.download_session_id;const link=document.getElementById('sessionCsv');link.hidden=!sessionId;
- link.textContent=r.download_kind==='CURRENT'?'Current Session CSV — selected page':'Latest Session CSV — selected page';csvLinks();
- const seen=h.server_seen_at?new Date(h.server_seen_at).toLocaleString():'unknown';
- const ackAge=h.gateway_uptime_ms&&h.last_ack_ms?((h.gateway_uptime_ms-h.last_ack_ms)/1000).toFixed(1)+' s at last contact':'unknown';
- document.getElementById('transport').textContent=`Wi-Fi: ${h.wifi_connected_ms?'connected at gateway uptime '+Math.round(h.wifi_connected_ms/1000)+' s':'unknown'} · BLE: ${h.ble_connected===true?'connected':h.ble_connected===false?'disconnected':'unknown'} · cloud ACK age: ${ackAge} · last cloud contact: ${seen}`;
- document.getElementById('health').textContent=JSON.stringify(h,null,2);
-}
-function poll(){if(busy)return;busy=true;google.script.run.withSuccessHandler(d=>{busy=false;show(d);}).withFailureHandler(e=>{busy=false;document.getElementById('state').textContent='CLOUD/UPLOAD ERROR (dashboard request)';error(e);}).getDashboard();}
-function control(start){
- const runner=google.script.run.withSuccessHandler(()=>{document.getElementById('message').textContent='Recording state updated';poll();}).withFailureHandler(error);
- if(start)runner.startRecording(document.getElementById('label').value);else runner.stopRecording();
-}
-csvLinks();setInterval(poll,refreshMs);poll();
+ el(id,'gas').textContent=h.latest&&h.latest.g>0&&gasAge!=null?`Last valid gas: ${h.latest.g.toFixed(2)} kΩ · ${(gasAge/1000).toFixed(0)} s ago`:'No valid gas sample';
+ const r=d.recording;el(id,'recording').textContent=r.state;
+ el(id,'session').textContent=r.session_id?`${r.session_id} / ${r.experiment_label}`:r.download_session_id?`Latest: ${r.download_session_id} / ${r.download_experiment_label}`:'No recorded experiment';
+ const updating=h.ota_state==='UPDATING'||h.ota_state==='VERIFYING';
+ el(id,'start').disabled=r.state==='RECORDING'||updating;el(id,'stop').disabled=r.state!=='RECORDING';
+ panels.get(id).sessionId=r.download_session_id;const link=el(id,'sessionCsv');link.hidden=!r.download_session_id;
+ link.textContent=r.download_kind==='CURRENT'?'Current Session CSV — selected page':'Latest Session CSV — selected page';csvLinks(id);
+ const seen=h.server_seen_at?new Date(h.server_seen_at).toLocaleString():'unknown',ackAge=h.gateway_uptime_ms&&h.last_ack_ms?((h.gateway_uptime_ms-h.last_ack_ms)/1000).toFixed(1)+' s at last contact':'unknown';
+ el(id,'firmware').textContent='Version: '+(h.firmware_version||'unknown');
+ el(id,'ota').textContent='OTA: '+(h.ota_state||'unknown');
+ const otaLink=el(id,'otaLink');const ip=typeof h.local_ip==='string'&&/^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)\d{1,3}\.\d{1,3}$/.test(h.local_ip);
+ otaLink.hidden=!ip;if(ip)otaLink.href='http://'+h.local_ip+'/';
+ el(id,'transport').textContent=`Wi-Fi: ${h.wifi_connected_ms?'connected at gateway uptime '+Math.round(h.wifi_connected_ms/1000)+' s':'unknown'} · BLE: ${h.ble_connected===true?'connected':h.ble_connected===false?'disconnected':'unknown'} · cloud ACK age: ${ackAge} · last cloud contact: ${seen}`;
+ el(id,'health').textContent=JSON.stringify(h,null,2);}
+function pollDevice(id){if(polling.has(id))return;polling.add(id);google.script.run.withSuccessHandler(d=>{polling.delete(id);if(panels.has(id))show(id,d);}).withFailureHandler(e=>{polling.delete(id);if(panels.has(id)){el(id,'state').textContent='CLOUD/UPLOAD ERROR (dashboard request)';el(id,'message').textContent=String(e.message||e);el(id,'message').className='error';}}).getDashboard(id);}
+function poll(){try{google.script.run.withSuccessHandler(renderDevices).withFailureHandler(e=>deviceError('CLOUD ERROR: '+String(e&&e.message||e))).getDashboardDevices();}
+ catch(e){deviceError('CLOUD ERROR: '+String(e&&e.message||e));}}
+function control(id,start){const runner=google.script.run.withSuccessHandler(()=>{el(id,'message').textContent='Recording state updated';pollDevice(id);}).withFailureHandler(e=>{el(id,'message').textContent=String(e.message||e);el(id,'message').className='error';});
+ if(start)runner.startRecording(el(id,'label').value,id);else runner.stopRecording(id);}
+setTimeout(()=>{if(document.getElementById('loading').textContent==='Loading devices…')deviceError('Device lookup is taking longer than expected; check Apps Script execution log and browser console');},20000);
+setInterval(poll,refreshMs);poll();
 </script></body></html>

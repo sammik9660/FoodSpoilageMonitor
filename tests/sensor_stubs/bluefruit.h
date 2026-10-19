@@ -20,5 +20,5 @@ inline std::string transmitted;
 inline bool testBleConnected=true;
 struct BLEUart{void begin(){}bool notifyEnabled(){return true;}size_t write(const uint8_t* p,size_t n){transmitted.append((char*)p,n);return n;}};
 struct AdvertisingStub{void addService(BLEUart&){}void addName(){}void restartOnDisconnect(bool){}void setInterval(int,int){}void setFastTimeout(int){}void start(int){}};
-struct BluefruitStub{AdvertisingStub Advertising;void begin(){}void setTxPower(int){}void setName(const char*){}void autoConnLed(bool){}bool connected(){return testBleConnected;}};
+struct BluefruitStub{AdvertisingStub Advertising,ScanResponse;void begin(){}void setTxPower(int){}void setName(const char*){}void autoConnLed(bool){}bool connected(){return testBleConnected;}};
 inline BluefruitStub Bluefruit;

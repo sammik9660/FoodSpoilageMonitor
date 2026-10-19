@@ -47,7 +47,23 @@ function v3(seq,step,time){return {...sample(seq,time,{ms:seq*140}),sample_schem
  scan_seq:1,heater_step:step,gas_index:step,meas_index:step,sensor_status:0xb0,
  gas_valid:true,heater_stable:true,measurement_valid:true,profile_id:354};}
 function test(name,f){f();tests++;console.log('PASS '+name);}
-test('migration preserves historical rows and extends headers',()=>{const e=environment();assert.deepEqual(e.sensor.rows[1],['historical',20,40,1000,70]);assert.equal(e.sensor.rows[0].length,22);});
+test('migration preserves historical rows and appends device ID after existing schema',()=>{const e=environment();assert.deepEqual(e.sensor.rows[1],['historical',20,40,1000,70]);assert.equal(e.sensor.rows[0].length,23);assert.equal(e.sensor.rows[0][22],'device_id');});
+test('device lookup extends legacy sheet headers without changing historical rows',()=>{
+ const e=environment(),history=e.all.get('EnvironmentHistory');
+ e.sensor.rows[0]=e.sensor.rows[0].slice(0,12);
+ e.all.get('Sessions').rows[0]=e.all.get('Sessions').rows[0].slice(0,4);
+ e.all.get('Unassigned').rows[0]=e.all.get('Unassigned').rows[0].slice(0,22);
+ e.all.get('DeviceRegistry').rows[0]=e.all.get('DeviceRegistry').rows[0].slice(0,5);
+ history.rows=[history.rows[0].slice(0,22),['historical',20,40,1000,'']];
+ const before=history.rows[1].slice();
+ const devices=e.api.getDashboardDevices();
+ assert.deepEqual(Array.from(devices,x=>x.device_id),['legacy']);
+ assert.equal(history.rows[0][22],'device_id');assert.deepEqual(history.rows[1],before);
+ assert.equal(e.sensor.rows[0][22],'device_id');assert.deepEqual(e.sensor.rows[1],['historical',20,40,1000,70]);
+ assert.equal(e.all.get('Sessions').rows[0][4],'device_id');
+ assert.equal(e.all.get('Unassigned').rows[0][22],'device_id');
+ assert.equal(e.all.get('DeviceRegistry').rows[0][5],'ota_state');
+});
 test('migration refuses occupied columns without recognized headers',()=>{
  const e=environment();e.sensor.rows[0]=e.sensor.rows[0].slice(0,12);e.sensor.rows[1][12]='unknown data';
  assert.throws(()=>e.api.setupReliability(),/occupied column/);assert.equal(e.sensor.rows[1][12],'unknown data');
@@ -56,7 +72,7 @@ test('v2 pending journal replays into wider schema without resetting rows',()=>{
  const e=environment(),row=[new Date(e.now()).toISOString(),25,50,1000,70,boot+'-1','EXP-OLD',1,140,'ntp',new Date(e.now()).toISOString(),42];
  e.sensor.rows[0]=e.sensor.rows[0].slice(0,12);
  e.all.get('IngestState').rows[1]=[boot,0,JSON.stringify({high:1,groups:[{sheet:'SensorData',start:3,rows:[row]}]})];
- e.api.setupReliability();assert.equal(e.sensor.rows[0].length,22);
+ e.api.setupReliability();assert.equal(e.sensor.rows[0].length,23);
  assert.deepEqual(e.sensor.rows[2].slice(0,12),row);assert(e.sensor.rows[2].slice(12).every(x=>x===''));
  assert.equal(e.all.get('IngestState').rows[1][1],1);
 });
@@ -132,6 +148,19 @@ test('one active session, STOP idempotent, no auto recreate',()=>{
  const e=environment();e.api.startRecording('A');assert.throws(()=>e.api.startRecording('B'));e.api.stopRecording();e.api.stopRecording();
  e.props.delete('SPREADSHEET_ID');assert.throws(()=>send(e,[]),/missing/);assert.equal(e.sensor.getLastRow(),2);
 });
+test('OTA lease and recording start are mutually exclusive per device',()=>{
+ const e=environment(),a='111111111111',b='222222222222';
+ e.api.startRecording('active',a);
+ assert.throws(()=>e.api.ingest({version:2,device_id:a,samples:[],health:{ota_state:'UPDATING'}}),/Cannot update firmware while recording/);
+ e.api.stopRecording(a);
+ e.api.ingest({version:2,device_id:a,samples:[],health:{ota_state:'UPDATING'}});
+ assert.throws(()=>e.api.startRecording('blocked',a),/Firmware update is active/);
+ const other=e.api.startRecording('independent',b);assert.equal(other.state,'RECORDING');
+ e.api.ingest({version:2,device_id:a,samples:[],health:{ota_state:'VERIFYING'}});
+ assert.throws(()=>e.api.startRecording('blocked while verifying',a),/Firmware update is active/);
+ e.api.ingest({version:2,device_id:a,samples:[],health:{ota_state:'IDLE'}});
+ assert.equal(e.api.startRecording('released',a).state,'RECORDING');
+});
 test('CSV route, session filter and absolute deployed link template',()=>{
  const e=environment();const r=e.api.startRecording('냉장 사과:01/테스트');send(e,[sample(1,e.now())]);const session=e.api.doGet({parameter:{download:'csv',session:r.session_id}});
  assert(session.text.includes('sample_uid'));assert(session.text.includes(boot+'-1'));assert(!session.text.includes('historical'));
@@ -139,7 +168,7 @@ test('CSV route, session filter and absolute deployed link template',()=>{
  assert.equal(e.api.doGet({parameter:{download:'csv'}}).filename,'food-spoilage-all.csv');
  e.api.stopRecording();const stopped=e.api.getDashboard().recording;
  assert.equal(stopped.state,'STOPPED');assert.equal(stopped.download_session_id,r.session_id);assert.equal(stopped.download_kind,'LATEST');
- const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');assert(html.includes('<?= webAppUrl ?>?download=csv'));
+ const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');assert(html.includes("base='<?= webAppUrl ?>'"));assert(html.includes("&device='+encodeURIComponent(id)"));
 });
 test('dashboard cannot report live solely from successful RPC',()=>{const e=environment();assert(!e.api.getDashboard().state.includes('ONLINE'));e.api.ingest({version:2,samples:[],health:{ble_connected:true,sensor_ok:false,last_valid_age_ms:100}});assert.equal(e.api.getDashboard().state,'SENSOR ERROR');e.setTime(e.now()+31000);assert(e.api.getDashboard().state.startsWith('STALE'));});
 test('large CSV requires explicit pages and never silently truncates',()=>{
@@ -148,20 +177,54 @@ test('large CSV requires explicit pages and never silently truncates',()=>{
  const page=e.api.getCsvData('',10000,10000);assert(page.includes('row9999'));assert(!page.includes('row9998'));
  assert.throws(()=>e.api.getCsvData('',0,10001),/Invalid CSV/);
 });
-test('dashboard JavaScript executes and builds absolute paged session links',()=>{
- const e=environment(),elements=new Map();
- function el(id){if(!elements.has(id))elements.set(id,{value:id==='csvOffset'?'0':'test',href:id==='all'?'https://example.invalid/exec?download=csv':'',textContent:'',hidden:false});return elements.get(id);}
- let ok,fail;const runner={withSuccessHandler(f){ok=f;return this;},withFailureHandler(f){fail=f;return this;},getDashboard(){ok(e.api.getDashboard());},startRecording(label){try{ok(e.api.startRecording(label));}catch(x){fail(x);}},stopRecording(){ok(e.api.stopRecording());}};
- const ctx={document:{getElementById:el},google:{script:{run:runner}},setInterval(){},Number,String,JSON,encodeURIComponent};
- vm.createContext(ctx);const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
- vm.runInContext(html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','10000'),ctx);
- assert(el('all').href.startsWith('https://example.invalid/exec?download=csv&offset=0'));
- ctx.control(true);assert.equal(el('recording').textContent,'RECORDING');assert(el('sessionCsv').href.includes('&session=EXP-'));
- assert(el('sessionCsv').textContent.startsWith('Current Session CSV'));const currentHref=el('sessionCsv').href;
- ctx.control(false);assert.equal(el('recording').textContent,'STOPPED');assert.equal(el('sessionCsv').hidden,false);
- assert(el('sessionCsv').textContent.startsWith('Latest Session CSV'));assert.equal(el('sessionCsv').href,currentHref);
- ctx.control(true);assert.equal(el('recording').textContent,'RECORDING');assert(el('sessionCsv').textContent.startsWith('Current Session CSV'));
- assert.notEqual(el('sessionCsv').href,currentHref);
+test('dashboard defines device-scoped panels, polling, controls and paged CSV links',()=>{
+ const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
+ assert(html.includes('getDashboardDevices()'));assert(html.includes('getDashboard(id)'));
+ assert(html.includes('startRecording(el(id,\'label\').value,id)'));assert(html.includes('stopRecording(id)'));
+ assert(html.includes('h.ota_state===\'UPDATING\''));assert(html.includes('Open local signed updater'));
+ assert(html.includes("device='+encodeURIComponent(id)"));assert(html.includes("session='+encodeURIComponent(session)"));
+ assert(html.includes('section.device'));assert(html.includes('panels=new Map()'));
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','8000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
+ assert.doesNotThrow(()=>new Function(script));
+});
+test('dashboard renders two virtual devices and scopes control, errors, and CSV links',()=>{
+ const e=environment(),a='111111111111',b='222222222222',elements=new Map();
+ e.api.ingest({version:2,device_id:a,samples:[],health:{ble_connected:true}});
+ e.api.ingest({version:2,device_id:b,samples:[],health:{ble_connected:false}});
+ function element(id){if(!elements.has(id))elements.set(id,{id,value:id.startsWith('label-')?'label-'+id.slice(6):'0',href:'',textContent:'',hidden:false,disabled:false,className:'',remove(){elements.delete(id);}});return elements.get(id);}
+ element('loading');const devices=element('devices');devices.insertAdjacentHTML=(_,html)=>{for(const match of html.matchAll(/id="([^"]+)"/g))element(match[1]);};
+ let success=null,failure=null,offlineB=false;
+ const runner={withSuccessHandler(fn){success=fn;return this;},withFailureHandler(fn){failure=fn;return this;},
+  getDashboardDevices(){success(e.api.getDashboardDevices());},getDashboard(id){if(id===b&&offlineB){failure(Error('unit B offline'));return;}success(e.api.getDashboard(id));},
+  startRecording(label,id){try{success(e.api.startRecording(label,id));}catch(err){failure(err);}},stopRecording(id){try{success(e.api.stopRecording(id));}catch(err){failure(err);}}};
+ const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','8000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
+ const ctx={document:{getElementById:element},google:{script:{run:runner}},setInterval(){},setTimeout(){},Number,String,JSON,encodeURIComponent,Map,Date};
+ vm.createContext(ctx);vm.runInContext(script,ctx);
+ assert(element('panel-'+a)&&element('panel-'+b));
+ ctx.control(a,true);assert.equal(e.api.getDashboard(a).recording.state,'RECORDING');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
+ assert(element('all-'+a).href.includes('device='+a));assert(element('all-'+b).href.includes('device='+b));
+ offlineB=true;ctx.poll();assert.equal(element('state-'+a).textContent,e.api.getDashboard(a).state);assert.equal(element('state-'+b).textContent,'CLOUD/UPLOAD ERROR (dashboard request)');
+ ctx.control(a,false);assert.equal(e.api.getDashboard(a).recording.state,'STOPPED');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
+});
+test('device loading displays empty, failure, malformed response, and delayed lookup states',()=>{
+ const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','8000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
+ function run(mode){
+  const loading={textContent:'Loading devices…',className:''},devices={insertAdjacentHTML(){}},element=id=>id==='loading'?loading:devices;
+  let timer,success,failure;
+  const runner={withSuccessHandler(fn){success=fn;return this;},withFailureHandler(fn){failure=fn;return this;},
+   getDashboardDevices(){if(mode==='empty')success([]);else if(mode==='failure')failure(Error('sheet unavailable'));
+    else if(mode==='throw')throw Error('RPC unavailable');
+    else if(mode==='malformed')success({devices:[]});}};
+  const ctx={document:{getElementById:element},google:{script:{run:runner}},setInterval(){},setTimeout(fn){timer=fn;},Number,String,JSON,encodeURIComponent,Map,Date};
+  vm.createContext(ctx);vm.runInContext(script,ctx);return {loading,timer};
+ }
+ assert.equal(run('empty').loading.textContent,'No devices registered yet');
+ assert.match(run('failure').loading.textContent,/CLOUD ERROR: sheet unavailable/);
+ assert.match(run('throw').loading.textContent,/CLOUD ERROR: RPC unavailable/);
+ assert.match(run('malformed').loading.textContent,/Invalid device list response/);
+ const pending=run('pending');pending.timer();assert.match(pending.loading.textContent,/taking longer than expected/);
 });
 test('environment history uses schema 4 without gas, keeps SensorData and ACK identity',()=>{
  const e=environment(),t=e.now();const env={...sample(1,t),sample_schema:4};delete env.g;
@@ -201,7 +264,29 @@ test('dashboard labels scan and cooling as paused with aged ambient telemetry',(
   sensor_mode:'COOL',environment:{t:25,h:50,p:1000,age_ms:11000}}});
  assert.equal(e.api.getDashboard().state,'COOLING / ENVIRONMENT PAUSED');
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
- assert(html.includes('Last measured (not current): '));assert(html.includes('id="measurement"'));
+ assert(html.includes('Last measured (not current): '));assert(html.includes("el(id,'measurement')"));
  assert(html.includes("GAS:'HP-354 gas scan'"));assert(!html.includes('v.g.toFixed'));
+});
+test('two virtual gateways keep recording, live cache, registry, and CSV isolated',()=>{
+ const e=environment(),a='111111111111',b='222222222222',t=e.now(),bootA='a'.repeat(32),bootB='b'.repeat(32);
+ const recA=e.api.startRecording('unit one',a),recB=e.api.startRecording('unit two',b);
+ assert.equal(recA.state,'RECORDING');assert.equal(recB.state,'RECORDING');
+ const sa={...sample(1,t),uid:bootA+'-1'},sb={...sample(1,t),uid:bootB+'-1'};
+ assert.equal(e.api.ingest({version:2,device_id:a,sensor_id:'aaaabbbbcccc',samples:[sa],health:{ble_connected:true,latest:{t:20,h:40,p:1000,g:55}}}).stored,1);
+ assert.equal(e.api.ingest({version:2,device_id:b,sensor_id:'ddddeeeeffff',samples:[sb],health:{ble_connected:false,latest:{t:30,h:60,p:1000,g:88}}}).stored,1);
+ assert.equal(e.sensor.rows[2][22],a);assert.equal(e.sensor.rows[3][22],b);
+ assert.equal(e.api.getDashboard(a).health.latest.g,55);assert.equal(e.api.getDashboard(b).health.latest.g,88);
+ assert.deepEqual(Array.from(e.api.getDashboardDevices(),x=>x.device_id).sort(),[a,b]);
+ e.api.stopRecording(a);assert.equal(e.api.getDashboard(a).recording.state,'STOPPED');
+ assert.equal(e.api.getDashboard(b).recording.state,'RECORDING');
+ assert(e.api.getCsvData(recA.session_id,0,100,a).includes(bootA+'-1'));
+ assert(!e.api.getCsvData(recA.session_id,0,100,a).includes(bootB+'-1'));
+ assert(e.api.getCsvData(recB.session_id,0,100,b).includes(bootB+'-1'));
+ assert(e.api.getCsvData('').includes(bootA+'-1')&&e.api.getCsvData('').includes(bootB+'-1'));
+ assert.equal(e.api.ingest({version:2,device_id:a,samples:[sa]}).acks[0].status,'duplicate');
+ assert.throws(()=>e.api.getDashboard('abc'),/Invalid device ID/);
+ const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
+ assert(html.includes('.getDashboard(id)'));assert(html.includes('.startRecording(el(id,\'label\').value,id)'));
+ assert(html.includes('.stopRecording(id)'));assert(html.includes("device='+encodeURIComponent(id)"));
 });
 console.log(`${tests} cloud tests passed (mock Sheets, no external services).`);

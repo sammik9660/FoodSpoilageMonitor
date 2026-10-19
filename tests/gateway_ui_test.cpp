@@ -28,6 +28,24 @@ int main() {
   assert(pixelState(true,true,CLOUD_WAIT,false)==PIXEL_WAIT);
   assert(pixelState(true,true,CLOUD_OK,true)==PIXEL_WAIT);
   assert(pixelState(true,true,CLOUD_OK,false)==PIXEL_OK);
+  assert(!uploadDataPending(0,0,0,0));
+  assert(uploadDataPending(1,0,0,0));
+  assert(uploadDataPending(0,1,0,0));
+  assert(uploadDataPending(0,0,1,0));
+  assert(uploadDataPending(0,0,0,1));
+  assert(!shouldStartDataUpload(false,false,false,5000,5000,0,0,0,0));
+  assert(shouldStartDataUpload(false,false,false,5000,5000,0,0,0,1));
+  assert(!shouldStartDataUpload(true,false,false,5000,5000,0,0,0,1));
+  assert(!shouldStartDataUpload(false,true,false,5000,5000,0,0,0,1));
+  assert(!shouldStartDataUpload(false,false,true,5000,5000,0,0,0,1));
+  assert(!shouldStartDataUpload(false,false,false,4999,5000,0,0,0,1));
+  assert(otaRainbowVisible(1000,1000));
+  assert(otaRainbowVisible(1000,3999));
+  assert(!otaRainbowVisible(1000,4000));
+  assert(!otaRainbowVisible(1000,999));
+  assert(otaRainbowColor(0)==0xff0000);
+  assert(otaRainbowColor(85)==0x00ff00);
+  assert(otaRainbowColor(170)==0x0000ff);
 
   ActiveLowButton shortButton;
   assert(!shortButton.update(true,0).shortPress);
@@ -44,5 +62,5 @@ int main() {
   longButton.update(true,4100);ButtonEvents longRelease=longButton.update(true,4130);
   assert(!longRelease.shortPress&&!longRelease.longPress);
 
-  puts("PASS gateway UI: fixed 16x2 formatting, no-sample state, button debounce/edges, pixel priority");
+  puts("PASS gateway UI: formatting, pixel priority, non-empty upload scheduling, OTA active blocking, rainbow");
 }

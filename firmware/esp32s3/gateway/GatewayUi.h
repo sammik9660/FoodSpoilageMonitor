@@ -16,6 +16,20 @@ enum LcdMode : uint8_t { LCD_SENSOR, LCD_DEBUG };
 enum CloudState : uint8_t { CLOUD_OFF, CLOUD_WAIT, CLOUD_OK };
 enum PixelState : uint8_t { PIXEL_BOOT, PIXEL_BLE_OFF, PIXEL_WIFI_OFF, PIXEL_WAIT, PIXEL_OK };
 
+constexpr uint32_t OTA_RAINBOW_MS = 3000;
+constexpr uint32_t OTA_RAINBOW_FRAME_MS = 30;
+
+inline bool otaRainbowVisible(uint64_t startedAt, uint64_t now) {
+  return now >= startedAt && now - startedAt < OTA_RAINBOW_MS;
+}
+
+inline uint32_t otaRainbowColor(uint8_t phase) {
+  if (phase < 85) return ((uint32_t)(255 - phase * 3) << 16) | ((uint32_t)(phase * 3) << 8);
+  if (phase < 170) { phase -= 85; return ((uint32_t)(255 - phase * 3) << 8) | phase * 3; }
+  phase -= 170;
+  return ((uint32_t)(phase * 3) << 16) | (255 - phase * 3);
+}
+
 inline void fixedLine(char out[LCD_COLUMNS + 1], const char* text) {
   size_t n = strlen(text);
   if (n > LCD_COLUMNS) n = LCD_COLUMNS;
@@ -75,6 +89,20 @@ inline PixelState pixelState(bool ble, bool wifi, CloudState cloud, bool backlog
   if (!wifi) return PIXEL_WIFI_OFF;
   if (cloud != CLOUD_OK || backlog) return PIXEL_WAIT;
   return PIXEL_OK;
+}
+
+inline bool uploadDataPending(uint32_t active, uint32_t staged,
+                              uint32_t spool, uint32_t queued) {
+  return active || staged || spool || queued;
+}
+
+inline bool shouldStartDataUpload(bool busy, bool otaActive,
+                                  bool otaMaintenanceNetworkBusy, uint64_t now,
+                                  uint64_t due, uint32_t active,
+                                  uint32_t staged, uint32_t spool,
+                                  uint32_t queued) {
+  return !busy && !otaActive && !otaMaintenanceNetworkBusy && now >= due &&
+         uploadDataPending(active, staged, spool, queued);
 }
 
 struct ButtonEvents { bool shortPress=false, longPress=false; };

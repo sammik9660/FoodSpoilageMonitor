@@ -14,9 +14,10 @@ BME688 Food Spoilage Monitor의 단일 저장소다. 작업 전에 `PROJECT_STAT
 - 사용자 검증: V1940 Pro Micro nRF52840 / nice!nano V2 compatible clone, Arduino `Adafruit Feather nRF52840 Express` variant.
 - 검증한 `Wire.setPins(21, 20)` 유지: Arduino D21 -> P0.31 SDA, D20 -> P0.29 SCL. Arduino pin 인자로 31/29 또는 031/029를 추측해서 사용하지 않는다.
 - BME688 주소 0x76, chip ID 0x61. v2의 Adafruit 고정 히터 코드는 역사적 기록이며 현재 v3는 고정본 Bosch BME68x wrapper와 HP-354 parallel heater profile을 사용한다. `getMeasDur()`는 µs, parallel shared heater duration은 ms, duration profile은 multiplier다.
-- T/H/P oversampling 8X/2X/4X, IIR 3을 유지한다. 현재 환경 측정은 히터 OFF forced mode 2초, HP-354 parallel scan은 2분마다 140ms polling이다. 과거 2초 fixed-heater cadence와 혼동하지 않는다. BSEC/AI-Studio 및 ML 전환은 별도 단계다.
+- T/H/P oversampling 8X/2X/4X, IIR 3을 유지한다. 현재 환경 측정은 히터 OFF forced mode 2초, HP-354 parallel scan은 10분마다 140ms polling이다. 과거 2초 fixed-heater cadence와 혼동하지 않는다. BSEC/AI-Studio 및 ML 전환은 별도 단계다.
 - BLE NUS, 20-byte chunk + newline framing을 유지한다. v2 BID/SEQ/MS/T/H/P/G, v3 BID/SEQ/SCAN/STEP/GI/MI/ST/PID/T/H/P/G 및 G/STEP 없는 ENV/BID/SEQ/MS/T/H/P를 구분한다. STAT은 진단용이며 chunk를 완전한 샘플로 가정하지 않는다.
-- 사용자 검증 정상 설정인 ESP32-S3 Flash Size 16MB, Huge APP(3MB No OTA/1MB SPIFFS), PSRAM disabled, CDC enabled, Hardware CDC/JTAG를 유지한다. 설치된 core 3.3.12의 Huge APP는 app0 `0x10000`/`0x300000`, SPIFFS `0x310000`/`0xE0000`(896 KiB)다. 2026-10-11 읽기 전용 덤프의 No OTA 레이아웃은 과거 상태로 보존한다. 미전송 spool 백업·검증 없이 파티션 선택을 바꾸지 않는다.
+- nRF BLE DFU는 사용자 보고 nice!nano 호환 Adafruit bootloader 0.6.0과 S140 6.1.1을 그대로 쓰는 application-only legacy DFU 경로다. `BLEDfu` 서비스와 core가 생성한 `device_type=0x0052`, `sd_req=0x00B6` ZIP을 사용하며, 이를 Nordic Secure DFU나 ESP의 서명 OTA와 동일하게 표현하지 않는다. 부트로더/SoftDevice 변경은 별도 승인 없이는 금지한다.
+- ESP32-S3 v2.0.6 빌드는 Flash Size 16MB, sketch `partitions.csv`의 3MiB OTA 슬롯 2개, OPI PSRAM, CDC enabled, Hardware CDC/JTAG, Erase All Flash disabled를 사용한다. SPIFFS는 기존 `0x310000`/`0xE0000`(896 KiB)를 유지한다. 2026-10-11 읽기 전용 덤프의 No OTA 레이아웃과 과거 Huge APP/PSRAM disabled 설정은 역사적 상태로 보존한다. 미전송 spool 백업·검증 없이 파티션 선택을 바꾸지 않는다.
 - 실제 endpoint 및 AP credential은 현재 값 보존 요청을 따른다. 민감한 값을 로그·문서·보고서에 재출력하지 않는다. `setInsecure()`는 아직 prototype 기술 부채다.
 
 ## Reliability / Data Integrity Invariants
