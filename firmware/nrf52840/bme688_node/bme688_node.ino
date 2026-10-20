@@ -230,12 +230,13 @@ constexpr uint32_t ENV_CONVERSION_TIMEOUT_MS = 200;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.5";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.6";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 bme68xData lastEnvData={};
 #if !defined(_MSC_VER)
 BLEDfu bledfu; // Buttonless entry into the existing Adafruit legacy BLE DFU bootloader.
+BLEDis bledis; // Standard Device Information Service exposes the firmware version without changing NUS frames.
 #endif
 BLEUart bleuart;
 #if !defined(_MSC_VER)
@@ -593,6 +594,8 @@ void setup() {
   // Adafruit requires the OTA DFU service to be registered before other GATT services.
   // This only enters the existing bootloader; it does not replace bootloader/SoftDevice.
   bledfu.begin();
+  bledis.setFirmwareRev(SENSOR_FIRMWARE_VERSION);
+  bledis.begin();
 #endif
   bleuart.begin();
   Bluefruit.Advertising.addService(bleuart);

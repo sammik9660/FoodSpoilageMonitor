@@ -2,9 +2,29 @@
 
 갱신일: 2026-10-19. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-19 ESP32 → nRF52840 Legacy BLE DFU 중계 Phase 1 (소스/호스트 검증)
+
+- 2026-10-20 사용자 실기에서 웹 페어링, ZIP 검증·저장, PREPARE/ACTIVE 및 nRF의 실제 bootloader 진입까지 확인했으나 전송은 0%에서 `DFU control write failed`로 중단됐다. 로그상 애플리케이션은 진입 명령 직후 예상대로 연결을 끊고 bootloader에 머물렀다. ESP 구현이 write-with-response의 `false`를 즉시 실패로 처리해 bootloader 검색으로 진행하지 않은 것이 확인됐다.
+- 애플리케이션 진입과 최종 activate/reset 명령에 한해 GATT 반환값과 별도로 실제 연결 해제를 확인하도록 수정했다. 연결이 유지된 채 write가 실패하면 계속 실패 처리한다. 나머지 Legacy DFU control 명령, 응답, 20-byte payload, PRN 8, ZIP/CRC 검증은 변경하지 않았다. 단계·opcode·write 결과·bootloader 검색/연결·특성 속성 로그를 추가했다. 프로토콜 호스트 테스트와 `git diff --check`는 통과했으며, 이 수정 이후의 Arduino IDE 컴파일과 실제 ESP→nRF 전송/재연결은 사용자 검증 전까지 미검증이다.
+- 후속 실기에서 예상 연결 해제와 동일 주소 bootloader 검색·연결까지 성공했고 ESP32 core 3.3.12가 협상한 MTU 247 때문에 기존 `MTU == 23` 검사에서 중단됐다. 현재 qio_opi SDK 설정은 NimBLE이며 `BLEClient::getMTU()`는 `ble_att_mtu(connection)`의 협상 결과를 반환한다. Legacy 전송 크기는 검증된 20 bytes로 유지하고 MTU가 최소 23이며 그 payload를 수용하면 진행하도록 수정했다. MTU 23/247/517 허용 및 22 거부 호스트 테스트는 통과했으며 서비스 발견 이후 실제 전송은 아직 실기 미검증이다.
+
+- 기존 포트 80 관리 서버의 OTA token Basic 인증과 Host/Origin 동일 출처 검사를 재사용하는 로컬 `/nrf-dfu` 업로드 화면을 추가했다. 녹화 STOPPED가 확인되고 RAM queue, SPIFFS spool, HTTP/ACK 작업 및 다른 업데이트가 모두 비어 있을 때만 `/nrf-dfu.upload.tmp`로 스트리밍한다. SPIFFS spool budget 60%와 8 KiB 파일시스템 여유를 남기며, 기존 `/nrf-dfu.zip`은 ZIP entry CRC32, BIN CRC16, Legacy DFU 0.5 구조, device type `0x0052`, SoftDevice `0x00B6`, 앱 크기 검사가 끝날 때까지 유지한다. 검증된 파일은 backup/rename 순서로 교체하고 부팅 시 중단된 교체를 복구한다. 중단된 전송은 60초 무진행 timeout으로 임시 파일만 정리한다. 업로드는 DFU를 시작하지 않으며 기존 `NRF DFU START`만 실행 승인 경로다.
+- 업로드 정책/정적 회귀, 기존 protocol/UI/integrity/spool/sensor/cloud 테스트, OTA 파티션 검사와 `git diff --check`가 통과했다. 기본 샌드박스에서는 기존 Windows 오류 623(`Illegal System DLL Relocation`)가 재현됐지만, 같은 Arduino IDE 설정을 사용한 외부 Arduino CLI에서 ESP32 core 3.3.12 전체 컴파일·링크가 통과했다. application BIN은 1,520,224 bytes로 3 MiB app slot 안이다. `.ino` 자동 prototype이 기존 `extern "C" verifyRollbackLater()`와 충돌한 것은 동일 linkage의 전방 선언만 추가해 해결했으며 함수 본문과 rollback 정책은 바꾸지 않았다. 장치 접근, SPIFFS 쓰기, 펌웨어 업로드 및 실제 브라우저 업로드는 수행하지 않았다.
+- ESP32 signed Wi-Fi OTA는 이미 사용자 실기에서 성공한 기존 기능이다. 이번 변경은 해당 OTA 수신 코드, `partitions.csv`, SPIFFS/NVS 배치와 서명·anti-rollback 경로를 수정하지 않고 별도 nRF Legacy DFU 중계 모듈만 추가한다.
+- 중계기는 SPIFFS의 고정 경로 `/nrf-dfu.zip`에서 application-only Legacy DFU 0.5 ZIP을 스트리밍한다. STORE/no-encryption/no-data-descriptor, manifest/BIN/DAT 3개 항목, ZIP CRC32, BIN CRC16, device type `0x0052`, SoftDevice requirement `0x00B6`, 815,104-byte 앱 한도를 전송 전에 검사한다. 전체 ZIP 또는 BIN을 RAM에 적재하지 않는다.
+- `NRF DFU START`는 NVS에 명시적으로 pairing된 sensor ID가 현재 연결 ID와 같고 cloud recording이 STOPPED로 확인됐을 때만 PREPARE로 들어간다. PREPARE 중 이미 받은 RAM queue/SPIFFS spool/HTTP를 기존 ACK 정책으로 비운 뒤 ACTIVE로 전환하며 기존 sample을 삭제하지 않는다. ACTIVE는 앱의 buttonless DFU service로 진입하고 동일하거나 주소가 1만 차이 나는 DFU service 광고만 선택해 MTU 23, 20-byte packet, PRN 8로 전송한다. 성공 표시는 validate/activate 뒤 NUS 재연결 및 Device Information Firmware Revision 읽기까지 완료돼야 한다.
+- 스마트폰 성공 ZIP의 BIN 161,240 bytes와 manifest CRC16 `0xB9F1`, ZIP STORE 구조를 다시 확인했고, protocol opcode/response/PRN/CRC host test, 기존 OTA 파티션 검사와 `git diff --check`가 통과했다. ESP32 core 3.3.12, Flash 16MB, sketch custom partition, OPI PSRAM, CDC/HW CDC 설정의 업로드 기능 추가 전 Arduino CLI 빌드도 통과했다(Flash 1,513,315/3,145,728 bytes, static RAM 62,616/327,680 bytes, application BIN 1,513,456 bytes). 실제 ESP 중계 DFU, 브라우저 ZIP 저장, 취소/전원 중단 복구, 주소 +1 동작 및 NUS 재연결은 장치 시험 전까지 미검증이다. Dashboard 통합은 구현하지 않았다.
+
+## 2026-10-19 nRF52840 BLE DFU 2.0.6 실기 성공 (사용자 확인)
+
+- nRF 센서 버전을 2.0.6으로 올리고 기존 부팅 로그에 새 버전을 유지했다. 표준 BLE Device Information Service의 Firmware Revision 0x2A26에도 2.0.6을 노출한다. NUS 광고, 20-byte/newline 프레임, ENV/GAS/STAT 형식, 2초 ENV 및 10분 gas scan 주기는 변경하지 않았다.
+- 설치된 Adafruit nRF52 core 1.7.0의 `adafruit:nrf52:feather52840`/S140 6.1.1 대상으로 빌드했다. Flash 161,232/815,104 bytes, RAM 16,544/237,568 bytes이며 실제 소스를 포함하는 MSVC sensor host test와 `git diff --check`가 통과했다.
+- core의 기존 `adafruit-nrfutil dfu genpkg --dev-type 0x0052 --sd-req 0x00B6` recipe가 만든 application-only legacy DFU ZIP을 `data/nrf-dfu-2.0.6/bme688-node-2.0.6-legacy-dfu.zip`에 보존했다. ZIP 162,102 bytes, application BIN 161,240 bytes, DAT 14 bytes이며 manifest의 device type 82, SoftDevice requirement 182, DFU format 0.5와 BIN의 2.0.6 문자열을 확인했다. SoftDevice/bootloader 이미지는 포함하지 않았다.
+- 사용자 실기에서 Nordic Android DFU 앱의 high-MTU 요청을 끄고 기본 ATT MTU 23, 낮은 PRN 설정으로 `bme688-node-2.0.6-legacy-dfu.zip`을 전송했다. Bootloader enabled, DFU initialized, Firmware uploaded, Completed 단계가 모두 성공했다. 에이전트는 장치 업로드나 DFU를 실행하지 않았다.
+
 ## 2026-10-19 v2.0.8 OTA 시험 준비
 
-- 사용자 보고: v2.0.7/build 2026101905를 USB로 설치한 뒤 BLE, HTTPS application ACK, spool 및 backlog drain을 확인했다. v2.0.7 OTA 수신은 아직 실기 미검증이다. v2.0.5의 generic HTTP 400만으로 실패 검증 단계를 확정할 수 없다.
+- 사용자 보고: v2.0.7/build 2026101905를 USB로 설치한 뒤 BLE, HTTPS application ACK, spool 및 backlog drain을 확인했다. 이어 최신 2.0.8 파일을 사용한 OTA가 성공했으며, 이전 실패는 새 파일과 이전 파일을 혼동한 것이 원인이었다. 세부 post-boot 로그는 이 기록에서 독립 재검증하지 않았다.
 - feature/multi-device-support의 cf76088에서 버전만 2.0.8/build 2026101906으로 올렸다. 서명, build 증가 검사, 파티션, OPI PSRAM 및 데이터 경로는 변경하지 않았다. tests/ota_package_test.ps1은 배포 BIN/manifest의 형식, 버전, build, SHA-256, 내장 공개키 서명과 변조 거부를 검사한다. 이는 장치의 mbedTLS/sscanf 실행 검증을 대신하지 않는다.
 - 클라우드 모의 테스트 30개, fingerprint 5개, MSVC gateway_ui/integrity/spool, OTA 서명 도구 및 파티션 테스트와 git diff --check 통과. 새 패키지 검사기를 기존 2.0.7 패키지에 적용하여 내장 공개키 검증 및 변조 거부를 확인했다.
 - 빌드: Codex CLI 빌드는 샌드박스의 Arduino15 경로 변경으로 초기화에 실패했고 외부 환경에서도 의존성 탐색이 길어져 중단했다. 이후 사용자가 Arduino IDE에서 application BIN을 export했다. 해당 BIN은 현재 소스보다 새롭고 ESP 이미지 헤더 `0xE9`, `2.0.8` 문자열, manifest 단계 진단 및 지연 lease 정리 코드를 포함하며 `2.0.7` 문자열은 없다. 크기는 1,496,960 bytes, SHA-256은 `26d4e336637207052703f93319465562cc1e5de4209407fadcde512664b02f8c`다.

@@ -44,6 +44,7 @@
 #include <HTTPClient.h>
 
 #include <WiFiManager.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 
 #include <BLEDevice.h>
@@ -86,6 +87,13 @@
 
 #include "GatewayUi.h"
 
+#include "NrfLegacyDfuRelay.h"
+#include "NrfDfuPackagePolicy.h"
+#include "WifiRecoveryPolicy.h"
+
+#ifdef CONFIG_APP_ROLLBACK_ENABLE
+extern "C" bool verifyRollbackLater();
+#endif
 
 
 const char* GOOGLE_SCRIPT_URL =
@@ -149,6 +157,8 @@ char gatewayBoot[33]={};
 char deviceId[13]={};
 char targetSensorId[17]={};
 char connectedSensorId[17]={};
+char connectedSensorAddress[18]={};
+char connectedSensorFirmware[32]={};
 
 OutageSpool spool;
 
@@ -195,9 +205,35 @@ WebServer otaServer(80);
 uint64_t otaLastCloudAckAt=0;
 uint32_t otaPendingSamples=0;
 bool otaUploadActive=false;
+enum NrfDfuMode { NRF_DFU_NORMAL, NRF_DFU_PREPARE, NRF_DFU_ACTIVE, NRF_DFU_RECONNECT };
+volatile NrfDfuMode nrfDfuMode=NRF_DFU_NORMAL;
+volatile bool nrfDfuCancelRequested=false;
+uint32_t nrfDfuBytesSent=0,nrfDfuBytesTotal=0;
+uint64_t nrfDfuTransferStartedAt=0;
+char nrfDfuLastResult[128]="No DFU has run since boot";
+bool nrfDfuHasResult=false,nrfDfuLastSuccess=false;
+uint64_t nrfDfuDeadlineAt=0;
+uint32_t nrfDfuGapSamples=0;
+constexpr uint32_t NRF_DFU_PREPARE_TIMEOUT_MS=180000;
+constexpr uint32_t NRF_DFU_RECONNECT_TIMEOUT_MS=120000;
+NrfLegacyDfuRelay nrfDfuRelay;
+NrfLegacyDfuRelay::PackageInfo nrfDfuPackage;
+constexpr const char* NRF_DFU_PACKAGE_PATH=nrf_dfu_package::FINAL_PATH;
+File nrfPackageUploadFile;
+bool nrfPackageUploadActive=false,nrfPackageUploadFailed=false;
+size_t nrfPackageUploadBytes=0,nrfPackageUploadLimit=0;
+uint64_t nrfPackageUploadLastAt=0;
+int nrfPackageUploadStatus=400;
+char nrfPackageUploadError[128]={};
+bool cloudRecordingKnown=false,cloudRecording=false;
 uint8_t wifiNetworkCount=0, wifiNextSlot=0, wifiTried=0;
 int8_t wifiActiveSlot=-1;
 uint64_t wifiAttemptAt=0, wifiRetryAt=0;
+bool wifiDisconnectPending=false,mdnsReady=false;
+bool wifiWasConnected=false;
+uint64_t wifiDisconnectAt=0;
+volatile bool wifiDisconnectEventPending=false;
+volatile uint8_t wifiLastDisconnectReason=0;
 
 LiquidCrystal_I2C lcd(LCD_ADDRESS,16,2);
 
@@ -347,6 +383,61 @@ void loadOtaSettings() {
   if(valid)saved.toCharArray(otaPassword,sizeof(otaPassword));
 }
 
+const char* nrfDfuModeName(NrfDfuMode mode) {
+  return mode==NRF_DFU_PREPARE?"PREPARE":mode==NRF_DFU_ACTIVE?"UPDATING":
+    mode==NRF_DFU_RECONNECT?"RECONNECTING":"IDLE";
+}
+
+bool setPairedSensor(const char* sensorId,char* error,size_t errorSize) {
+  if(!sensorId||strlen(sensorId)!=16) {snprintf(error,errorSize,"connected sensor ID is unavailable");return false;}
+  for(uint8_t i=0;i<16;++i)if(!((sensorId[i]>='0'&&sensorId[i]<='9')||(sensorId[i]>='a'&&sensorId[i]<='f'))) {
+    snprintf(error,errorSize,"connected sensor ID is invalid");return false;
+  }
+  if(!pairingPreferencesReady) {snprintf(error,errorSize,"pairing storage is unavailable");return false;}
+  if(nrfDfuMode!=NRF_DFU_NORMAL||otaMode!=OTA_NORMAL) {snprintf(error,errorSize,"an update is active");return false;}
+  if(!bleConnected||strcmp(sensorId,connectedSensorId)) {snprintf(error,errorSize,"sensor connection changed; refresh and approve again");return false;}
+  if(pairingPreferences.putString("target",sensorId)!=16||pairingPreferences.getString("target","")!=sensorId) {
+    snprintf(error,errorSize,"pairing target was not retained");return false;
+  }
+  portENTER_CRITICAL(&stateMux);memcpy(targetSensorId,sensorId,16);targetSensorId[16]=0;portEXIT_CRITICAL(&stateMux);
+  logEvent("BLE pairing approved sensor_id=%s address=%s",sensorId,connectedSensorAddress[0]?connectedSensorAddress:"unknown");
+  return true;
+}
+
+bool requestNrfDfuStart(char* error,size_t errorSize) {
+  char connected[17],wanted[17];
+  portENTER_CRITICAL(&stateMux);memcpy(connected,connectedSensorId,sizeof(connected));memcpy(wanted,targetSensorId,sizeof(wanted));portEXIT_CRITICAL(&stateMux);
+  if(nrfDfuMode!=NRF_DFU_NORMAL||otaMode!=OTA_NORMAL||nrfPackageUploadActive) {snprintf(error,errorSize,"another update is active");return false;}
+  if(!wanted[0]||strcmp(connected,wanted)||!bleConnected) {snprintf(error,errorSize,"explicit paired sensor is not connected");return false;}
+  if(!cloudRecordingKnown||cloudRecording) {snprintf(error,errorSize,"recording state is not confirmed STOPPED");return false;}
+  if(!spool.mounted||spool.fault) {snprintf(error,errorSize,"SPIFFS is unavailable");return false;}
+  NrfLegacyDfuRelay::PackageInfo package;char validation[128]={};
+  if(!nrfDfuRelay.validatePackage(SPIFFS,NRF_DFU_PACKAGE_PATH,package,validation,sizeof(validation))) {
+    snprintf(error,errorSize,"package rejected: %.92s",validation);return false;
+  }
+  xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
+  if(nrfDfuMode!=NRF_DFU_NORMAL) {xSemaphoreGive(otaIngressMutex);snprintf(error,errorSize,"another DFU request won the start race");return false;}
+  nrfDfuPackage=package;nrfDfuCancelRequested=false;nrfDfuBytesSent=0;nrfDfuBytesTotal=package.binarySize;
+  nrfDfuTransferStartedAt=0;nrfDfuHasResult=false;nrfDfuLastSuccess=false;
+  snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Draining queued and spooled samples");
+  nrfDfuMode=NRF_DFU_PREPARE;nrfDfuDeadlineAt=uptimeMs()+NRF_DFU_PREPARE_TIMEOUT_MS;
+  xSemaphoreGive(otaIngressMutex);
+  logEvent("nRF DFU PREPARE sensor=%s app_bytes=%lu; draining existing queue, spool, and HTTP",
+    connected,(unsigned long)package.binarySize);
+  return true;
+}
+
+bool requestNrfDfuCancel(char* message,size_t messageSize) {
+  xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
+  const NrfDfuMode mode=nrfDfuMode;
+  if(mode==NRF_DFU_PREPARE) {nrfDfuMode=NRF_DFU_NORMAL;nrfDfuDeadlineAt=0;snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Cancelled before transfer");}
+  else if(mode==NRF_DFU_ACTIVE)nrfDfuCancelRequested=true;
+  xSemaphoreGive(otaIngressMutex);
+  if(mode==NRF_DFU_PREPARE){snprintf(message,messageSize,"DFU preparation cancelled");logEvent("nRF DFU PREPARE cancelled; normal collection resumed");return true;}
+  if(mode==NRF_DFU_ACTIVE){snprintf(message,messageSize,"DFU cancellation requested");logEvent("nRF DFU cancel requested; bootloader reset will be attempted");return true;}
+  snprintf(message,messageSize,"no cancellable DFU is active");return false;
+}
+
 void handlePairingCommand() {
   static char line[40];static uint8_t length=0;
   while(Serial.available()) {
@@ -364,6 +455,18 @@ void handlePairingCommand() {
       Serial.println(otaPassword);if(UART_DIAGNOSTICS)Serial0.println(otaPassword);continue;
     }
     if(!strcmp(line,"OTA?")) {logEvent("OTA local upload=%s version=%s build=%llu",otaPassword[0]?"enabled":"disabled",FIRMWARE_VERSION,(unsigned long long)OTA_BUILD_NUMBER);continue;}
+    if(!strcmp(line,"NRF DFU?")) {
+      const char* state=nrfDfuModeName(nrfDfuMode);
+      logEvent("nRF DFU state=%s package=%s upload=%s",state,SPIFFS.exists(NRF_DFU_PACKAGE_PATH)?"present":"missing",
+        nrfPackageUploadActive?"active":"idle");continue;
+    }
+    if(!strcmp(line,"NRF DFU CANCEL")) {
+      char message[64];if(!requestNrfDfuCancel(message,sizeof(message)))logEvent("nRF DFU cancel ignored; %s",message);
+      continue;
+    }
+    if(!strcmp(line,"NRF DFU START")) {
+      char error[128]={};if(!requestNrfDfuStart(error,sizeof(error)))logEvent("nRF DFU blocked: %s",error);continue;
+    }
     if(!strcmp(line,"PAIR?")) {logEvent("DEVICE id=%s BLE target=%s",deviceId,targetSensorId[0]?targetSensorId:"ANY");continue;}
     if(strncmp(line,"PAIR ",5))continue;
     const char* value=line+5;
@@ -397,7 +500,7 @@ bool otaSafeState() {
 }
 
 bool otaSafeToStart() {
-  return otaMode==OTA_NORMAL&&otaPassword[0]&&spool.mounted&&!spool.fault&&
+  return otaMode==OTA_NORMAL&&!nrfPackageUploadActive&&otaPassword[0]&&spool.mounted&&!spool.fault&&
     !otaPendingVerify&&!otaLeaseReleasePending&&WiFi.status()==WL_CONNECTED;
 }
 
@@ -413,8 +516,224 @@ bool otaActivateIfDrained() {
 bool otaSameOrigin() {
   const String host=otaServer.header("Host");
   const String origin=otaServer.header("Origin");
-  const String expected=String("http://")+WiFi.localIP().toString();
-  return host==WiFi.localIP().toString()&&origin==expected;
+  const String ip=WiFi.localIP().toString();
+  const bool ipOrigin=host==ip&&origin==String("http://")+ip;
+  const bool mdnsOrigin=host=="foodmonitor.local"&&origin=="http://foodmonitor.local";
+  return ipOrigin||mdnsOrigin;
+}
+
+bool nrfPackageUploadSafe() {
+  return otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&otaPassword[0]&&
+    spool.mounted&&!spool.fault&&!spool.count&&cloudRecordingKnown&&!cloudRecording&&
+    !otaActiveSamples&&!otaStagedSamples&&!otaHttpBusy&&!otaHttpFailed&&
+    !otaUploadActive&&!otaLeaseReleasePending&&!uxQueueMessagesWaiting(samplesQueue)&&
+    !uxQueueMessagesWaiting(resultsQueue)&&WiFi.status()==WL_CONNECTED;
+}
+
+bool validateNrfPackageAt(const char* path,NrfLegacyDfuRelay::PackageInfo& info,char* error,size_t errorSize) {
+  if(error&&errorSize)error[0]=0;
+  return nrfDfuRelay.validatePackage(SPIFFS,path,info,error,errorSize);
+}
+
+void recoverNrfPackageFiles() {
+  if(!spool.mounted||spool.fault)return;
+  if(SPIFFS.exists(nrf_dfu_package::TEMP_PATH))SPIFFS.remove(nrf_dfu_package::TEMP_PATH);
+  if(!SPIFFS.exists(nrf_dfu_package::BACKUP_PATH))return;
+  if(!SPIFFS.exists(NRF_DFU_PACKAGE_PATH)) {
+    if(SPIFFS.rename(nrf_dfu_package::BACKUP_PATH,NRF_DFU_PACKAGE_PATH))
+      logEvent("nRF DFU package backup restored");
+    else logEvent("ERROR nRF DFU package backup restore failed");
+    return;
+  }
+  NrfLegacyDfuRelay::PackageInfo info;char error[128]={};
+  if(validateNrfPackageAt(NRF_DFU_PACKAGE_PATH,info,error,sizeof(error))) {
+    if(!SPIFFS.remove(nrf_dfu_package::BACKUP_PATH))logEvent("ERROR stale nRF DFU package backup retained");
+    return;
+  }
+  NrfLegacyDfuRelay::PackageInfo backupInfo;char backupError[128]={};
+  if(!validateNrfPackageAt(nrf_dfu_package::BACKUP_PATH,backupInfo,backupError,sizeof(backupError))) {
+    logEvent("ERROR nRF DFU package recovery needs inspection; final=%s backup=%s",error,backupError);return;
+  }
+  if(!SPIFFS.rename(NRF_DFU_PACKAGE_PATH,nrf_dfu_package::TEMP_PATH)||
+     !SPIFFS.rename(nrf_dfu_package::BACKUP_PATH,NRF_DFU_PACKAGE_PATH)) {
+    if(!SPIFFS.exists(NRF_DFU_PACKAGE_PATH)&&SPIFFS.exists(nrf_dfu_package::BACKUP_PATH))
+      SPIFFS.rename(nrf_dfu_package::BACKUP_PATH,NRF_DFU_PACKAGE_PATH);
+    logEvent("ERROR nRF DFU package recovery rename failed");return;
+  }
+  SPIFFS.remove(nrf_dfu_package::TEMP_PATH);
+  logEvent("nRF DFU package backup restored after interrupted replacement");
+}
+
+bool promoteNrfPackage(char* error,size_t errorSize) {
+  const bool hadFinal=SPIFFS.exists(NRF_DFU_PACKAGE_PATH);
+  if(SPIFFS.exists(nrf_dfu_package::BACKUP_PATH)) {
+    snprintf(error,errorSize,"stale backup prevents replacement");return false;
+  }
+  if(hadFinal&&!SPIFFS.rename(NRF_DFU_PACKAGE_PATH,nrf_dfu_package::BACKUP_PATH)) {
+    snprintf(error,errorSize,"existing package backup failed");return false;
+  }
+  if(!SPIFFS.rename(nrf_dfu_package::TEMP_PATH,NRF_DFU_PACKAGE_PATH)) {
+    if(hadFinal)SPIFFS.rename(nrf_dfu_package::BACKUP_PATH,NRF_DFU_PACKAGE_PATH);
+    snprintf(error,errorSize,"validated package promotion failed");return false;
+  }
+  NrfLegacyDfuRelay::PackageInfo check;char validation[128]={};
+  if(!validateNrfPackageAt(NRF_DFU_PACKAGE_PATH,check,validation,sizeof(validation))) {
+    SPIFFS.rename(NRF_DFU_PACKAGE_PATH,nrf_dfu_package::TEMP_PATH);
+    if(hadFinal)SPIFFS.rename(nrf_dfu_package::BACKUP_PATH,NRF_DFU_PACKAGE_PATH);
+    SPIFFS.remove(nrf_dfu_package::TEMP_PATH);
+    snprintf(error,errorSize,"promoted package recheck failed");return false;
+  }
+  if(hadFinal&&!SPIFFS.remove(nrf_dfu_package::BACKUP_PATH)) {
+    logEvent("ERROR nRF DFU package installed but old backup remains");
+  }
+  return true;
+}
+
+void failNrfPackageUpload(const char* reason,int status) {
+  if(nrfPackageUploadFile)nrfPackageUploadFile.close();
+  if(SPIFFS.exists(nrf_dfu_package::TEMP_PATH))SPIFFS.remove(nrf_dfu_package::TEMP_PATH);
+  nrfPackageUploadFailed=true;nrfPackageUploadStatus=status;nrfPackageUploadActive=false;
+  nrfPackageUploadLastAt=0;
+  snprintf(nrfPackageUploadError,sizeof(nrfPackageUploadError),"%s",reason);
+  logEvent("nRF DFU package upload rejected HTTP %d: %s",status,reason);
+}
+
+void handleNrfPackagePage() {
+  if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
+  NrfLegacyDfuRelay::PackageInfo info;char error[128]={};
+  const bool present=SPIFFS.exists(NRF_DFU_PACKAGE_PATH);
+  const bool valid=present&&validateNrfPackageAt(NRF_DFU_PACKAGE_PATH,info,error,sizeof(error));
+  const bool ready=nrfPackageUploadSafe();
+  const String page=String("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>nRF DFU</title>")+
+    "<h1>nRF52840 firmware update</h1><p>Gateway "+String(deviceId)+"</p><div id=s>Loading status…</div><p>Current package: "+
+    (valid?String("valid, application ")+String(info.binarySize)+" bytes":present?String("invalid: ")+error:"none")+
+    "</p><p>"+(ready?"Ready. Upload replaces only /nrf-dfu.zip after full validation.":
+      "Blocked: recording must be STOPPED and RAM queue, spool, HTTP work, and other updates must be idle.")+
+    "</p><form id=f><input id=z type=file accept='.zip,application/zip' required><button "+(ready?"":"disabled")+
+    ">Validate and store</button></form><p><button id=p>Pair connected sensor</button> <button id=b>Start update</button> <button id=c>Cancel</button></p><pre id=o></pre>"
+    "<script>const f=document.getElementById('f'),z=document.getElementById('z'),o=document.getElementById('o'),s=document.getElementById('s');"
+    "async function status(){try{let r=await fetch('/nrf-dfu/status',{cache:'no-store'}),v=await r.json();s.textContent=`State: ${v.state} | connected: ${v.connected_sensor||'none'} (${v.connected_address||'address unknown'}) | paired: ${v.paired_sensor||'ANY'} | firmware: ${v.sensor_firmware||'unknown'} | progress: ${v.bytes_sent}/${v.bytes_total} (${v.percent}%) | ${v.message}`;document.getElementById('p').disabled=!v.can_pair;document.getElementById('b').disabled=!v.can_start;}catch(x){s.textContent=String(x)}}"
+    "f.onsubmit=async e=>{e.preventDefault();let d=new FormData();d.append('package',z.files[0]);o.textContent='Uploading and validating…';try{let r=await fetch('/nrf-dfu/upload',{method:'POST',body:d});o.textContent=await r.text();await status()}catch(x){o.textContent=String(x)}};"
+    "document.getElementById('p').onclick=async()=>{let v=await (await fetch('/nrf-dfu/status')).json();if(!v.connected_sensor||!confirm('Pair sensor '+v.connected_sensor+' at '+(v.connected_address||'unknown address')+'?'))return;let d=new URLSearchParams({sensor_id:v.connected_sensor});let r=await fetch('/nrf-dfu/pair',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:d});o.textContent=await r.text();await status()};"
+    "document.getElementById('b').onclick=async()=>{if(!confirm('Start DFU for the explicitly paired sensor? Measurement pauses until reconnect.'))return;let r=await fetch('/nrf-dfu/start',{method:'POST'});o.textContent=await r.text();await status()};"
+    "document.getElementById('c').onclick=async()=>{let r=await fetch('/nrf-dfu/cancel',{method:'POST'});o.textContent=await r.text();await status()};status();setInterval(status,1000)</script>";
+  otaServer.sendHeader("Cache-Control","no-store");otaServer.send(200,"text/html; charset=utf-8",page);
+}
+
+void handleNrfPackageUploadComplete() {
+  if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
+  if(nrfPackageUploadFailed) {
+    const int status=nrfPackageUploadStatus;const String message=nrfPackageUploadError;
+    nrfPackageUploadFailed=false;nrfPackageUploadError[0]=0;
+    return otaServer.send(status,"text/plain",message+"; existing package and samples were preserved.");
+  }
+  if(nrfPackageUploadActive)failNrfPackageUpload("upload did not complete",400);
+  if(nrfPackageUploadFailed) {
+    nrfPackageUploadFailed=false;
+    return otaServer.send(400,"text/plain","Upload did not complete; existing package and samples were preserved.");
+  }
+  otaServer.send(201,"text/plain","Validated nRF DFU package stored. DFU was not started; use the web Start update button or NRF DFU START explicitly.");
+}
+
+void handleNrfDfuStatus() {
+  if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
+  char connected[17],paired[17],address[18],firmware[32],message[128];
+  portENTER_CRITICAL(&stateMux);
+  memcpy(connected,connectedSensorId,sizeof(connected));memcpy(paired,targetSensorId,sizeof(paired));
+  memcpy(address,connectedSensorAddress,sizeof(address));memcpy(firmware,connectedSensorFirmware,sizeof(firmware));
+  memcpy(message,nrfDfuLastResult,sizeof(message));
+  portEXIT_CRITICAL(&stateMux);
+  const NrfDfuMode mode=nrfDfuMode;
+  const char* state=mode!=NRF_DFU_NORMAL?nrfDfuModeName(mode):nrfDfuHasResult?(nrfDfuLastSuccess?"SUCCESS":"FAILED"):"IDLE";
+  NrfLegacyDfuRelay::PackageInfo package;char packageError[128]={};
+  const bool packageValid=SPIFFS.exists(NRF_DFU_PACKAGE_PATH)&&validateNrfPackageAt(NRF_DFU_PACKAGE_PATH,package,packageError,sizeof(packageError));
+  const bool pairedConnected=paired[0]&&connected[0]&&!strcmp(paired,connected)&&bleConnected;
+  const bool canPair=mode==NRF_DFU_NORMAL&&otaMode==OTA_NORMAL&&bleConnected&&connected[0];
+  const bool canStart=mode==NRF_DFU_NORMAL&&otaMode==OTA_NORMAL&&!nrfPackageUploadActive&&pairedConnected&&
+    cloudRecordingKnown&&!cloudRecording&&spool.mounted&&!spool.fault&&packageValid;
+  const uint32_t sent=nrfDfuBytesSent,total=nrfDfuBytesTotal;
+  cJSON* root=cJSON_CreateObject();
+  cJSON_AddStringToObject(root,"state",state);cJSON_AddStringToObject(root,"connected_sensor",connected);
+  cJSON_AddStringToObject(root,"connected_address",address);cJSON_AddStringToObject(root,"paired_sensor",paired);
+  cJSON_AddStringToObject(root,"sensor_firmware",firmware);cJSON_AddStringToObject(root,"message",message);
+  cJSON_AddBoolToObject(root,"package_valid",packageValid);cJSON_AddBoolToObject(root,"can_pair",canPair);
+  cJSON_AddBoolToObject(root,"can_start",canStart);addNumber(root,"bytes_sent",sent);addNumber(root,"bytes_total",total);
+  addNumber(root,"percent",total?(100.0*sent/total):0);addNumber(root,"queue",uxQueueMessagesWaiting(samplesQueue));
+  addNumber(root,"spool",spool.count);cJSON_AddBoolToObject(root,"http_busy",otaHttpBusy);
+  cJSON_AddStringToObject(root,"recording",!cloudRecordingKnown?"UNKNOWN":cloudRecording?"RECORDING":"STOPPED");
+  char* body=cJSON_PrintUnformatted(root);cJSON_Delete(root);
+  otaServer.sendHeader("Cache-Control","no-store");otaServer.send(200,"application/json",body?body:"{}");if(body)cJSON_free(body);
+}
+
+void handleNrfDfuPair() {
+  if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
+  if(!otaSameOrigin())return otaServer.send(400,"text/plain","Origin mismatch");
+  const String requested=otaServer.arg("sensor_id");char error[128]={};
+  if(!setPairedSensor(requested.c_str(),error,sizeof(error)))return otaServer.send(409,"text/plain",error);
+  otaServer.send(200,"text/plain","Connected sensor paired and retained in NVS");
+}
+
+void handleNrfDfuStart() {
+  if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
+  if(!otaSameOrigin())return otaServer.send(400,"text/plain","Origin mismatch");
+  char error[128]={};if(!requestNrfDfuStart(error,sizeof(error)))return otaServer.send(409,"text/plain",error);
+  otaServer.send(202,"text/plain","DFU preparation started; this page may be refreshed without stopping it");
+}
+
+void handleNrfDfuCancel() {
+  if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
+  if(!otaSameOrigin())return otaServer.send(400,"text/plain","Origin mismatch");
+  char message[64];const bool accepted=requestNrfDfuCancel(message,sizeof(message));otaServer.send(accepted?202:409,"text/plain",message);
+}
+
+void handleNrfPackageUploadProgress() {
+  HTTPUpload& upload=otaServer.upload();
+  if(upload.status==UPLOAD_FILE_START) {
+    nrfPackageUploadFailed=false;nrfPackageUploadError[0]=0;nrfPackageUploadBytes=0;nrfPackageUploadLimit=0;
+    nrfPackageUploadLastAt=uptimeMs();
+    if(!otaServer.authenticate("admin",otaPassword)){failNrfPackageUpload("authentication required",401);return;}
+    if(!otaSameOrigin()){failNrfPackageUpload("origin mismatch",400);return;}
+    if(!upload.filename.endsWith(".zip")){failNrfPackageUpload("a ZIP file is required",400);return;}
+    recoverNrfPackageFiles();
+    if(!nrfPackageUploadSafe()){failNrfPackageUpload("recording, pending data, HTTP, SPIFFS, or update state is not safe",409);return;}
+    if(SPIFFS.exists(nrf_dfu_package::TEMP_PATH)&&!SPIFFS.remove(nrf_dfu_package::TEMP_PATH)) {
+      failNrfPackageUpload("stale temporary file could not be removed",500);return;
+    }
+    nrfPackageUploadLimit=nrf_dfu_package::temporaryCapacity(SPIFFS.totalBytes(),SPIFFS.usedBytes(),spool.budget);
+    if(!nrfPackageUploadLimit){failNrfPackageUpload("insufficient SPIFFS space while preserving spool reserve",507);return;}
+    nrfPackageUploadFile=SPIFFS.open(nrf_dfu_package::TEMP_PATH,FILE_WRITE);
+    if(!nrfPackageUploadFile){failNrfPackageUpload("temporary file open failed",500);return;}
+    nrfPackageUploadActive=true;
+    logEvent("nRF DFU package upload started limit=%lu spool_reserve=%lu",(unsigned long)nrfPackageUploadLimit,(unsigned long)spool.budget);
+    return;
+  }
+  if(upload.status==UPLOAD_FILE_WRITE) {
+    if(!nrfPackageUploadActive||nrfPackageUploadFailed)return;
+    if(upload.currentSize>nrfPackageUploadLimit-nrfPackageUploadBytes) {
+      failNrfPackageUpload("package exceeds safe SPIFFS capacity",413);return;
+    }
+    const size_t written=nrfPackageUploadFile.write(upload.buf,upload.currentSize);
+    if(written!=upload.currentSize){failNrfPackageUpload("temporary file write failed",507);return;}
+    nrfPackageUploadBytes+=written;nrfPackageUploadLastAt=uptimeMs();return;
+  }
+  if(upload.status==UPLOAD_FILE_ABORTED) {failNrfPackageUpload("upload was interrupted",400);return;}
+  if(upload.status!=UPLOAD_FILE_END||!nrfPackageUploadActive||nrfPackageUploadFailed)return;
+  nrfPackageUploadFile.flush();nrfPackageUploadFile.close();nrfPackageUploadActive=false;nrfPackageUploadLastAt=0;
+  if(!nrfPackageUploadBytes||upload.totalSize!=nrfPackageUploadBytes) {
+    failNrfPackageUpload("uploaded byte count mismatch",400);return;
+  }
+  if(!nrfPackageUploadSafe()) {
+    failNrfPackageUpload("device state changed during upload; retry after pending data drains",409);return;
+  }
+  NrfLegacyDfuRelay::PackageInfo info;char error[128]={};
+  if(!validateNrfPackageAt(nrf_dfu_package::TEMP_PATH,info,error,sizeof(error))) {
+    char message[128];snprintf(message,sizeof(message),"DFU ZIP validation failed: %.92s",error);
+    failNrfPackageUpload(message,400);return;
+  }
+  if(!promoteNrfPackage(error,sizeof(error))) {failNrfPackageUpload(error,500);return;}
+  nrfDfuPackage=info;
+  logEvent("nRF DFU package stored bytes=%lu app_bytes=%lu; DFU not started",
+    (unsigned long)nrfPackageUploadBytes,(unsigned long)info.binarySize);
 }
 
 bool otaVersionValid(const char* version) {
@@ -702,6 +1021,12 @@ void startOtaWebServer() {
   otaServer.on("/status",HTTP_GET,handleOtaStatus);
   otaServer.on("/cancel",HTTP_POST,handleOtaCancel);
   otaServer.on("/update",HTTP_POST,handleOtaUpload,handleOtaUploadProgress);
+  otaServer.on("/nrf-dfu",HTTP_GET,handleNrfPackagePage);
+  otaServer.on("/nrf-dfu/upload",HTTP_POST,handleNrfPackageUploadComplete,handleNrfPackageUploadProgress);
+  otaServer.on("/nrf-dfu/status",HTTP_GET,handleNrfDfuStatus);
+  otaServer.on("/nrf-dfu/pair",HTTP_POST,handleNrfDfuPair);
+  otaServer.on("/nrf-dfu/start",HTTP_POST,handleNrfDfuStart);
+  otaServer.on("/nrf-dfu/cancel",HTTP_POST,handleNrfDfuCancel);
   otaServer.onNotFound([](){otaServer.send(404,"text/plain","Not found");});
   otaServer.begin();otaServerReady=true;
   logEvent("OTA local updater listening at http://%s/",WiFi.localIP().toString().c_str());
@@ -735,22 +1060,48 @@ void startWifiPortal() {
 
 void serviceWifi(uint64_t now) {
   if(WiFi.status()==WL_CONNECTED){
-    wifiTrying=false;wifiTried=0;
+    const bool newlyConnected=!wifiWasConnected;
+    wifiWasConnected=true;wifiTrying=false;wifiDisconnectPending=false;wifiTried=0;
     for(uint8_t i=0;i<wifiNetworkCount;++i)if(WiFi.SSID()==wifiNetworks[i].ssid)wifiActiveSlot=i;
+    if(newlyConnected) {
+      logEvent("Wi-Fi connected slot=%d ssid=%s ip=%s",(int)wifiActiveSlot,WiFi.SSID().c_str(),WiFi.localIP().toString().c_str());
+      if(mdnsReady){MDNS.end();mdnsReady=false;}
+      mdnsReady=MDNS.begin("foodmonitor");
+      if(mdnsReady){MDNS.addService("http","tcp",80);logEvent("mDNS updater address=http://foodmonitor.local/");}
+      else logEvent("mDNS unavailable; use IP address http://%s/",WiFi.localIP().toString().c_str());
+    }
     return; // Never scan or switch a healthy connection.
   }
+  if(wifiWasConnected) {
+    wifiWasConnected=false;wifiTrying=false;wifiDisconnectPending=false;wifiTried=0;wifiNextSlot=wifi_recovery::preferredSlot();wifiRetryAt=now;
+    if(mdnsReady){MDNS.end();mdnsReady=false;}
+    logEvent("Wi-Fi link lost reason=%u; automatic recovery starts at preferred slot=0",(unsigned)wifiLastDisconnectReason);
+  }
+  if(wifiDisconnectEventPending) {
+    wifiDisconnectEventPending=false;
+    logEvent("Wi-Fi disconnect event reason=%u status=%d",(unsigned)wifiLastDisconnectReason,(int)WiFi.status());
+  }
   if(wifiManager.getConfigPortalActive())return; // Portal owns STA while configuring.
+  if(wifiDisconnectPending) {
+    if(now-wifiDisconnectAt<500||WiFi.status()==WL_CONNECTED)return;
+    wifiDisconnectPending=false;
+  }
   if(wifiTrying){
     if(now-wifiAttemptAt<WIFI_CONNECT_MS)return;
-    logEvent("Wi-Fi connect timeout slot=%u",(unsigned)wifiNextSlot);
+    const uint8_t timedOutSlot=wifiNextSlot;
+    logEvent("Wi-Fi connect timeout slot=%u ssid=%s; cancelling STA attempt before failover",
+      (unsigned)timedOutSlot,wifiNetworks[timedOutSlot].ssid);
+    WiFi.disconnect(false,false);wifiDisconnectPending=true;wifiDisconnectAt=now;
     wifiTrying=false;++wifiTried;
-    wifiNextSlot=(wifiNextSlot+1)%wifiNetworkCount;
-    if(wifiTried>=wifiNetworkCount){
+    wifiNextSlot=wifi_recovery::nextSlot(wifiNextSlot,wifiNetworkCount);
+    if(wifi_recovery::cycleComplete(wifiTried,wifiNetworkCount)){
       wifiRetryAt=now+WIFI_RETRY_MS;wifiTried=0;
-      logEvent("Wi-Fi networks unavailable; opening configuration portal");
-      startWifiPortal();
+      wifiNextSlot=wifi_recovery::preferredSlot();
+      logEvent("Wi-Fi networks unavailable; retrying preferred slot in %lu ms",(unsigned long)WIFI_RETRY_MS);
       return;
     }
+    wifiRetryAt=now+500;
+    return;
   }
   if(!wifiNetworkCount){
     if(now>=wifiRetryAt){
@@ -762,7 +1113,7 @@ void serviceWifi(uint64_t now) {
   if(now<wifiRetryAt)return;
   WiFi.begin(wifiNetworks[wifiNextSlot].ssid,wifiNetworks[wifiNextSlot].password);
   wifiAttemptAt=now;wifiTrying=true;
-  logEvent("Wi-Fi connect attempt slot=%u",(unsigned)wifiNextSlot);
+  logEvent("Wi-Fi connect attempt slot=%u ssid=%s",(unsigned)wifiNextSlot,wifiNetworks[wifiNextSlot].ssid);
 }
 
 void initGatewayPixel() {
@@ -885,11 +1236,14 @@ void receiveLine(const char* line) {
   }
 
   xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
-  const bool otaPaused=otaMode!=OTA_NORMAL;
-  if(otaPaused)++otaGapSamples;
+  const bool espOtaPaused=otaMode!=OTA_NORMAL;
+  const bool nrfPaused=nrfDfuMode!=NRF_DFU_NORMAL;
+  const bool otaPaused=espOtaPaused||nrfPaused;
+  if(espOtaPaused)++otaGapSamples;
+  if(nrfPaused)++nrfDfuGapSamples;
   xSemaphoreGive(otaIngressMutex);
   if(otaPaused) {
-    logEvent("OTA measurement gap: incoming BLE sample not accepted");
+    logEvent(espOtaPaused?"OTA measurement gap: incoming BLE sample not accepted":"nRF DFU measurement gap: incoming BLE sample not accepted");
     return;
   }
 
@@ -924,13 +1278,16 @@ void receiveLine(const char* line) {
     env.t=f.t;env.h=f.h;env.p=f.p; // g/STEP are absent on BLE and JSON
     seal(env);
     xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
-    const bool pausedAtQueue=otaMode!=OTA_NORMAL;
-    if(pausedAtQueue)++otaGapSamples;
+    const bool espOtaPausedAtQueue=otaMode!=OTA_NORMAL;
+    const bool nrfPausedAtQueue=nrfDfuMode!=NRF_DFU_NORMAL;
+    const bool pausedAtQueue=espOtaPausedAtQueue||nrfPausedAtQueue;
+    if(espOtaPausedAtQueue)++otaGapSamples;
+    if(nrfPausedAtQueue)++nrfDfuGapSamples;
     const BaseType_t queued=pausedAtQueue?pdFALSE:xQueueSend(samplesQueue,&env,0);
     xSemaphoreGive(otaIngressMutex);
     if(pausedAtQueue) {
       portENTER_CRITICAL(&stateMux);environmentState.historyRejected();portEXIT_CRITICAL(&stateMux);
-      logEvent("OTA measurement gap: environment history not queued");return;
+      logEvent(espOtaPausedAtQueue?"OTA measurement gap: environment history not queued":"nRF DFU measurement gap: environment history not queued");return;
     }
     if(queued!=pdTRUE) {
       portENTER_CRITICAL(&stateMux);++queueDrops;environmentState.historyRejected();portEXIT_CRITICAL(&stateMux);
@@ -969,11 +1326,14 @@ void receiveLine(const char* line) {
   seal(s);
 
   xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
-  const bool pausedAtQueue=otaMode!=OTA_NORMAL;
-  if(pausedAtQueue)++otaGapSamples;
+  const bool espOtaPausedAtQueue=otaMode!=OTA_NORMAL;
+  const bool nrfPausedAtQueue=nrfDfuMode!=NRF_DFU_NORMAL;
+  const bool pausedAtQueue=espOtaPausedAtQueue||nrfPausedAtQueue;
+  if(espOtaPausedAtQueue)++otaGapSamples;
+  if(nrfPausedAtQueue)++nrfDfuGapSamples;
   const BaseType_t queued=pausedAtQueue?pdFALSE:xQueueSend(samplesQueue,&s,0);
   xSemaphoreGive(otaIngressMutex);
-  if(pausedAtQueue){logEvent("OTA measurement gap: gas seq=%lu not queued",(unsigned long)s.seq);return;}
+  if(pausedAtQueue){logEvent(espOtaPausedAtQueue?"OTA measurement gap: gas seq=%lu not queued":"nRF DFU measurement gap: gas seq=%lu not queued",(unsigned long)s.seq);return;}
   if(queued!=pdTRUE) {
 
     portENTER_CRITICAL(&stateMux);++queueDrops;portEXIT_CRITICAL(&stateMux);
@@ -1018,7 +1378,8 @@ class ClientCallbacks:public BLEClientCallbacks {
 
   void onDisconnect(BLEClient*)override{
 
-    portENTER_CRITICAL(&stateMux);bleConnected=false;framer.reset();portEXIT_CRITICAL(&stateMux);
+    portENTER_CRITICAL(&stateMux);bleConnected=false;connectedSensorId[0]=0;connectedSensorAddress[0]=0;
+    connectedSensorFirmware[0]=0;framer.reset();portEXIT_CRITICAL(&stateMux);
 
     logEvent("BLE DISCONNECTED; partial frame cleared");
 
@@ -1052,6 +1413,12 @@ class ScanCallbacks:public BLEAdvertisedDeviceCallbacks {
 
 ScanCallbacks scanCallbacks;
 
+void updateNrfDfuProgress(uint32_t sent,uint32_t total,void*) {
+  portENTER_CRITICAL(&stateMux);nrfDfuBytesSent=sent;nrfDfuBytesTotal=total;
+  snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Transferring firmware %lu/%lu bytes",
+    (unsigned long)sent,(unsigned long)total);portEXIT_CRITICAL(&stateMux);
+}
+
 void bleTask(void*) {
 
   BLEDevice::init("FoodMonitor-ESP32");
@@ -1062,9 +1429,36 @@ void bleTask(void*) {
 
     xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
     const bool otaPaused=otaMode!=OTA_NORMAL;
+    const NrfDfuMode dfuMode=nrfDfuMode;
     xSemaphoreGive(otaIngressMutex);
     if(otaPaused) {
       if(bleClient&&bleClient->isConnected())bleClient->disconnect();
+      vTaskDelay(pdMS_TO_TICKS(1000));continue;
+    }
+
+    if(dfuMode==NRF_DFU_PREPARE) {
+      // Keep the current, explicitly paired application connection available
+      // for buttonless DFU entry while the main loop drains pre-existing data.
+      vTaskDelay(pdMS_TO_TICKS(100));continue;
+    }
+
+    if(dfuMode==NRF_DFU_ACTIVE) {
+      char error[128]={};
+      const BLEAddress applicationAddress=bleClient->getPeerAddress();
+      portENTER_CRITICAL(&stateMux);nrfDfuTransferStartedAt=uptimeMs();
+      snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Entering the paired sensor bootloader");portEXIT_CRITICAL(&stateMux);
+      logEvent("nRF DFU ACTIVE; MTU=23 PRN=8 measurement gap continues");
+      const bool ok=nrfDfuRelay.run(SPIFFS,NRF_DFU_PACKAGE_PATH,nrfDfuPackage,bleClient,
+        applicationAddress,&nrfDfuCancelRequested,error,sizeof(error),updateNrfDfuProgress,nullptr);
+      xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
+      nrfDfuMode=ok?NRF_DFU_RECONNECT:NRF_DFU_NORMAL;
+      nrfDfuDeadlineAt=ok?uptimeMs()+NRF_DFU_RECONNECT_TIMEOUT_MS:0;
+      nrfDfuCancelRequested=false;
+      if(ok)snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Transfer validated; waiting for sensor reconnect");
+      else {nrfDfuHasResult=true;nrfDfuLastSuccess=false;snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"%.120s",error);}
+      xSemaphoreGive(otaIngressMutex);
+      if(ok)logEvent("nRF DFU transfer validated and activated; waiting for NUS reconnect");
+      else logEvent("nRF DFU FAILED: %s; normal collection resumed",error);
       vTaskDelay(pdMS_TO_TICKS(1000));continue;
     }
 
@@ -1086,7 +1480,9 @@ void bleTask(void*) {
       xSemaphoreGive(otaIngressMutex);
       if(mayConnect&&targetDevice && bleClient->connect(targetDevice)) {
 
-        portENTER_CRITICAL(&stateMux);connectedSensorId[0]=0;portEXIT_CRITICAL(&stateMux);
+        const String peerAddress=bleClient->getPeerAddress().toString();
+        portENTER_CRITICAL(&stateMux);connectedSensorId[0]=0;connectedSensorFirmware[0]=0;
+        peerAddress.toCharArray(connectedSensorAddress,sizeof(connectedSensorAddress));portEXIT_CRITICAL(&stateMux);
         if(targetDevice->haveName()) {
           String name(targetDevice->getName().c_str());
           if(name.startsWith("BME688-")&&name.length()==23) {
@@ -1107,7 +1503,25 @@ void bleTask(void*) {
 
           if(!bleConnectedAt)bleConnectedAt=uptimeMs();
           char sensorIdSnapshot[17];portENTER_CRITICAL(&stateMux);memcpy(sensorIdSnapshot,connectedSensorId,sizeof(sensorIdSnapshot));portEXIT_CRITICAL(&stateMux);
-          logEvent("BLE connected and subscribed sensor_id=%s uptime=%llu ms",sensorIdSnapshot[0]?sensorIdSnapshot:"unknown",(unsigned long long)uptimeMs());
+          BLEUUID disUuid((uint16_t)0x180A),firmwareUuid((uint16_t)0x2A26);
+          BLERemoteService* dis=bleClient->getService(disUuid);
+          BLERemoteCharacteristic* revision=dis?dis->getCharacteristic(firmwareUuid):nullptr;
+          const String firmware=revision&&revision->canRead()?revision->readValue():String();
+          portENTER_CRITICAL(&stateMux);firmware.toCharArray(connectedSensorFirmware,sizeof(connectedSensorFirmware));portEXIT_CRITICAL(&stateMux);
+          logEvent("BLE connected and subscribed sensor_id=%s address=%s firmware=%s uptime=%llu ms",
+            sensorIdSnapshot[0]?sensorIdSnapshot:"unknown",peerAddress.c_str(),firmware.length()?firmware.c_str():"unknown",(unsigned long long)uptimeMs());
+
+          if(dfuMode==NRF_DFU_RECONNECT) {
+            if(firmware.length()) {
+              logEvent("nRF DFU SUCCESS; reconnected firmware=%s",firmware.c_str());
+              xSemaphoreTake(otaIngressMutex,portMAX_DELAY);nrfDfuMode=NRF_DFU_NORMAL;nrfDfuDeadlineAt=0;
+              nrfDfuHasResult=true;nrfDfuLastSuccess=true;
+              snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Reconnected with firmware %.31s",firmware.c_str());xSemaphoreGive(otaIngressMutex);
+            } else {
+              logEvent("nRF DFU reconnect missing firmware revision; update remains unconfirmed");
+              bleClient->disconnect();
+            }
+          }
 
         } else bleClient->disconnect();
 
@@ -1688,6 +2102,7 @@ uint32_t drain(Sample* dest) {
 void setup() {
 
   Serial.begin(115200);if(UART_DIAGNOSTICS)Serial0.begin(115200);
+  nrfDfuRelay.setLogger(logEvent);
 
   logMutex=xSemaphoreCreateMutex();otaIngressMutex=xSemaphoreCreateMutex();samplesQueue=xQueueCreate(RAM_SAMPLES,sizeof(Sample));
 
@@ -1696,6 +2111,9 @@ void setup() {
   if(!logMutex||!samplesQueue||!jobsQueue||!resultsQueue){Serial0.println("FATAL allocation failed");while(true)delay(1000);}
 
   pinMode(WIFI_RESET_PIN,INPUT_PULLUP);WiFi.mode(WIFI_STA);
+  WiFi.onEvent([](WiFiEvent_t,WiFiEventInfo_t info){
+    wifiLastDisconnectReason=info.wifi_sta_disconnected.reason;wifiDisconnectEventPending=true;
+  },ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
   initGatewayPixel();initGatewayLcd();
 
@@ -1722,6 +2140,7 @@ void setup() {
 
   spool.begin();
   logEvent("SPIFFS mount %s",spool.mounted?"success":"failed");
+  recoverNrfPackageFiles();
 
   logEvent("SPOOL total=%u budget=%u pending=%lu fault=%u (never auto-format)",
 
@@ -1762,8 +2181,6 @@ void loop() {
   static String activePath;
 
   static bool busy=false, failed=false, haveCloudAck=false;
-
-  static bool recordingKnown=false, recording=false;
 
   static uint64_t due=0, activeSince=0, lastSpill=0;
 
@@ -1816,9 +2233,9 @@ void loop() {
       otaLastCloudAckAt=now;
       logEvent("MILESTONE application ACK uptime=%llu ms",(unsigned long long)now);
 
-      if(!strcmp(result.recording,"RECORDING")){recordingKnown=true;recording=true;}
+      if(!strcmp(result.recording,"RECORDING")){cloudRecordingKnown=true;cloudRecording=true;}
 
-      else if(!strcmp(result.recording,"STOPPED")){recordingKnown=true;recording=false;}
+      else if(!strcmp(result.recording,"STOPPED")){cloudRecordingKnown=true;cloudRecording=false;}
 
       lastCloudUpload=clockValid()?utcMs():0;unassignedCount+=result.unassigned;
 
@@ -1873,7 +2290,29 @@ void loop() {
   otaActiveSamples=activeCount;otaStagedSamples=stagedCount;
   otaHttpBusy=busy;otaHttpFailed=failed;
   if(otaServerReady)otaServer.handleClient(); // OTA request wins before another data job starts.
+  if(nrfPackageUploadActive&&uptimeMs()-nrfPackageUploadLastAt>60000ULL)
+    failNrfPackageUpload("upload timed out",408);
   const bool otaMaintenanceNetworkBusy=serviceDeferredOtaLeaseRelease();
+
+  if(nrfDfuMode==NRF_DFU_PREPARE) {
+    if(now>nrfDfuDeadlineAt||!cloudRecordingKnown||cloudRecording||spool.fault) {
+      logEvent("nRF DFU PREPARE failed: %s; normal collection resumed",
+        now>nrfDfuDeadlineAt?"timeout":!cloudRecordingKnown?"recording unknown":cloudRecording?"recording active":"SPIFFS fault");
+      xSemaphoreTake(otaIngressMutex,portMAX_DELAY);nrfDfuMode=NRF_DFU_NORMAL;nrfDfuDeadlineAt=0;
+      nrfDfuHasResult=true;nrfDfuLastSuccess=false;snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Preparation failed or timed out");xSemaphoreGive(otaIngressMutex);
+    } else if(!activeCount&&!stagedCount&&!spool.count&&!busy&&!failed&&
+              !uxQueueMessagesWaiting(samplesQueue)&&!uxQueueMessagesWaiting(resultsQueue)&&bleConnected) {
+      xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
+      if(nrfDfuMode==NRF_DFU_PREPARE)nrfDfuMode=NRF_DFU_ACTIVE;
+      snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Starting transfer to paired sensor");
+      xSemaphoreGive(otaIngressMutex);
+      logEvent("nRF DFU PREPARE complete; existing data preserved and drained");
+    }
+  } else if(nrfDfuMode==NRF_DFU_RECONNECT&&now>nrfDfuDeadlineAt) {
+    logEvent("nRF DFU reconnect timeout; update result unconfirmed, normal collection resumed");
+    xSemaphoreTake(otaIngressMutex,portMAX_DELAY);nrfDfuMode=NRF_DFU_NORMAL;nrfDfuDeadlineAt=0;
+    nrfDfuHasResult=true;nrfDfuLastSuccess=false;snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Reconnect timed out; update result is unconfirmed");xSemaphoreGive(otaIngressMutex);
+  }
 
   if(otaMode==OTA_PREPARE&&!otaLeaseHeld&&otaSafeState()) {
     otaHttpBusy=true;
@@ -1889,7 +2328,7 @@ void loop() {
   }
 
   const uint32_t queuedForUpload=uxQueueMessagesWaiting(samplesQueue);
-  if(shouldStartDataUpload(busy,otaMode==OTA_ACTIVE,otaMaintenanceNetworkBusy||otaLeaseReleasePending,now,due,
+  if(shouldStartDataUpload(busy,nrfPackageUploadActive||otaMode==OTA_ACTIVE||nrfDfuMode==NRF_DFU_ACTIVE||nrfDfuMode==NRF_DFU_RECONNECT,otaMaintenanceNetworkBusy||otaLeaseReleasePending,now,due,
        activeCount,stagedCount,spool.count,queuedForUpload)) {
 
     // Preserve unreadable disk contents; current-boot RAM samples may still upload with stable UIDs.
@@ -1950,7 +2389,7 @@ void loop() {
     abortOtaSession();
   }
 
-  updateGatewayUi(now,wifiOnline,cloud,queueDepth,spool.count,recordingKnown,recording,backlog);
+  updateGatewayUi(now,wifiOnline,cloud,queueDepth,spool.count,cloudRecordingKnown,cloudRecording,backlog);
 
   delay(10);
 
