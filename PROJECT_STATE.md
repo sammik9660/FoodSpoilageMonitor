@@ -2,6 +2,11 @@
 
 갱신일: 2026-10-21. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-21 OLED sensor-error battery display (소스/호스트 검증)
+
+- BME688 초기화 실패 또는 연속 측정 실패로 `sensorReady=false`인 동안에도 기존 배터리 service와 OLED refresh는 계속 실행되고 있었으나, OLED의 invalid-measurement 분기가 세 번째 줄에 pressure placeholder만 출력해 배터리 상태를 숨기고 있었다. 표시 분기만 변경해 `BME:ERR`, T/H/P `--`, 그리고 `B:<percent>%`/`B:USB`/`B:--%`를 4줄 layout 안에 표시한다. 복구 중임은 마지막 줄의 `REC`로 유지하고 센서 복구 후 기존 정상 ENV 화면으로 자동 복귀한다.
+- 배터리 측정·자가 보정, BLE, HP-354 scan과 센서 recovery 로직은 변경하지 않았다. 실제 nRF source를 포함한 MSVC host test가 통과했고 error 화면의 battery/USB/unavailable 세 형식을 검사했다. Arduino nRF target compile과 실제 BME688 분리·복구 OLED 동작은 아직 미검증이다.
+
 ## 2026-10-21 battery estimate/calibration integration (소스/호스트 검증)
 
 - 사용자가 추가한 `Battery.h` 비선형 3.50--4.20 V 곡선과 OLED `B:n%` 표시를 기준으로 보존했다. 5-sample median, ENV-only 100 mV residence summaries, fixed endpoint를 바꾸지 않는 제한 보정, DEFAULT/COLLECTING/CALIBRATED/INSUFFICIENT_DATA/INVALID 상태를 추가했다. GAS/COOL/REC/USB 측정은 학습하지 않으며 보정값은 기본 곡선과 혼합 후 +/-10 percentage points로 제한한다. 이는 mAh, 정확한 SOC, 열화도나 충전 완료 측정이 아니다.

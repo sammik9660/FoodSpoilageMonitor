@@ -422,6 +422,17 @@ void serviceBatteryVoltage(uint32_t now) {
   measureBatteryVoltage();
 }
 
+void formatUnavailableSensorOledLine(char* out, size_t outSize,
+                                     bool usbPresent, bool batteryValid,
+                                     uint8_t batteryPercent) {
+  if (usbPresent)
+    snprintf(out, outSize, "P:----.- B:USB");
+  else if (batteryValid)
+    snprintf(out, outSize, "P:----.- B:%u%%", batteryPercent);
+  else
+    snprintf(out, outSize, "P:----.- B:--%%");
+}
+
 #if !defined(_MSC_VER)
 void initializeOled() {
   // Wire는 initializeSensor()가 검증된 D21/D20 핀으로 이미 시작했다.
@@ -479,7 +490,7 @@ void updateOled(uint32_t now) {
   formatOledCounter(failures, failText, sizeof(failText));
   formatOledCounter(recoveries, recoveryText, sizeof(recoveryText));
   formatOledCounter(txErrors, txText, sizeof(txText));
-  const char* sensorText = !sensorReady ? "REC" : sensorMode==MODE_GAS ? "GAS" :
+  const char* sensorText = !sensorReady ? "ERR" : sensorMode==MODE_GAS ? "GAS" :
     sensorMode==MODE_COOL ? "COOL" : envReadOK ? "OK" : "ERR";
 
   oled.clearDisplay();
@@ -513,12 +524,18 @@ void updateOled(uint32_t now) {
     oled.println(line);
   } else {
     oled.println(F("T:--.-C H:--.-%"));
-    oled.println(sensorMode==MODE_GAS ? F("HP354 scan active") :
-                 sensorMode==MODE_COOL ? F("Cooling sensor") : F("P:----.-"));
+    if (!sensorReady) {
+      formatUnavailableSensorOledLine(line, sizeof(line), usbPowerPresent,
+                                      batteryMeasurementValid,
+                                      batteryTracker.estimatedPercent());
+      oled.println(line);
+    } else
+      oled.println(sensorMode==MODE_GAS ? F("HP354 scan active") :
+                   sensorMode==MODE_COOL ? F("Cooling sensor") : F("P:----.-"));
   }
 
   snprintf(line, sizeof(line), "%s:%s F:%s R:%s",
-         sensorMode == MODE_ENV ? "ENV" : "GAS",
+         !sensorReady ? "REC" : sensorMode == MODE_ENV ? "ENV" : "GAS",
          seqText, failText, recoveryText);
   oled.println(line);
   oled.display();

@@ -40,6 +40,13 @@ int main(){
  assert(!batteryMeasurementValid&&batteryMillivolts==0&&usbPowerPresent);
  testUsbPowerPresent=false;measureBatteryVoltage();sendHealth();
  assert(transmitted.find(",BV=")!=std::string::npos&&transmitted.find(",BOK=1,USB=0,BP=")!=std::string::npos);
+ char oledLine[22];
+ formatUnavailableSensorOledLine(oledLine,sizeof(oledLine),false,true,89);
+ assert(std::string(oledLine)=="P:----.- B:89%");
+ formatUnavailableSensorOledLine(oledLine,sizeof(oledLine),true,false,0);
+ assert(std::string(oledLine)=="P:----.- B:USB");
+ formatUnavailableSensorOledLine(oledLine,sizeof(oledLine),false,false,0);
+ assert(std::string(oledLine)=="P:----.- B:--%");
  assert(Wire.sda==21&&Wire.scl==20&&profileCount==0&&sensorMode==MODE_ENV);
  assert((testGas0&BME68X_HCTRL_MSK)&&!(testGas1&BME68X_RUN_GAS_MSK));
  const uint32_t bootAt=testMillis;
