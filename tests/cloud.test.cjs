@@ -34,7 +34,7 @@ function environment(){
   SpreadsheetApp:{openById:id=>{assert.equal(id,'existing-id');return book;},flush(){}},
   Utilities:{getUuid:()=>String(++uuid).padStart(32,'0')},
   CacheService:{getScriptCache:()=>({get:k=>cache.get(k),put:(k,v)=>cache.set(k,v),remove:k=>cache.delete(k)})},
-  ContentService:{MimeType:{JSON:'json',CSV:'csv'},createTextOutput:text=>({text,filename:null,setMimeType(){return this;},downloadAsFile(name){this.filename=name;return this;}})},
+  ContentService:{MimeType:{JSON:'json',CSV:'csv'},createTextOutput:text=>({text,filename:null,setMimeType(){return this;},downloadAsFile(name){if(/[^\x20-\x7E]/.test(name))throw Error('잘못된 인수: '+name);this.filename=name;return this;}})},
   ScriptApp:{getService:()=>({getUrl:()=> 'https://example.invalid/exec'})},
   HtmlService:{createTemplateFromFile:name=>({evaluate(){return {setTitle(){return {name,url:this.webAppUrl};}};}})}
  };
@@ -165,13 +165,15 @@ test('OTA lease and recording start are mutually exclusive per device',()=>{
  e.api.ingest({version:2,device_id:a,samples:[],health:{ota_state:'IDLE'}});
  assert.equal(e.api.startRecording('released',a).state,'RECORDING');
 });
-test('CSV route, session filter and absolute deployed link template',()=>{
- const e=environment();const r=e.api.startRecording('냉장 사과:01/테스트');send(e,[sample(1,e.now())]);const session=e.api.doGet({parameter:{download:'csv',session:r.session_id}});
+test('CSV route uses safe filenames, session filter and absolute deployed link template',()=>{
+ const e=environment();const r=e.api.startRecording('바나나껍데기');send(e,[sample(1,e.now())]);const session=e.api.doGet({parameter:{download:'csv',session:r.session_id}});
  assert(session.text.includes('sample_uid'));assert(session.text.includes(boot+'-1'));assert(!session.text.includes('historical'));
- assert.equal(session.filename,'냉장 사과_01_테스트.csv');
+ assert.match(session.filename,/^food-spoilage-session-EXP-[A-Za-z0-9_-]+\.csv$/);assert(!/[^\x20-\x7E]/.test(session.filename));
  assert.equal(e.api.doGet({parameter:{download:'csv'}}).filename,'food-spoilage-all.csv');
  e.api.stopRecording();const stopped=e.api.getDashboard().recording;
  assert.equal(stopped.state,'STOPPED');assert.equal(stopped.download_session_id,r.session_id);assert.equal(stopped.download_kind,'LATEST');
+ const ascii=e.api.startRecording('banana-peel');send(e,[sample(2,e.now())]);
+ assert.equal(e.api.doGet({parameter:{download:'csv',session:ascii.session_id}}).filename,'banana-peel.csv');
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');assert(html.includes("base='<?= webAppUrl ?>'"));assert(html.includes("&device='+encodeURIComponent(id)"));
 });
 test('dashboard cannot report live solely from successful RPC',()=>{const e=environment();assert(!e.api.getDashboard().state.includes('ONLINE'));e.api.ingest({version:2,samples:[],health:{ble_connected:true,sensor_ok:false,last_valid_age_ms:100}});assert.equal(e.api.getDashboard().state,'SENSOR ERROR');e.setTime(e.now()+31000);assert(e.api.getDashboard().state.startsWith('STALE'));});
@@ -187,6 +189,8 @@ test('dashboard defines device-scoped panels, polling, controls and paged CSV li
  assert(code.includes('const DASHBOARD_REFRESH_MS = 5000;'));
  assert(html.includes('getDashboardDevices()'));assert(html.includes('getDashboard(id)'));
  assert(html.includes('startRecording(el(id,\'label\').value,id)'));assert(html.includes('stopRecording(id)'));
+ assert(html.includes('새 실험 시작'));assert(html.includes('실험 종료'));assert(html.includes('장치 전체 데이터 다운로드 (CSV)'));
+ assert(html.includes('최근 실험 데이터 다운로드 (CSV)'));assert(html.includes('(page-1)*10000'));
  assert(html.includes('h.ota_state===\'UPDATING\''));
  assert(html.includes('ESP32 OTA — gateway firmware'));assert(html.includes('nRF52840 DFU — sensor firmware'));
  assert(html.includes("espOtaLink.href=local+'/'"));assert(html.includes("nrfDfuLink.href=local+'/nrf-dfu'"));
@@ -211,17 +215,22 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  vm.createContext(ctx);vm.runInContext(script,ctx);
  assert(element('panel-'+a)&&element('panel-'+b));
  ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5}},
-  recording:{state:'STOPPED',session_id:null,download_session_id:null}});
+  recording:{state:'STOPPED',session_id:null,download_session_id:'EXP-recent',download_experiment_label:'바나나껍데기',download_started_at:e.now(),download_kind:'LATEST'}});
  assert.equal(element('state-'+a).textContent,'STALE');
  assert.equal(element('values-'+a).textContent,'24.50 °C · 47.25 % · 1002.50 hPa');
  assert.equal(element('age-'+a).textContent,'Last environment sample: 20.0 s ago');
+ assert.equal(element('recording-'+a).textContent,'실험 종료됨');assert.equal(element('sessionName-'+a).textContent,'바나나껍데기');
+ assert(element('sessionDate-'+a).textContent.startsWith('실험 시작: '));assert.equal(element('sessionId-'+a).textContent,'EXP-recent');
+ element('page-'+a).value='2';ctx.csvLinks(a);assert(element('all-'+a).href.includes('offset=10000'));assert(element('sessionCsv-'+a).href.includes('offset=10000'));
  ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5}},
   recording:{state:'UNKNOWN',session_id:null,download_session_id:null}});
  assert.equal(element('start-'+a).disabled,true);assert.equal(element('stop-'+a).disabled,true);
  ctx.control(a,true);assert.equal(e.api.getDashboard(a).recording.state,'RECORDING');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
+ assert.equal(element('message-'+a).textContent,'새 실험을 시작했습니다.');
  assert(element('all-'+a).href.includes('device='+a));assert(element('all-'+b).href.includes('device='+b));
  offlineB=true;ctx.poll();assert.equal(element('state-'+a).textContent,e.api.getDashboard(a).state);assert.equal(element('state-'+b).textContent,'CLOUD/UPLOAD ERROR (dashboard request)');
  ctx.control(a,false);assert.equal(e.api.getDashboard(a).recording.state,'STOPPED');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
+ assert.equal(element('message-'+a).textContent,'실험을 종료했습니다.');
 });
 test('device loading displays empty, failure, malformed response, and delayed lookup states',()=>{
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');

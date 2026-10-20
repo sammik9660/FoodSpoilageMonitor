@@ -124,7 +124,9 @@ function recordingResult(ctx, deviceId) {
   const latest=active?null:(list.slice().reverse().find(s=>s.stop!==null)||null);
   const download=active||latest;
   return {device_id:deviceId,state:active?'RECORDING':'STOPPED',session_id:active?active.id:null,experiment_label:active?active.label:null,
+    started_at:active?active.start:null,
     download_session_id:download?download.id:null,download_experiment_label:download?download.label:null,
+    download_started_at:download?download.start:null,
     download_kind:active?'CURRENT':latest?'LATEST':null};
 }
 function cacheRecording(record) {
@@ -133,7 +135,8 @@ function cacheRecording(record) {
 }
 function unknownRecording(deviceId) {
   return {device_id:deviceId,state:'UNKNOWN',session_id:null,experiment_label:null,
-    download_session_id:null,download_experiment_label:null,download_kind:null};
+    started_at:null,download_session_id:null,download_experiment_label:null,
+    download_started_at:null,download_kind:null};
 }
 function cachedObject(cache,key) {
   try {const raw=cache.get(key);return raw?JSON.parse(raw):null;} catch(_) {return null;}
@@ -434,13 +437,21 @@ function getDashboardDevices() {
 }
 function getSensorData(deviceId) {return getDashboard(deviceId);}
 function csvCell(v) {if(v instanceof Date)v=v.toISOString();return '"'+String(v===null?'':v).replace(/"/g,'""')+'"';}
-function csvFilename(label) {
+function csvFilename(label, sessionId) {
   if(label===null)return 'food-spoilage-all.csv';
   let name=String(label);
   if(name.normalize)name=name.normalize('NFC');
+  const hadNonAscii=/[^\x20-\x7E]/.test(name);
   name=name.replace(/[\u0000-\u001F\u007F<>:"/\\|?*]/g,'_').replace(/\s+/g,' ').trim().replace(/[. ]+$/g,'');
   name=name.replace(/\.csv$/i,'').replace(/[. ]+$/g,'');
-  if(!name)name='session';
+  // TextOutput.downloadAsFile() rejects some Unicode filenames in production.
+  // Keep readable ASCII labels, otherwise use the stable session identity; the
+  // original Unicode experiment label remains unchanged in Sheets/session data.
+  name=name.replace(/[^\x20-\x7E]/g,'_').replace(/_+/g,'_').replace(/^_+|_+$/g,'');
+  if(hadNonAscii||!/[A-Za-z0-9]/.test(name)) {
+    const safeId=String(sessionId||'session').replace(/[^A-Za-z0-9_-]/g,'_').slice(0,80);
+    name='food-spoilage-session-'+(safeId||'session');
+  }
   if(/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name))name='_'+name;
   name=Array.from(name).slice(0,100).join('');
   return name+'.csv';
@@ -460,7 +471,7 @@ function getCsvPage(sessionId, offset, limit, requestedDeviceId) {
     const selected=[HEADERS].concat(rows.filter(r=>(!sessionId||r[6]===sessionId)&&
       (deviceId===null||(deviceId===LEGACY_DEVICE_ID?(r[22]||LEGACY_DEVICE_ID)===LEGACY_DEVICE_ID:r[22]===deviceId))));
     return {csv:selected.map(r=>r.map(csvCell).join(',')).join('\r\n'),
-      filename:session?csvFilename(session.label):csvFilename(null)};
+      filename:session?csvFilename(session.label,session.id):csvFilename(null)};
   });
 }
 function getCsvData(sessionId, offset, limit, deviceId) {return getCsvPage(sessionId,offset,limit,deviceId).csv;}
