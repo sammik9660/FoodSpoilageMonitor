@@ -2,6 +2,14 @@
 
 갱신일: 2026-10-19. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-20 Wi-Fi event-driven recovery (소스/호스트 검증)
+
+- 연결 시도 중 STA disconnect 이벤트가 오면 슬롯 전체 timeout을 기다리지 않고 즉시 실패로 처리한다. 명시적 연결 취소는 실제 disconnect 이벤트를 기다리며, 이벤트가 누락된 경우에만 2초 제한 fallback을 사용한다. 다음 `WiFi.begin()` 전에는 이벤트 이후 250ms settle을 둬 연결 설정 충돌을 피한다.
+- 무응답 연결 timeout은 20초에서 12초, 두 네트워크 전체 실패 뒤 재시도 간격은 30초에서 10초로 줄였다. 성공 슬롯 번호만 기존 `fsm-wifi` namespace의 별도 `last` 1-byte key에 기록한다. 기존 `ap0`/`ap1` credential 레코드와 내용은 바꾸지 않으며 재부팅·연결 끊김 뒤 마지막 성공 슬롯을 먼저 시도하고 다른 슬롯도 계속 순회한다.
+- HTTPS/TLS, BLE/DFU, OTA, SPIFFS/spool, NeoPixel, 센서 펌웨어와 파티션은 변경하지 않았다. MSVC C++17 `wifi_recovery_test`와 `git diff --check`가 통과했다. ESP32 컴파일과 실제 AP 전환·장기 자동 복구는 사용자 실기 전까지 미검증이다.
+- 후속 실기에서 빠른 연결 직후 `udp_new_ip_type ... Required to lock TCPIP core functionality!` assertion과 reason 8이 관찰됐다. 설치된 mDNS 1.11.2는 UDP PCB 작업을 `tcpip_api_call()`로 넘기며 Wi-Fi 이벤트 callback도 상태 기록만 하므로, 제공된 로그만으로 assert의 정확한 호출자는 확정하지 못했다. 링크 변동 때 `MDNS.end()`/`begin()`을 반복하던 수명 경합은 responder를 1회만 초기화하고 ESP-NETIF 상태 전이를 따르도록 제거했다. 명시적 disconnect의 늦은 reason 8(`ASSOC_LEAVE`)이 다음 슬롯 시도를 실패로 처리하지 않도록 무시하며 2/201/203은 기존 즉시 failover 대상으로 유지한다. 호스트 정책 테스트와 정적 mDNS 수명 검사, `git diff --check`는 통과했다. assert 해소, 1.5초/126초 연결 사례 및 Brownout 원인은 실기 재확인이 필요하다.
+- 재발 로그와 SHA-256 `776df427b17c...`가 일치하는 Arduino ELF를 디코딩했다. 호출 경로는 `networkTask()`의 HTTPS POST → `HTTPClient` → `NetworkClientSecure::connect()` → core 3.3.12 `NetworkManager::hostByName()` → 잠금 없는 `dns_clear_cache()` → SNTP DNS callback → `dns_gethostbyname()` → `udp_new_ip_type()` assert였다. mDNS는 이 crash의 호출 스택에 없었다. Arduino core 파일 대신 gateway의 네 HTTPS 경로만 thread-safe `lwip_getaddrinfo()`로 해석하고, 해석된 IP와 원래 hostname(SNI), 기존 인증 설정으로 TLS를 연결하도록 변경했다. Wi-Fi 정책 테스트, 모든 HTTPS client 경로 정적 검사와 `git diff --check`는 통과했으며 ESP32 전체 빌드·업로드와 실기 crash 해소는 아직 미검증이다.
+
 ## 2026-10-19 ESP32 → nRF52840 Legacy BLE DFU 중계 Phase 1 (소스/호스트 검증)
 
 - 2026-10-20 사용자 실기에서 웹 페어링, ZIP 검증·저장, PREPARE/ACTIVE 및 nRF의 실제 bootloader 진입까지 확인했으나 전송은 0%에서 `DFU control write failed`로 중단됐다. 로그상 애플리케이션은 진입 명령 직후 예상대로 연결을 끊고 bootloader에 머물렀다. ESP 구현이 write-with-response의 `false`를 즉시 실패로 처리해 bootloader 검색으로 진행하지 않은 것이 확인됐다.

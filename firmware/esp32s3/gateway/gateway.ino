@@ -43,6 +43,8 @@
 
 #include <HTTPClient.h>
 
+#include <lwip/netdb.h>
+
 #include <WiFiManager.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
@@ -91,6 +93,51 @@
 #include "NrfDfuPackagePolicy.h"
 #include "WifiRecoveryPolicy.h"
 
+// Arduino-ESP32 3.3.12 NetworkManager::hostByName() clears lwIP's DNS cache
+// directly when the interface address state changes. With lwIP thread-safety
+// checks enabled, that can run SNTP DNS callbacks from this task and assert in
+// udp_new_ip_type(). Resolve through the thread-safe netconn getaddrinfo path,
+// then retain the original hostname for TLS SNI and certificate handling.
+class GatewaySecureClient : public WiFiClientSecure {
+ public:
+  using WiFiClientSecure::connect;
+
+  int connect(const char* host,uint16_t port) override {
+    return connect(host,port,_timeout);
+  }
+
+  int connect(const char* host,uint16_t port,int32_t timeout) override {
+    IPAddress address;
+    if(!resolveHost(host,address))return 0;
+    setConnectionTimeout(timeout);
+    return NetworkClientSecure::connect(address,port,host,_CA_cert,_cert,_private_key);
+  }
+
+ private:
+  static bool resolveHost(const char* host,IPAddress& address) {
+    if(!host||!host[0])return false;
+    if(address.fromString(host))return true;
+    struct addrinfo hints={};
+    struct addrinfo* result=nullptr;
+    hints.ai_family=AF_UNSPEC;
+    hints.ai_socktype=SOCK_STREAM;
+    const int err=lwip_getaddrinfo(host,"0",&hints,&result);
+    if(err!=ERR_OK||!result)return false;
+#if CONFIG_LWIP_IPV6
+    if(result->ai_family==AF_INET6) {
+      const struct sockaddr_in6* ipv6=(const struct sockaddr_in6*)result->ai_addr;
+      address=IPAddress(IPv6,ipv6->sin6_addr.s6_addr);
+    } else
+#endif
+    {
+      const struct sockaddr_in* ipv4=(const struct sockaddr_in*)result->ai_addr;
+      address=IPAddress(ipv4->sin_addr.s_addr);
+    }
+    lwip_freeaddrinfo(result);
+    return true;
+  }
+};
+
 #ifdef CONFIG_APP_ROLLBACK_ENABLE
 extern "C" bool verifyRollbackLater();
 #endif
@@ -115,7 +162,8 @@ constexpr uint32_t UPLOAD_INTERVAL_MS=5000, OUTAGE_FLUSH_MS=60000;
 constexpr uint32_t MAX_RETRY_MS=30000, RATE_LIMIT_RETRY_MS=150000, PERSIST_INFLIGHT_MS=10000;
 
 constexpr uint8_t WIFI_RESET_PIN=0;
-constexpr uint32_t WIFI_CONNECT_MS=20000, WIFI_RETRY_MS=30000;
+constexpr uint32_t WIFI_CONNECT_MS=wifi_recovery::CONNECT_TIMEOUT_MS;
+constexpr uint32_t WIFI_RETRY_MS=wifi_recovery::RETRY_CYCLE_MS;
 
 constexpr uint8_t LCD_SDA_PIN=8, LCD_SCL_PIN=9, LCD_ADDRESS=0x27;
 
@@ -226,7 +274,7 @@ uint64_t nrfPackageUploadLastAt=0;
 int nrfPackageUploadStatus=400;
 char nrfPackageUploadError[128]={};
 bool cloudRecordingKnown=false,cloudRecording=false;
-uint8_t wifiNetworkCount=0, wifiNextSlot=0, wifiTried=0;
+uint8_t wifiNetworkCount=0, wifiNextSlot=0, wifiTried=0, wifiPreferredSlot=0;
 int8_t wifiActiveSlot=-1;
 uint64_t wifiAttemptAt=0, wifiRetryAt=0;
 bool wifiDisconnectPending=false,mdnsReady=false;
@@ -332,6 +380,15 @@ bool saveWifiNetwork(const String& ssid,const String& password) {
   return true;
 }
 
+void rememberSuccessfulWifiSlot(uint8_t slot) {
+  if(slot>=wifiNetworkCount)return;
+  wifiPreferredSlot=slot;
+  if(!wifiPreferencesReady)return;
+  if(wifiPreferences.getUChar("last",0xff)==slot)return;
+  if(wifiPreferences.putUChar("last",slot)!=sizeof(uint8_t))
+    logEvent("ERROR Wi-Fi preferred slot storage failed; credentials unchanged");
+}
+
 void loadWifiNetworks() {
   wifiPreferencesReady=wifiPreferences.begin("fsm-wifi",false);
   if(!wifiPreferencesReady)logEvent("ERROR Wi-Fi credential storage unavailable");
@@ -359,8 +416,12 @@ void loadWifiNetworks() {
       }
     }
   }
+  wifiPreferredSlot=wifi_recovery::preferredSlot(
+    wifiPreferencesReady?wifiPreferences.getUChar("last",0xff):0xff,wifiNetworkCount);
+  wifiNextSlot=wifiPreferredSlot;
   wifiActiveSlot=-1;
-  logEvent("Wi-Fi saved networks=%u",(unsigned)wifiNetworkCount);
+  logEvent("Wi-Fi saved networks=%u preferred_slot=%u",
+    (unsigned)wifiNetworkCount,(unsigned)wifiPreferredSlot);
 }
 
 void loadSensorPairing() {
@@ -903,7 +964,7 @@ bool syncOtaLease(const char* state) {
   char* payload=cJSON_PrintUnformatted(root);cJSON_Delete(root);if(!payload)return false;
   String redirect,response;int postCode=0;
   {
-    WiFiClientSecure client;client.setInsecure();HTTPClient post;
+    GatewaySecureClient client;client.setInsecure();HTTPClient post;
     post.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);post.setConnectTimeout(5000);post.setTimeout(15000);post.setReuse(false);
     if(post.begin(client,GOOGLE_SCRIPT_URL)) {
       post.addHeader("Content-Type","application/json");postCode=post.POST((uint8_t*)payload,strlen(payload));
@@ -915,7 +976,7 @@ bool syncOtaLease(const char* state) {
   }
   cJSON_free(payload);
   if(redirect.length()) {
-    delay(100);WiFiClientSecure client;client.setInsecure();HTTPClient get;
+    delay(100);GatewaySecureClient client;client.setInsecure();HTTPClient get;
     get.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);get.setConnectTimeout(10000);get.setTimeout(15000);get.setReuse(false);
     if(get.begin(client,redirect)) {const int code=get.GET();if(code>=200&&code<300&&get.getSize()<=16000)response=get.getString();get.end();}
     client.stop();
@@ -1059,32 +1120,64 @@ void startWifiPortal() {
 }
 
 void serviceWifi(uint64_t now) {
+  bool disconnectEvent=false;
+  uint8_t disconnectReason=0;
+  portENTER_CRITICAL(&stateMux);
+  disconnectEvent=wifiDisconnectEventPending;
+  disconnectReason=wifiLastDisconnectReason;
+  wifiDisconnectEventPending=false;
+  portEXIT_CRITICAL(&stateMux);
+
   if(WiFi.status()==WL_CONNECTED){
     const bool newlyConnected=!wifiWasConnected;
     wifiWasConnected=true;wifiTrying=false;wifiDisconnectPending=false;wifiTried=0;
+    wifiActiveSlot=-1;
     for(uint8_t i=0;i<wifiNetworkCount;++i)if(WiFi.SSID()==wifiNetworks[i].ssid)wifiActiveSlot=i;
     if(newlyConnected) {
+      if(wifiActiveSlot>=0)rememberSuccessfulWifiSlot((uint8_t)wifiActiveSlot);
       logEvent("Wi-Fi connected slot=%d ssid=%s ip=%s",(int)wifiActiveSlot,WiFi.SSID().c_str(),WiFi.localIP().toString().c_str());
-      if(mdnsReady){MDNS.end();mdnsReady=false;}
-      mdnsReady=MDNS.begin("foodmonitor");
-      if(mdnsReady){MDNS.addService("http","tcp",80);logEvent("mDNS updater address=http://foodmonitor.local/");}
-      else logEvent("mDNS unavailable; use IP address http://%s/",WiFi.localIP().toString().c_str());
+      // mDNS follows ESP-NETIF link events internally. Keep one responder for
+      // the process lifetime instead of recreating its UDP PCB during Wi-Fi
+      // slot failover while HTTPS work can be active on another task.
+      if(!mdnsReady) {
+        mdnsReady=MDNS.begin("foodmonitor");
+        if(mdnsReady)MDNS.addService("http","tcp",80);
+        else logEvent("mDNS unavailable; use IP address http://%s/",WiFi.localIP().toString().c_str());
+      }
+      if(mdnsReady)logEvent("mDNS updater address=http://foodmonitor.local/");
     }
     return; // Never scan or switch a healthy connection.
   }
   if(wifiWasConnected) {
-    wifiWasConnected=false;wifiTrying=false;wifiDisconnectPending=false;wifiTried=0;wifiNextSlot=wifi_recovery::preferredSlot();wifiRetryAt=now;
-    if(mdnsReady){MDNS.end();mdnsReady=false;}
-    logEvent("Wi-Fi link lost reason=%u; automatic recovery starts at preferred slot=0",(unsigned)wifiLastDisconnectReason);
+    wifiWasConnected=false;wifiTrying=false;wifiDisconnectPending=false;wifiTried=0;
+    wifiNextSlot=wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
+    wifiRetryAt=now+wifi_recovery::SLOT_SETTLE_MS;
+    logEvent("Wi-Fi link lost reason=%u; automatic recovery starts at preferred slot=%u",
+      (unsigned)disconnectReason,(unsigned)wifiNextSlot);
   }
-  if(wifiDisconnectEventPending) {
-    wifiDisconnectEventPending=false;
-    logEvent("Wi-Fi disconnect event reason=%u status=%d",(unsigned)wifiLastDisconnectReason,(int)WiFi.status());
+  if(disconnectEvent) {
+    logEvent("Wi-Fi disconnect event reason=%u status=%d",(unsigned)disconnectReason,(int)WiFi.status());
   }
   if(wifiManager.getConfigPortalActive())return; // Portal owns STA while configuring.
   if(wifiDisconnectPending) {
-    if(now-wifiDisconnectAt<500||WiFi.status()==WL_CONNECTED)return;
+    if(!wifi_recovery::disconnectComplete(disconnectEvent,(uint32_t)(now-wifiDisconnectAt)))return;
+    if(!disconnectEvent)logEvent("Wi-Fi disconnect event timeout; continuing failover after bounded fallback");
     wifiDisconnectPending=false;
+  }
+  if(disconnectEvent&&wifiTrying&&wifi_recovery::staleLocalLeave(wifiDisconnectPending,disconnectReason)) {
+    logEvent("Wi-Fi stale local-leave event ignored during slot=%u attempt",(unsigned)wifiNextSlot);
+  } else if(disconnectEvent&&wifiTrying) {
+    const uint8_t failedSlot=wifiNextSlot;
+    wifiTrying=false;++wifiTried;
+    wifiNextSlot=wifi_recovery::nextSlot(wifiNextSlot,wifiNetworkCount);
+    logEvent("Wi-Fi connect failed slot=%u reason=%u; next slot=%u",
+      (unsigned)failedSlot,(unsigned)disconnectReason,(unsigned)wifiNextSlot);
+    if(wifi_recovery::cycleComplete(wifiTried,wifiNetworkCount)){
+      wifiRetryAt=now+WIFI_RETRY_MS;wifiTried=0;
+      wifiNextSlot=wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
+      logEvent("Wi-Fi networks unavailable; retrying preferred slot=%u in %lu ms",
+        (unsigned)wifiNextSlot,(unsigned long)WIFI_RETRY_MS);
+    } else wifiRetryAt=now+wifi_recovery::SLOT_SETTLE_MS;
   }
   if(wifiTrying){
     if(now-wifiAttemptAt<WIFI_CONNECT_MS)return;
@@ -1096,11 +1189,12 @@ void serviceWifi(uint64_t now) {
     wifiNextSlot=wifi_recovery::nextSlot(wifiNextSlot,wifiNetworkCount);
     if(wifi_recovery::cycleComplete(wifiTried,wifiNetworkCount)){
       wifiRetryAt=now+WIFI_RETRY_MS;wifiTried=0;
-      wifiNextSlot=wifi_recovery::preferredSlot();
-      logEvent("Wi-Fi networks unavailable; retrying preferred slot in %lu ms",(unsigned long)WIFI_RETRY_MS);
+      wifiNextSlot=wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
+      logEvent("Wi-Fi networks unavailable; retrying preferred slot=%u in %lu ms",
+        (unsigned)wifiNextSlot,(unsigned long)WIFI_RETRY_MS);
       return;
     }
-    wifiRetryAt=now+500;
+    wifiRetryAt=now+wifi_recovery::SLOT_SETTLE_MS;
     return;
   }
   if(!wifiNetworkCount){
@@ -1715,7 +1809,7 @@ void networkTask(void*) {
 
       {
 
-        WiFiClientSecure postClient;
+        GatewaySecureClient postClient;
 
         postClient.setInsecure();
 
@@ -1924,7 +2018,7 @@ void networkTask(void*) {
 
         {
 
-          WiFiClientSecure getClient;
+          GatewaySecureClient getClient;
 
           getClient.setInsecure();
 
@@ -2112,7 +2206,9 @@ void setup() {
 
   pinMode(WIFI_RESET_PIN,INPUT_PULLUP);WiFi.mode(WIFI_STA);
   WiFi.onEvent([](WiFiEvent_t,WiFiEventInfo_t info){
+    portENTER_CRITICAL(&stateMux);
     wifiLastDisconnectReason=info.wifi_sta_disconnected.reason;wifiDisconnectEventPending=true;
+    portEXIT_CRITICAL(&stateMux);
   },ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
   initGatewayPixel();initGatewayLcd();
