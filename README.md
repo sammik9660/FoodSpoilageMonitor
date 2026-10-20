@@ -2,6 +2,17 @@
 
 BME688 기반 음식 상태 측정 프로젝트. 현재 작업 트리는 히터 OFF 환경 측정(기본 2초)과 HP-354 가스 스캔(기본 10분)을 분리한다. **컴파일·호스트 모의 테스트와 실제 하드웨어/클라우드 검증은 구분한다.** 장치/클라우드 확인 결과는 `PROJECT_STATE.md`에 기록한다.
 
+## 핵심 기능
+
+- nRF52840의 BME688 환경 측정, HP-354 10-step 가스 스캔, OLED와 VDDH 기반 배터리 추정
+- BLE NUS 20-byte framing과 ESP32-S3 gateway의 재연결·device pairing
+- CRC SPIFFS spool, 안정적인 sample UID, application ACK 이후 해제와 reboot replay
+- Google Apps Script/Sheets ingest, 장치별 실험 session, dashboard와 paginated CSV
+- 서명·anti-rollback을 적용한 ESP32 Wi-Fi OTA와 nRF52840 Legacy DFU relay
+- 다중 장치 식별·session/UI 분리와 HP-354 학습 데이터 준비 도구
+
+구현 범위와 검증 상태는 [기능 목록](docs/FEATURES.md), 전체 data/update 흐름은 [시스템 아키텍처](docs/ARCHITECTURE.md)에서 확인한다. 실제 부패 판정 AI는 아직 구현·검증되지 않았다.
+
 ESP32-S3 현재 빌드 설정은 **Flash Size 16MB / sketch custom OTA partition / OPI PSRAM / USB CDC On Boot Enabled / Hardware CDC and JTAG / Erase All Flash Disabled**다. custom table은 기존 SPIFFS `0x310000`/`0xE0000`과 NVS를 유지한다. 파티션 선택을 바꾸면 미전송 spool 접근성이 달라질 수 있으므로 그대로 유지한다.
 
 ```text
@@ -30,6 +41,8 @@ docs/ENVIRONMENT_AND_GAS.md       # 환경 측정/저빈도 스캔, schema 4 및
 docs/NRF52840_BLE_DFU.md           # 기존 Adafruit 부트로더를 이용한 application-only BLE DFU
 docs/BATTERY_ESTIMATION.md          # VDDH 기반 추정, 제한 보정, 저장 및 실기 검증
 docs/PSRAM_AND_TECH_DEBT.md         # ESP 내부 RAM/PSRAM 할당 근거와 남은 기술 부채
+docs/FEATURES.md                      # 현재 구현 기능, 사용법과 검증 상태
+docs/ARCHITECTURE.md                  # 시스템 구조, data/protocol/update 흐름
 firmware/nrf52840/bme688_node/src/Bosch-BME68x-Library/ # 스케치 내 Bosch 공식 드라이버 고정본
 data/                          # Git 제외 실험 데이터
 ```
@@ -48,6 +61,8 @@ data/                          # Git 제외 실험 데이터
 
 ## 먼저 읽을 문서
 
+- [docs/FEATURES.md](docs/FEATURES.md): 실제 구현 기능, 관련 source, 사용 방법과 검증 상태
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): sensor→BLE→gateway→cloud 구조, protocol과 OTA/DFU flow
 - [PROJECT_STATE.md](PROJECT_STATE.md): 사용자 검증 상태, 2026-09-28 실제 센서 장애, 현재 구현 및 남은 검증
 - [docs/GAS_SCAN_V3.md](docs/GAS_SCAN_V3.md): Bosch 근거, v3 프로토콜·스풀/Sheets 전환·수동 검증 순서
 - [docs/ENVIRONMENT_AND_GAS.md](docs/ENVIRONMENT_AND_GAS.md): 현재 환경/가스 모드, 실시간 표시·이력 분리, 남은 현장 검증
