@@ -313,7 +313,7 @@ int64_t lastCloudUpload=0;
 // the ACK. Keeping another full Sample[32] alive during the TLS handshake costs
 // about 3.8 KiB of the same contiguous internal heap used by mbedTLS.
 struct AckIdentity { char boot[32]; uint32_t rx; };
-struct UploadJob { AckIdentity acks[BATCH_SIZE]; uint32_t count; bool heartbeat; char* json; };
+struct UploadJob { AckIdentity acks[BATCH_SIZE]; uint32_t count; bool heartbeat; bool jsonInPsram; char* json; };
 
 struct UploadResult { bool ok; bool heartbeat; int http; uint32_t unassigned; char recording[16]; char session[64]; };
 uint64_t wifiConnectedAt=0, bleConnectedAt=0, firstFrameAt=0;
@@ -354,14 +354,36 @@ void logHttpsConnectDiagnostic(const char* phase,WiFiClientSecure& client) {
 }
 
 void logHttpsHeapDiagnostic(const char* phase) {
-  logEvent("HTTPS heap %s free=%lu largest=%lu min=%lu free8=%lu largest8=%lu min8=%lu",
+  logEvent("HTTPS heap %s internal=%lu largest=%lu min=%lu psram=%lu ps_largest=%lu ps_min=%lu",
     phase,
-    (unsigned long)ESP.getFreeHeap(),
-    (unsigned long)ESP.getMaxAllocHeap(),
-    (unsigned long)ESP.getMinFreeHeap(),
-    (unsigned long)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-    (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
-    (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+    (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+    (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+    (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
+    (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT),
+    (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT),
+    (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT));
+}
+
+char* serializeHttpJson(cJSON* root,bool& inPsram) {
+  inPsram=false;
+  char* internal=cJSON_PrintUnformatted(root);
+  if(!internal)return nullptr;
+  const size_t bytes=strlen(internal)+1;
+  if(ESP.getPsramSize()) {
+    char* external=(char*)heap_caps_malloc(bytes,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if(external) {
+      memcpy(external,internal,bytes);cJSON_free(internal);inPsram=true;return external;
+    }
+    static bool warned=false;
+    if(!warned){logEvent("WARN PSRAM request payload allocation failed bytes=%u; using internal RAM",(unsigned)bytes);warned=true;}
+  }
+  return internal;
+}
+
+void releaseHttpJson(char*& payload,bool inPsram) {
+  if(!payload)return;
+  if(inPsram)heap_caps_free(payload);else cJSON_free(payload);
+  payload=nullptr;
 }
 
 bool saveWifiNetwork(const String& ssid,const String& password) {
@@ -572,7 +594,7 @@ bool otaActivateIfDrained() {
   const bool ready=otaMode==OTA_PREPARE&&otaSafeState();
   if(ready){otaMode=OTA_ACTIVE;otaDeadlineAt=uptimeMs()+OTA_ACTIVE_TIMEOUT_MS;}
   xSemaphoreGive(otaIngressMutex);
-  if(ready)logEvent("OTA ACTIVE; BLE measurement gap begins; queued samples preserved");
+  if(ready){logEvent("OTA ACTIVE; BLE measurement gap begins; queued samples preserved");logHttpsHeapDiagnostic("OTA-ACTIVE");}
   return ready;
 }
 
@@ -963,7 +985,7 @@ bool syncOtaLease(const char* state) {
   portENTER_CRITICAL(&stateMux);memcpy(sensorId,connectedSensorId,sizeof(sensorId));portEXIT_CRITICAL(&stateMux);
   cJSON_AddStringToObject(root,"sensor_id",sensorId);cJSON_AddArrayToObject(root,"samples");
   cJSON* health=healthJson(0,0);cJSON_AddStringToObject(health,"ota_state",state);cJSON_AddItemToObject(root,"health",health);
-  char* payload=cJSON_PrintUnformatted(root);cJSON_Delete(root);if(!payload)return false;
+  bool payloadInPsram=false;char* payload=serializeHttpJson(root,payloadInPsram);cJSON_Delete(root);if(!payload)return false;
   String redirect,response;int postCode=0;
   {
     GatewaySecureClient client;client.setInsecure();HTTPClient post;
@@ -976,7 +998,7 @@ bool syncOtaLease(const char* state) {
     }
     client.stop();
   }
-  cJSON_free(payload);
+  releaseHttpJson(payload,payloadInPsram);
   if(redirect.length()) {
     delay(100);GatewaySecureClient client;client.setInsecure();HTTPClient get;
     get.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);get.setConnectTimeout(10000);get.setTimeout(15000);get.setReuse(false);
@@ -1857,7 +1879,7 @@ void networkTask(void*) {
 
           if(!firstPostAt)firstPostAt=uptimeMs();
           lastPostAt=uptimeMs();
-          logEvent("HTTP POST begin kind=%s uptime=%llu ms bytes=%u",job->heartbeat?"health":"data",(unsigned long long)lastPostAt,(unsigned)strlen(job->json));
+          logEvent("HTTP POST begin kind=%s uptime=%llu ms bytes=%u payload_mem=%s",job->heartbeat?"health":"data",(unsigned long long)lastPostAt,(unsigned)strlen(job->json),job->jsonInPsram?"psram":"internal");
           postCode =
 
             post.POST(
@@ -1993,7 +2015,7 @@ void networkTask(void*) {
       // POST has consumed the request body. Do not keep this comparatively
       // large allocation alive while the redirect GET creates a second TLS
       // context. A retry rebuilds the same JSON from the preserved batch.
-      if(job->json){cJSON_free(job->json);job->json=nullptr;}
+      releaseHttpJson(job->json,job->jsonInPsram);
       logHttpsHeapDiagnostic("POST-body-free");
 
 
@@ -2185,7 +2207,7 @@ void networkTask(void*) {
 
 
 
-    if(job->json)cJSON_free(job->json);
+    releaseHttpJson(job->json,job->jsonInPsram);
 
     delete job;
 
@@ -2240,8 +2262,10 @@ void setup() {
   loadSensorPairing();
 
   logEvent("BOOT gas-scan-v3 gateway=%s device=%s uptime=%llu ms",gatewayBoot,deviceId,(unsigned long long)uptimeMs());
-  logEvent("FIRMWARE build=%s compiled=%s %s flash_chip=%lu psram=%lu",FIRMWARE_VERSION,
-    __DATE__,__TIME__,(unsigned long)ESP.getFlashChipSize(),(unsigned long)ESP.getPsramSize());
+  logEvent("FIRMWARE build=%s compiled=%s %s flash_chip=%lu psram=%lu psram_free=%lu",FIRMWARE_VERSION,
+    __DATE__,__TIME__,(unsigned long)ESP.getFlashChipSize(),(unsigned long)ESP.getPsramSize(),
+    (unsigned long)ESP.getFreePsram());
+  logHttpsHeapDiagnostic("BOOT");
   loadOtaSettings();
   const esp_partition_t* running=esp_ota_get_running_partition();
   esp_ota_img_states_t otaState=ESP_OTA_IMG_UNDEFINED;
@@ -2445,6 +2469,7 @@ void loop() {
       snprintf(nrfDfuLastResult,sizeof(nrfDfuLastResult),"Starting transfer to paired sensor");
       xSemaphoreGive(otaIngressMutex);
       logEvent("nRF DFU PREPARE complete; existing data preserved and drained");
+      logHttpsHeapDiagnostic("NRF-DFU-ACTIVE");
     }
   } else if(nrfDfuMode==NRF_DFU_RECONNECT&&now>nrfDfuDeadlineAt) {
     logEvent("nRF DFU reconnect timeout; update result unconfirmed, normal collection resumed");
@@ -2486,7 +2511,7 @@ void loop() {
       due=now+UPLOAD_INTERVAL_MS;
       logEvent("ERROR pending upload data could not form a non-empty batch");
     } else {
-      UploadJob* job=new UploadJob();job->count=activeCount;job->heartbeat=false;
+      UploadJob* job=new UploadJob();job->count=activeCount;job->heartbeat=false;job->jsonInPsram=false;job->json=nullptr;
       for(uint32_t i=0;i<activeCount;++i){memcpy(job->acks[i].boot,active[i].boot,32);job->acks[i].rx=active[i].rx;}
 
       cJSON* root=cJSON_CreateObject();addNumber(root,"version",3);
@@ -2496,11 +2521,11 @@ void loop() {
 
       for(uint32_t i=0;i<activeCount;++i)cJSON_AddItemToArray(arr,sampleJson(active[i]));
 
-      cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=cJSON_PrintUnformatted(root);cJSON_Delete(root);
+      cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=serializeHttpJson(root,job->jsonInPsram);cJSON_Delete(root);
 
       if(job->json&&xQueueSend(jobsQueue,&job,0)==pdTRUE){busy=true;activeJobHeartbeat=false;logEvent("Batch upload start n=%lu spool=%lu uptime=%llu ms",(unsigned long)activeCount,(unsigned long)spool.count,(unsigned long long)now);}
 
-      else {if(job->json)cJSON_free(job->json);delete job;due=now+UPLOAD_INTERVAL_MS;logEvent("ERROR upload allocation/queue failed");}
+      else {releaseHttpJson(job->json,job->jsonInPsram);delete job;due=now+UPLOAD_INTERVAL_MS;logEvent("ERROR upload allocation/queue failed");}
     }
 
   }
@@ -2510,12 +2535,12 @@ void loop() {
   if(shouldStartHealthHeartbeat(busy||failed,updateActive,
        otaMaintenanceNetworkBusy||otaLeaseReleasePending,wifiState==WL_CONNECTED,
        now,healthHeartbeatDue,activeCount,stagedCount,spool.count,heartbeatQueued)) {
-    UploadJob* job=new UploadJob();job->count=0;job->heartbeat=true;
+    UploadJob* job=new UploadJob();job->count=0;job->heartbeat=true;job->jsonInPsram=false;job->json=nullptr;
     cJSON* root=cJSON_CreateObject();addNumber(root,"version",3);
     char sensorIdSnapshot[17];portENTER_CRITICAL(&stateMux);memcpy(sensorIdSnapshot,connectedSensorId,sizeof(sensorIdSnapshot));portEXIT_CRITICAL(&stateMux);
     cJSON_AddStringToObject(root,"device_id",deviceId);cJSON_AddStringToObject(root,"sensor_id",sensorIdSnapshot);
     cJSON_AddArrayToObject(root,"samples");
-    cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=cJSON_PrintUnformatted(root);cJSON_Delete(root);
+    cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=serializeHttpJson(root,job->jsonInPsram);cJSON_Delete(root);
     if(job->json&&xQueueSend(jobsQueue,&job,0)==pdTRUE) {
       busy=true;activeJobHeartbeat=true;
       const uint64_t interval=lastHealthHeartbeatStart?now-lastHealthHeartbeatStart:0;
@@ -2525,7 +2550,7 @@ void loop() {
         (unsigned long long)interval,(unsigned long)HEALTH_HEARTBEAT_INTERVAL_MS,
         (unsigned long long)now);
     } else {
-      if(job->json)cJSON_free(job->json);delete job;
+      releaseHttpJson(job->json,job->jsonInPsram);delete job;
       healthHeartbeatDue=now+HEALTH_HEARTBEAT_INTERVAL_MS;
       logEvent("ERROR health heartbeat allocation/queue failed; retry in %lu ms",
         (unsigned long)HEALTH_HEARTBEAT_INTERVAL_MS);

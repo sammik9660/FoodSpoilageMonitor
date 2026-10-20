@@ -10,6 +10,14 @@
 - MSVC battery/sensor/integrity/UI/spool/Wi-Fi/Legacy DFU host test, mock Sheets 36개, fingerprint/OTA partition/DFU web/access/upload tests와 `git diff --check`가 통과했다. Adafruit nRF52 core 1.7.0 Feather 빌드는 최종 소스보다 새 ELF/HEX를 생성해 성공했다(직전 요약: Flash 166,560 bytes, RAM 16,704 bytes; 마지막 작은 상태필드 변경 뒤 size tool 자체는 Windows DLL relocation으로 실행 불가). ESP compile은 같은 Codex 환경의 Windows tool process가 최종 ELF/BIN과 오류 출력을 남기지 못해 완료로 판정하지 않았다. 실제 OLED/BLE/cloud/persistence 동작은 아직 검증 전이다.
 - 잔여 기능 점검: NeoPixel은 BOOT/UPDATE blue, BLE red, Wi-Fi purple, cloud/backlog wait yellow, healthy green으로 이미 구현되어 있으며 부패 판정이 아니다. HP-354 complete fingerprint 추출기는 있으나 검증된 부패 모델/학습 데이터셋은 없다. session label은 ground truth가 아니므로 UI에 안전 판정을 추가하지 않았다. 다중 장치 cloud/UI, signed ESP OTA와 Legacy nRF DFU 경로는 기존 구현을 유지했고 두 번째 실제 장치 동시 운용은 미검증이다.
 
+## 2026-10-21 ESP32 PSRAM/technical-debt audit (소스 검증)
+
+- 저장된 Arduino build options와 core 3.3.12 `boards.txt`에서 16 MB flash, OPI PSRAM 설정을 확인했다. sketch-local partition table은 NVS, otadata, app0/app1 각 3 MiB, 기존 SPIFFS `0x310000`/`0xE0000`을 유지한다. 부팅 로그는 total/free PSRAM 및 internal/PSRAM free/largest/minimum을 분리해 출력하도록 보강했다. 실제 N16R8의 8 MiB 초기화와 동시 Wi-Fi/BLE/TLS 수치는 새 펌웨어 실기 전까지 미검증이다.
+- TLS handshake 동안 유지되던 직렬화 request JSON(최대 약 13 KiB)을 exact-size PSRAM으로 옮기고 원래 internal cJSON buffer를 네트워크 job 시작 전에 해제한다. PSRAM이 없거나 할당이 실패하면 기존 internal buffer를 그대로 쓰며 경고는 한 번만 남긴다. POST 로그는 payload bytes와 `payload_mem`을 표시한다. OTA cloud lease도 같은 helper를 사용한다. FreeRTOS/sample queue, task stack, TLS/BLE 객체, 작은 OTA/DFU buffers는 내부 메모리 요구와 위험 때문에 이동하지 않았다. DFU image는 기존처럼 SPIFFS에서 20-byte 단위로 stream한다.
+- 과거 lwIP assert의 확인된 stack은 core DNS cache 경로였고 현재 HTTPS client는 `lwip_getaddrinfo()`를 사용한다. mDNS 1회 초기화, event callback의 상태 기록만 수행하는 구조도 유지한다. Brownout detector는 건드리지 않았고 전원 문제는 실측이 필요하다. TLS `setInsecure()`와 공개 Apps Script 접근 통제는 남은 prototype 보안 부채다. data ACK/UID/spool/session/CSV pagination/HP-354 fingerprint 경로에서 새 결함은 확인하지 않았으며 형식은 변경하지 않았다.
+- 현 소스의 HP-354 interval은 600,000 ms이나 작업 지침에는 2분으로 기록되어 있어 불일치가 남아 있다. 정상 동작 중인 센서 cadence를 이번 audit에서 임의 변경하지 않았다. 의도한 기준을 다음 센서 release 전에 확정해야 한다.
+- 검증은 mock cloud 36개, fingerprint 5개, OTA partition, DFU web/upload/access 정적 검사, MSVC battery/integrity/실제 nRF source/spool/gateway UI/Wi-Fi/Legacy DFU/package policy와 `git diff --check`가 통과했다. ESP build는 sandbox에서 기존 Windows `Illegal System DLL Relocation`이 재현됐고, 동일 설정의 외부 CLI도 5분 이상 출력·새 산출물 없이 정체되어 중단했다. 따라서 현재 PSRAM 변경의 ESP compile과 실제 internal/PSRAM 전후 수치는 미검증이며 기존 2026-10-20 BIN/ELF를 현재 결과로 사용하지 않는다.
+
 ## 2026-10-21 V1940 battery voltage integration (소스/빌드 검증)
 
 - 사용자 실기에서 LiPo 단독 VDDH/5 환산 4.09--4.10 V와 B+/B- 멀티미터 4.09 V가 일치했고 P0.04는 배터리 탈착에 반응하지 않았다. USB 연결 시 VDDH가 실제 배터리와 달라지는 것도 확인했다. 생산 nRF 2.0.7은 P0.04를 사용하지 않고 60초마다 VDDH/5를 읽으며, SoftDevice `sd_power_usbregstatus_get()`의 VBUS 감지 시 값을 배터리로 인정하지 않는다. OLED 정상 ENV 화면은 `BAT 4.09V`, USB 상태는 `BAT USB`, 무효 상태는 `BAT --.--V`로 표시한다. 잔량 %, 용량 및 충전 완료 판정은 추가하지 않았다.

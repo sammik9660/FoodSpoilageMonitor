@@ -31,6 +31,14 @@ class GatewayUpdateAccessTest(unittest.TestCase):
     def test_default_console_is_not_mirrored(self):
         self.assertIn("constexpr bool UART_DIAGNOSTICS=false", SOURCE)
 
+    def test_http_payload_uses_psram_with_internal_fallback(self):
+        serializer = SOURCE[SOURCE.index("char* serializeHttpJson"):
+                            SOURCE.index("void releaseHttpJson")]
+        self.assertIn("MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT", serializer)
+        self.assertIn("return internal", serializer)
+        self.assertIn("payload_mem=%s", SOURCE)
+        self.assertIn("MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

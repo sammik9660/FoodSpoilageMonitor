@@ -29,6 +29,7 @@ docs/GAS_SCAN_V3.md              # Bosch 근거, v3 프로토콜/마이그레이
 docs/ENVIRONMENT_AND_GAS.md       # 환경 측정/저빈도 스캔, schema 4 및 남은 현장 검증
 docs/NRF52840_BLE_DFU.md           # 기존 Adafruit 부트로더를 이용한 application-only BLE DFU
 docs/BATTERY_ESTIMATION.md          # VDDH 기반 추정, 제한 보정, 저장 및 실기 검증
+docs/PSRAM_AND_TECH_DEBT.md         # ESP 내부 RAM/PSRAM 할당 근거와 남은 기술 부채
 firmware/nrf52840/bme688_node/src/Bosch-BME68x-Library/ # 스케치 내 Bosch 공식 드라이버 고정본
 data/                          # Git 제외 실험 데이터
 ```
@@ -52,6 +53,7 @@ data/                          # Git 제외 실험 데이터
 - [docs/ENVIRONMENT_AND_GAS.md](docs/ENVIRONMENT_AND_GAS.md): 현재 환경/가스 모드, 실시간 표시·이력 분리, 남은 현장 검증
 - [docs/NRF52840_BLE_DFU.md](docs/NRF52840_BLE_DFU.md): nRF application-only BLE DFU 패키지, 스마트폰 절차와 복구 한계
 - [docs/BATTERY_ESTIMATION.md](docs/BATTERY_ESTIMATION.md): 배터리 추정의 근거·제한, 학습 상태, 저장 정책과 실기 절차
+- [docs/PSRAM_AND_TECH_DEBT.md](docs/PSRAM_AND_TECH_DEBT.md): PSRAM 할당 범위, 메모리 진단과 남은 통신·보안 검증
 - [docs/RELIABILITY.md](docs/RELIABILITY.md): reliability v2 설계와 당시 검증 기록
 - [AGENTS.md](AGENTS.md): hardware mapping과 Data Integrity Invariants
 - [BASELINE_CODE_REVIEW_2026-09-25.md](BASELINE_CODE_REVIEW_2026-09-25.md): 수정하지 않는 과거 baseline 리뷰
