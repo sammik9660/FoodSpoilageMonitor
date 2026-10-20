@@ -2,6 +2,12 @@
 
 갱신일: 2026-10-19. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-20 live environment health heartbeat (소스/호스트 검증)
+
+- 2026-10-19의 빈 데이터 POST 제거 뒤 실제 queue/spool 데이터가 없으면 Apps Script `LIVE_V2` 캐시도 5분 schema 4 이력까지 갱신되지 않는 회귀를 확인했다. 2초 ENV RAM 최신값과 5분 `EnvironmentHistory` 저장은 유지하고, idle 상태에서만 `samples:[]` health heartbeat를 5초 간격으로 보내도록 복원했다. 기존 데이터 POST 성공은 다음 heartbeat를 5초 뒤로 미루며, 데이터 backlog/HTTP busy/OTA·nRF DFU/유지관리 HTTPS 중에는 heartbeat를 시작하지 않는다.
+- heartbeat 성공 주기는 ACK 완료가 아니라 요청 시작 시각을 기준으로 한다. 단일 `busy` job으로 중복 연결을 막고, 실패만 완료 후 5초 뒤 재시도한다. 시작 간격과 ACK 간격·전체 작업 시간을 별도 로그로 남긴다. Apps Script dashboard polling도 5초로 맞췄고 STALE 상태에서도 T/H/P 숫자 위치는 유지하되 상태·측정 경과시간 경고는 그대로 둔다. 실제 ESP32 HTTPS 주기·장기 TLS 안정성은 사용자 실기 전까지 미검증이다.
+- Apps Script의 일반 `IDLE + samples:[]` heartbeat는 최초 또는 cache miss 때만 짧게 script lock을 얻어 장치·recording 상태를 확인하고, 그 사이에는 10분 TTL을 요청한 검증 cache로 `LIVE_V2`만 갱신한다. CacheService가 TTL 전에 항목을 제거하면 안전한 짧은 재동기화를 수행한다. 실제 sample, UID journal/ACK, Start/Stop 및 OTA `UPDATING`/`VERIFYING`과 `IDLE` 해제는 기존 전역 잠금 경로를 유지한다. 대시보드 recording cache miss가 잠금과 겹치면 추측값 대신 `UNKNOWN`을 반환하고 조작 버튼을 잠근다. 장치 목록도 cache하며 새 장치/세션에서 무효화한다. 호스트의 heartbeat/data/OTA/Start·Stop/cache miss/lock 경합 및 age 보정 테스트는 통과했으나 실제 Apps Script 동시 실행·quota는 배포 전까지 미검증이다.
+
 ## 2026-10-20 Wi-Fi event-driven recovery (소스/호스트 검증)
 
 - 연결 시도 중 STA disconnect 이벤트가 오면 슬롯 전체 timeout을 기다리지 않고 즉시 실패로 처리한다. 명시적 연결 취소는 실제 disconnect 이벤트를 기다리며, 이벤트가 누락된 경우에만 2초 제한 fallback을 사용한다. 다음 `WiFi.begin()` 전에는 이벤트 이후 250ms settle을 둬 연결 설정 충돌을 피한다.
@@ -262,3 +268,9 @@
 - 실제 flash filesystem capacity/쓰기 지연, 재부팅·전원차단, RAM overflow, BLE reconnect, NTP/session 경계, CSV 다운로드는 현장 검증 필요.
 - 보드 전력과 heater 안정 상태, 정확한 실패 원인은 미검증이다. BSEC/AI-Studio raw acquisition은 이번 범위가 아니다.
 - 기존 baseline commit 90e5cc78ead2af1474672beb6b20956ad87cc9b7 및 historical review는 재작성하지 않는다.
+# 2026-10-20 OTA/DFU 접근성과 상태 표시
+
+- 5초 health-only HTTPS 요청은 OTA/DFU의 동시 네트워크 작업 방지에는 계속 포함하지만, 정상 진행 중에는 NeoPixel을 WAIT(노랑)로 바꾸지 않도록 데이터 HTTP 작업과 구분했다. heartbeat 실패, 실제 데이터 업로드/실패, RAM·SPIFFS backlog는 기존처럼 WAIT 상태이며, OTA/DFU 유지관리 중에는 의도적인 BLE 중단을 장애로 보이지 않게 파랑으로 표시한다.
+- OTA와 nRF DFU 시작은 상호 배타적으로 검사한다. 요청이 PREPARE에 들어가면 새 heartbeat가 시작되지 않으며, 진행 중 요청과 기존 큐/spool의 정상 완료를 기다린다. spool 삭제나 안전 조건 완화는 없다.
+- 장치별 클라우드 카드에 현재 heartbeat가 보고한 로컬 IP를 사용한 ESP32 OTA(`/`)와 nRF DFU(`/nrf-dfu`) 링크를 각각 추가했다. 두 로컬 페이지도 서로 연결한다. 인터넷에서 로컬 주소로 직접 업데이트하는 기능은 추가하지 않았다.
+- Hardware CDC/JTAG를 기본 진단 콘솔로 유지하고 UART0 복제 출력을 기본 비활성화해 동일 로그의 이중 출력을 제거했다. 클라우드 mock 35개와 업데이트/DFU 정적 테스트는 통과했으며, ESP32 컴파일과 실제 LED·웹 업데이트 흐름은 아직 실기 미검증이다.

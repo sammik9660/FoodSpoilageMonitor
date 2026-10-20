@@ -4,7 +4,8 @@ const vm=require('node:vm');
 const path=require('node:path');
 let tests=0;
 function environment(){
- let time=Date.parse('2026-09-28T12:00:00Z'),uuid=0,fail=null,locked=false;
+ let time=Date.parse('2026-09-28T12:00:00Z'),uuid=0,fail=null,locked=false,forceLockBusy=false,lockAdvance=0;
+ let waitLockCalls=0,tryLockCalls=0;
  const cache=new Map();
  class Sheet {
   constructor(name){this.name=name;this.rows=[];this.maxRows=1000;}
@@ -27,18 +28,21 @@ function environment(){
  class Clock extends Date{constructor(...args){super(...(args.length?args:[time]));}static now(){return time;}}
  const props=new Map([['SPREADSHEET_ID','existing-id']]);
  const api={Date:Clock,console,JSON,Number,String,Math,Array,Object,Error,
-  LockService:{getScriptLock:()=>({waitLock(){assert(!locked);locked=true;},releaseLock(){locked=false;}})},
+  LockService:{getScriptLock:()=>({waitLock(){waitLockCalls++;if(forceLockBusy||locked)throw Error('잠금 시간초과');locked=true;time+=lockAdvance;},
+    tryLock(){tryLockCalls++;if(forceLockBusy||locked)return false;locked=true;time+=lockAdvance;return true;},releaseLock(){locked=false;}})},
   PropertiesService:{getScriptProperties:()=>({getProperty:k=>props.get(k)})},
   SpreadsheetApp:{openById:id=>{assert.equal(id,'existing-id');return book;},flush(){}},
   Utilities:{getUuid:()=>String(++uuid).padStart(32,'0')},
-  CacheService:{getScriptCache:()=>({get:k=>cache.get(k),put:(k,v)=>cache.set(k,v)})},
+  CacheService:{getScriptCache:()=>({get:k=>cache.get(k),put:(k,v)=>cache.set(k,v),remove:k=>cache.delete(k)})},
   ContentService:{MimeType:{JSON:'json',CSV:'csv'},createTextOutput:text=>({text,filename:null,setMimeType(){return this;},downloadAsFile(name){this.filename=name;return this;}})},
   ScriptApp:{getService:()=>({getUrl:()=> 'https://example.invalid/exec'})},
   HtmlService:{createTemplateFromFile:name=>({evaluate(){return {setTitle(){return {name,url:this.webAppUrl};}};}})}
  };
  vm.createContext(api);vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Code.gs'),'utf8'),api);
  api.setupReliability();
- return {api,all,sensor,props,setTime:t=>time=t,now:()=>time,setFail:f=>fail=f};
+ return {api,all,sensor,props,cache,setTime:t=>time=t,now:()=>time,setFail:f=>fail=f,
+  setLockBusy:v=>forceLockBusy=v,setLockAdvance:v=>lockAdvance=v,
+  lockCounts:()=>({wait:waitLockCalls,try:tryLockCalls})};
 }
 const boot='a'.repeat(32);
 function sample(seq,time,extra={}){return {uid:boot+'-'+seq,seq,ms:seq*2000,nrf_boot:42,captured_at:time,quality:'ntp',t:25,h:50,p:1000,g:70,...extra};}
@@ -146,7 +150,7 @@ test('journal refuses to overwrite conflicting external row',()=>{
 });
 test('one active session, STOP idempotent, no auto recreate',()=>{
  const e=environment();e.api.startRecording('A');assert.throws(()=>e.api.startRecording('B'));e.api.stopRecording();e.api.stopRecording();
- e.props.delete('SPREADSHEET_ID');assert.throws(()=>send(e,[]),/missing/);assert.equal(e.sensor.getLastRow(),2);
+ e.props.delete('SPREADSHEET_ID');assert.equal(send(e,[]).stored,0);assert.throws(()=>send(e,[sample(1,e.now())]),/missing/);assert.equal(e.sensor.getLastRow(),2);
 });
 test('OTA lease and recording start are mutually exclusive per device',()=>{
  const e=environment(),a='111111111111',b='222222222222';
@@ -179,12 +183,16 @@ test('large CSV requires explicit pages and never silently truncates',()=>{
 });
 test('dashboard defines device-scoped panels, polling, controls and paged CSV links',()=>{
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
+ const code=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Code.gs'),'utf8');
+ assert(code.includes('const DASHBOARD_REFRESH_MS = 5000;'));
  assert(html.includes('getDashboardDevices()'));assert(html.includes('getDashboard(id)'));
  assert(html.includes('startRecording(el(id,\'label\').value,id)'));assert(html.includes('stopRecording(id)'));
- assert(html.includes('h.ota_state===\'UPDATING\''));assert(html.includes('Open local signed updater'));
+ assert(html.includes('h.ota_state===\'UPDATING\''));
+ assert(html.includes('ESP32 OTA — gateway firmware'));assert(html.includes('nRF52840 DFU — sensor firmware'));
+ assert(html.includes("espOtaLink.href=local+'/'"));assert(html.includes("nrfDfuLink.href=local+'/nrf-dfu'"));
  assert(html.includes("device='+encodeURIComponent(id)"));assert(html.includes("session='+encodeURIComponent(session)"));
  assert(html.includes('section.device'));assert(html.includes('panels=new Map()'));
- const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','8000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','5000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
  assert.doesNotThrow(()=>new Function(script));
 });
 test('dashboard renders two virtual devices and scopes control, errors, and CSV links',()=>{
@@ -198,10 +206,18 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
   getDashboardDevices(){success(e.api.getDashboardDevices());},getDashboard(id){if(id===b&&offlineB){failure(Error('unit B offline'));return;}success(e.api.getDashboard(id));},
   startRecording(label,id){try{success(e.api.startRecording(label,id));}catch(err){failure(err);}},stopRecording(id){try{success(e.api.stopRecording(id));}catch(err){failure(err);}}};
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
- const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','8000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','5000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
  const ctx={document:{getElementById:element},google:{script:{run:runner}},setInterval(){},setTimeout(){},Number,String,JSON,encodeURIComponent,Map,Date};
  vm.createContext(ctx);vm.runInContext(script,ctx);
  assert(element('panel-'+a)&&element('panel-'+b));
+ ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5}},
+  recording:{state:'STOPPED',session_id:null,download_session_id:null}});
+ assert.equal(element('state-'+a).textContent,'STALE');
+ assert.equal(element('values-'+a).textContent,'24.50 °C · 47.25 % · 1002.50 hPa');
+ assert.equal(element('age-'+a).textContent,'Last environment sample: 20.0 s ago');
+ ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5}},
+  recording:{state:'UNKNOWN',session_id:null,download_session_id:null}});
+ assert.equal(element('start-'+a).disabled,true);assert.equal(element('stop-'+a).disabled,true);
  ctx.control(a,true);assert.equal(e.api.getDashboard(a).recording.state,'RECORDING');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
  assert(element('all-'+a).href.includes('device='+a));assert(element('all-'+b).href.includes('device='+b));
  offlineB=true;ctx.poll();assert.equal(element('state-'+a).textContent,e.api.getDashboard(a).state);assert.equal(element('state-'+b).textContent,'CLOUD/UPLOAD ERROR (dashboard request)');
@@ -209,7 +225,7 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
 });
 test('device loading displays empty, failure, malformed response, and delayed lookup states',()=>{
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
- const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','8000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','5000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
  function run(mode){
   const loading={textContent:'Loading devices…',className:''},devices={insertAdjacentHTML(){}},element=id=>id==='loading'?loading:devices;
   let timer,success,failure;
@@ -264,8 +280,68 @@ test('dashboard labels scan and cooling as paused with aged ambient telemetry',(
   sensor_mode:'COOL',environment:{t:25,h:50,p:1000,age_ms:11000}}});
  assert.equal(e.api.getDashboard().state,'COOLING / ENVIRONMENT PAUSED');
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
- assert(html.includes('Last measured (not current): '));assert(html.includes("el(id,'measurement')"));
+ assert(!html.includes('Last measured (not current): '));assert(html.includes("el(id,'measurement')"));
+ assert(html.includes('`${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa`'));
  assert(html.includes("GAS:'HP-354 gas scan'"));assert(!html.includes('v.g.toFixed'));
+});
+test('health-only heartbeat refreshes live environment without storing history',()=>{
+ const e=environment(),history=e.all.get('EnvironmentHistory'),rows=history.getLastRow();
+ const response=e.api.ingest({version:3,device_id:'111111111111',sensor_id:'a1b2c3d4e5f60708',samples:[],
+  health:{ble_connected:true,sensor_ok:true,sensor_mode:'ENV',environment_ok:true,
+   environment:{t:26.5,h:48.25,p:1003.75,age_ms:900}}});
+ assert.equal(response.stored,0);assert.deepEqual(Array.from(response.acks),[]);
+ assert.equal(history.getLastRow(),rows);
+ const dashboard=e.api.getDashboard('111111111111');
+ assert.equal(dashboard.health.environment.t,26.5);assert.equal(dashboard.age,900);
+});
+test('routine heartbeats become lock-free while data and OTA state changes stay serialized',()=>{
+ const e=environment(),a='111111111111',heartbeat={version:3,device_id:a,sensor_id:'a1b2c3d4e5f60708',samples:[],
+  health:{ota_state:'IDLE',sensor_mode:'ENV',environment:{t:24,h:45,p:1001,age_ms:200}}};
+ const first=e.api.ingest(heartbeat),afterFirst=e.lockCounts();assert.equal(first.recording.state,'STOPPED');assert(afterFirst.try>0);
+ const deviceRows=e.all.get('DeviceRegistry').getLastRow();e.setLockBusy(true);e.setTime(e.now()+5000);
+ const second=e.api.ingest({...heartbeat,health:{...heartbeat.health,environment:{t:25,h:46,p:1002,age_ms:300}}});
+ assert.equal(second.success,true);assert.equal(second.recording.state,'STOPPED');assert.deepEqual(e.lockCounts(),afterFirst);
+ assert.equal(e.all.get('DeviceRegistry').getLastRow(),deviceRows);
+ const pending=sample(1,e.now());delete pending.g;pending.sample_schema=4;
+ assert.throws(()=>e.api.ingest({version:3,device_id:a,samples:[pending]}),/잠금 시간초과/);
+ e.cache.delete('HEARTBEAT_STATE_V1:'+a);
+ assert.throws(()=>e.api.ingest(heartbeat),/Cloud state busy/);
+ e.setLockBusy(false);e.api.startRecording('concurrent session',a);e.setLockBusy(true);
+ assert.equal(e.api.ingest(heartbeat).recording.state,'RECORDING');
+ e.setLockBusy(false);e.api.stopRecording(a);assert.equal(e.api.ingest(heartbeat).recording.state,'STOPPED');
+ e.setLockBusy(true);
+ assert.throws(()=>e.api.ingest({...heartbeat,health:{...heartbeat.health,ota_state:'UPDATING'}}),/잠금 시간초과/);
+ e.setLockBusy(false);e.api.ingest({...heartbeat,health:{...heartbeat.health,ota_state:'UPDATING'}});
+ e.setLockBusy(true);
+ assert.throws(()=>e.api.ingest(heartbeat),/Cloud state busy/);
+ e.setLockBusy(false);assert.equal(e.api.ingest(heartbeat).recording.state,'STOPPED');
+});
+test('dashboard uses cached devices and reports UNKNOWN recording on a contended cache miss',()=>{
+ const e=environment(),a='111111111111',heartbeat={version:3,device_id:a,samples:[],
+  health:{sensor_mode:'ENV',environment:{t:23,h:44,p:1000,age_ms:100}}};
+ e.api.ingest(heartbeat);const devices=e.api.getDashboardDevices();assert.equal(devices[0].device_id,a);
+ e.cache.delete('RECORDING_V1:'+a);e.setLockBusy(true);
+ const dashboard=e.api.getDashboard(a);assert.equal(dashboard.recording.state,'UNKNOWN');assert.equal(dashboard.health.environment.t,23);
+ assert.equal(e.api.getDashboardDevices()[0].device_id,a);
+ e.cache.delete('DEVICE_LIST_V1');assert.throws(()=>e.api.getDashboardDevices(),/temporarily busy/);
+});
+test('lock processing time advances server_seen_at and sample ages without creating history',()=>{
+ const e=environment(),a='111111111111',history=e.all.get('EnvironmentHistory'),rows=history.getLastRow();
+ e.setLockAdvance(5000);const arrival=e.now();
+ e.api.ingest({version:3,device_id:a,samples:[],health:{ota_state:'IDLE',sensor_mode:'ENV',last_valid_age_ms:2000,
+  environment:{t:22,h:43,p:999,age_ms:1000}}});
+ const dashboard=e.api.getDashboard(a);
+ assert.equal(dashboard.health.server_seen_at,arrival+5000);assert.equal(dashboard.health.environment.age_ms,6000);
+ assert.equal(dashboard.health.last_valid_age_ms,7000);assert.equal(dashboard.age,6000);assert.equal(history.getLastRow(),rows);
+});
+test('a delayed older request cannot replace a newer heartbeat environment sample',()=>{
+ const e=environment(),a='111111111111',newer={version:3,device_id:a,samples:[],
+  health:{sensor_mode:'ENV',environment:{t:26,h:48,p:1004,age_ms:100}}};
+ e.api.ingest(newer);const oldArrival=e.now()-5000;
+ e.api.cacheHealth({version:3,health:{sensor_mode:'ENV',environment:{t:20,h:40,p:998,age_ms:100}}},
+  {sensorId:''},[],a,oldArrival);
+ const dashboard=e.api.getDashboard(a);
+ assert.equal(dashboard.health.environment.t,26);assert.equal(dashboard.age,100);
 });
 test('two virtual gateways keep recording, live cache, registry, and CSV isolated',()=>{
  const e=environment(),a='111111111111',b='222222222222',t=e.now(),bootA='a'.repeat(32),bootB='b'.repeat(32);

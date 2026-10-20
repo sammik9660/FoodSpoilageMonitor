@@ -23,7 +23,15 @@ int main() {
   assert(strstr(a,"C:WAIT"));assert(strstr(b,"Q999k SP999k R1"));
   formatDebug(false,false,CLOUD_OFF,0xffffffffu,0xffffffffu,false,false,a,b);linesAreFixed(a,b);
 
+  assert(cloudState(false,false,false,false,false)==CLOUD_OFF);
+  assert(cloudState(true,false,false,false,true)==CLOUD_OK);
+  assert(cloudState(true,true,false,false,true)==CLOUD_WAIT);
+  assert(cloudState(true,false,true,false,true)==CLOUD_WAIT);
+  assert(cloudState(true,false,false,true,true)==CLOUD_WAIT);
+  assert(cloudState(true,false,false,false,false)==CLOUD_WAIT);
+
   assert(pixelState(false,false,CLOUD_WAIT,true)==PIXEL_BLE_OFF);
+  assert(pixelState(false,false,CLOUD_WAIT,true,true)==PIXEL_UPDATE);
   assert(pixelState(true,false,CLOUD_WAIT,true)==PIXEL_WIFI_OFF);
   assert(pixelState(true,true,CLOUD_WAIT,false)==PIXEL_WAIT);
   assert(pixelState(true,true,CLOUD_OK,true)==PIXEL_WAIT);
@@ -39,6 +47,13 @@ int main() {
   assert(!shouldStartDataUpload(false,true,false,5000,5000,0,0,0,1));
   assert(!shouldStartDataUpload(false,false,true,5000,5000,0,0,0,1));
   assert(!shouldStartDataUpload(false,false,false,4999,5000,0,0,0,1));
+  assert(shouldStartHealthHeartbeat(false,false,false,true,5000,5000,0,0,0,0));
+  assert(!shouldStartHealthHeartbeat(false,false,false,true,4999,5000,0,0,0,0));
+  assert(!shouldStartHealthHeartbeat(true,false,false,true,5000,5000,0,0,0,0));
+  assert(!shouldStartHealthHeartbeat(false,true,false,true,5000,5000,0,0,0,0));
+  assert(!shouldStartHealthHeartbeat(false,false,true,true,5000,5000,0,0,0,0));
+  assert(!shouldStartHealthHeartbeat(false,false,false,false,5000,5000,0,0,0,0));
+  assert(!shouldStartHealthHeartbeat(false,false,false,true,5000,5000,0,0,0,1));
   assert(otaRainbowVisible(1000,1000));
   assert(otaRainbowVisible(1000,3999));
   assert(!otaRainbowVisible(1000,4000));
@@ -62,5 +77,5 @@ int main() {
   longButton.update(true,4100);ButtonEvents longRelease=longButton.update(true,4130);
   assert(!longRelease.shortPress&&!longRelease.longPress);
 
-  puts("PASS gateway UI: formatting, pixel priority, non-empty upload scheduling, OTA active blocking, rainbow");
+  puts("PASS gateway UI: formatting, pixel priority, data/health scheduling, update blocking, rainbow");
 }

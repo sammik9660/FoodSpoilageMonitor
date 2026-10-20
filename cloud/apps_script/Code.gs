@@ -1,6 +1,6 @@
 // Gas scan v3. Existing SensorData rows and SPREADSHEET_ID are never reset.
 const MAX_BATCH = 32;
-const DASHBOARD_REFRESH_MS = 8000;
+const DASHBOARD_REFRESH_MS = 5000;
 const STALE_MS = 15000;
 const HEADERS = ['timestamp','temperature','humidity','pressure','gas_resistance',
   'sample_uid','session_id','nrf_seq','nrf_ms','capture_quality','received_at','nrf_boot',
@@ -11,11 +11,18 @@ const SESSION_HEADERS = ['session_id','experiment_label','started_at','stopped_a
 const INGEST_HEADERS = ['gateway_boot_id','ack_high_water','pending_transaction'];
 const DEVICE_HEADERS = ['device_id','first_seen_at','last_seen_at','firmware_version','sensor_id','ota_state'];
 const LEGACY_DEVICE_ID = 'legacy';
+const READ_LOCK_WAIT_MS = 250;
+const DEVICE_LIST_CACHE_KEY = 'DEVICE_LIST_V1';
 
 function locked(fn) {
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try { return fn(); } finally { lock.releaseLock(); }
+}
+function tryLocked(fn) {
+  const lock=LockService.getScriptLock();
+  if(!lock.tryLock(READ_LOCK_WAIT_MS))return {acquired:false,value:null};
+  try {return {acquired:true,value:fn()};} finally {lock.releaseLock();}
 }
 function book() {
   const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
@@ -124,6 +131,13 @@ function cacheRecording(record) {
   try {CacheService.getScriptCache().put('RECORDING_V1:'+record.device_id,JSON.stringify(record),600);} catch(_) {}
   return record;
 }
+function unknownRecording(deviceId) {
+  return {device_id:deviceId,state:'UNKNOWN',session_id:null,experiment_label:null,
+    download_session_id:null,download_experiment_label:null,download_kind:null};
+}
+function cachedObject(cache,key) {
+  try {const raw=cache.get(key);return raw?JSON.parse(raw):null;} catch(_) {return null;}
+}
 function validDeviceId(value) {
   if(value===undefined||value===null||value==='')return LEGACY_DEVICE_ID;
   if(value===LEGACY_DEVICE_ID)return value;
@@ -133,6 +147,8 @@ function validDeviceId(value) {
 function startRecording(label, requestedDeviceId) {
   const deviceId=validDeviceId(requestedDeviceId);
   if(typeof label!=='string' || !label.trim() || label.length>120 || /^[=+@\-]/.test(label)) throw new Error('Invalid experiment label');
+  const cache=CacheService.getScriptCache(), heartbeatStateKey='HEARTBEAT_STATE_V1:'+deviceId;
+  try {cache.remove(heartbeatStateKey);} catch(_) {}
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
     const device=dataRows(ctx.devices).find(r=>r[0]===deviceId);
@@ -141,16 +157,25 @@ function startRecording(label, requestedDeviceId) {
     const id='EXP-'+Utilities.getUuid(), now=new Date().toISOString();
     const row=ctx.sessions.getLastRow()+1;ensureRoom(ctx,ctx.sessions,row);
     ctx.sessions.getRange(row,1,1,5).setValues([[id,label.trim(),now,'',deviceId]]);
-    SpreadsheetApp.flush();return cacheRecording(recordingResult(ctx,deviceId));
+    SpreadsheetApp.flush();
+    try {cache.remove(DEVICE_LIST_CACHE_KEY);} catch(_) {}
+    const record=cacheRecording(recordingResult(ctx,deviceId));
+    try {cache.put(heartbeatStateKey,'IDLE',600);} catch(_) {}
+    return record;
   });
 }
 function stopRecording(requestedDeviceId) {
   const deviceId=validDeviceId(requestedDeviceId);
+  const cache=CacheService.getScriptCache(), heartbeatStateKey='HEARTBEAT_STATE_V1:'+deviceId;
+  try {cache.remove(heartbeatStateKey);} catch(_) {}
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
     const list=sessionsList(ctx.sessions), active=activeSession(list,deviceId);
     if(active) ctx.sessions.getRange(list.indexOf(active)+2,4).setValue(new Date().toISOString());
-    SpreadsheetApp.flush();return cacheRecording(recordingResult(ctx,deviceId));
+    SpreadsheetApp.flush();
+    const record=cacheRecording(recordingResult(ctx,deviceId));
+    try {cache.put(heartbeatStateKey,'IDLE',600);} catch(_) {}
+    return record;
   });
 }
 function registerDevice(ctx, deviceId, payload, now) {
@@ -162,6 +187,7 @@ function registerDevice(ctx, deviceId, payload, now) {
   ctx.devices.getRange(row,1,1,6).setValues([[deviceId,old?old[1]:new Date(now).toISOString(),
     new Date(now).toISOString(),typeof health.firmware_version==='string'?health.firmware_version:(old?old[3]:''),
     typeof payload.sensor_id==='string'?payload.sensor_id:(old?old[4]:''),otaState]]);
+  if(index<0)try {CacheService.getScriptCache().remove(DEVICE_LIST_CACHE_KEY);} catch(_) {}
 }
 function number(v,min,max,name) {
   if(typeof v!=='number'||!Number.isFinite(v)||v<min||v>max) throw new Error('Invalid '+name);
@@ -227,7 +253,7 @@ function normalize(payload, now) {
     h:short?payload.H:payload.humidity,p:short?payload.P:payload.pressure,g:short?payload.G:payload.gas};
   return {deviceId:LEGACY_DEVICE_ID,sensorId:'',samples:[validateSample(s,now)]};
 }
-function healthSnapshot(h, now) {
+function healthSnapshot(h, now, ageDelta) {
   const out={server_seen_at:now};
   if(!h||typeof h!=='object')return out;
   const numeric=['last_valid_age_ms','queue_depth','spool_depth','sensor_failures','sensor_recoveries',
@@ -242,19 +268,56 @@ function healthSnapshot(h, now) {
   if(typeof h.gas_ok==='boolean')out.gas_ok=h.gas_ok;
   if(h.environment){const x=h.environment;try {out.environment={t:number(x.t,-40,85,'T'),
     h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),
-    age_ms:number(x.age_ms,0,1e12,'environment age')};}catch(_) {}}
+    age_ms:number(x.age_ms,0,1e12,'environment age')+ageDelta};}catch(_) {}}
   if(h.latest) {const x=h.latest;try {out.latest={t:number(x.t,-40,85,'T'),h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),g:number(x.g,0,1e9,'G')};}catch(_) {}}
   if(typeof h.firmware_version==='string')out.firmware_version=h.firmware_version;
   if(typeof h.sensor_id==='string')out.sensor_id=h.sensor_id;
   out.ota_state=h.ota_state==='UPDATING'||h.ota_state==='VERIFYING'?h.ota_state:'IDLE';
   if(typeof h.local_ip==='string'&&/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h.local_ip))out.local_ip=h.local_ip;
+  if(typeof out.last_valid_age_ms==='number')out.last_valid_age_ms+=ageDelta;
   return out;
+}
+function cacheHealth(payload, normalized, samples, deviceId, receivedAt) {
+  const seenAt=Date.now(), ageDelta=Math.max(0,seenAt-receivedAt);
+  const snap=healthSnapshot(payload.health,seenAt,ageDelta);
+  if(!snap.latest && payload.version!==2 && payload.version!==3 && samples.length) {
+    const s=samples[0];snap.latest={t:s.t,h:s.h,p:s.p,g:s.g};snap.last_valid_age_ms=ageDelta;
+  }
+  snap.device_id=deviceId;snap.sensor_id=normalized.sensorId;
+  try {
+    const cache=CacheService.getScriptCache(), key='LIVE_V2:'+deviceId, previous=cachedObject(cache,key);
+    if(previous&&previous.environment&&snap.environment&&
+       previous.server_seen_at-previous.environment.age_ms>snap.server_seen_at-snap.environment.age_ms) {
+      snap.environment={t:previous.environment.t,h:previous.environment.h,p:previous.environment.p,
+        age_ms:previous.environment.age_ms+Math.max(0,seenAt-previous.server_seen_at)};
+    }
+    cache.put(key,JSON.stringify(snap),600);
+  } catch(_) {}
 }
 function ingest(payload) {
   const now=Date.now(), normalized=normalize(payload,now), samples=normalized.samples, deviceId=normalized.deviceId; // validate ALL before any mutation
+  const health=payload.health||{}, otaState=health.ota_state==='UPDATING'||health.ota_state==='VERIFYING'?health.ota_state:'IDLE';
+  const cache=CacheService.getScriptCache(), heartbeatStateKey='HEARTBEAT_STATE_V1:'+deviceId;
+  if(samples.length===0&&otaState==='IDLE') {
+    const state=cache.get(heartbeatStateKey), cached=cachedObject(cache,'RECORDING_V1:'+deviceId);
+    if(state==='IDLE'&&cached) {
+      cacheHealth(payload,normalized,samples,deviceId,now);
+      return {success:true,version:payload.version===3?3:2,acks:[],stored:0,recording:cached,server_time:Date.now()};
+    }
+    const attempt=tryLocked(()=>{
+      const ctx=sheets();
+      registerDevice(ctx,deviceId,payload,now);
+      const record=cacheRecording(recordingResult(ctx,deviceId));
+      try {cache.put(heartbeatStateKey,'IDLE',600);} catch(_) {}
+      return record;
+    });
+    if(!attempt.acquired)throw new Error('Cloud state busy; heartbeat will retry');
+    cacheHealth(payload,normalized,samples,deviceId,now);
+    return {success:true,version:payload.version===3?3:2,acks:[],stored:0,recording:attempt.value,server_time:Date.now()};
+  }
+  if(otaState!=='IDLE')try {cache.remove(heartbeatStateKey);} catch(_) {}
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
-    const health=payload.health||{};
     const active=activeSession(sessionsList(ctx.sessions),deviceId);
     if(health.ota_state==='UPDATING'&&active)throw new Error('Cannot update firmware while recording');
     registerDevice(ctx,deviceId,payload,now);
@@ -299,16 +362,9 @@ function ingest(payload) {
       }
     }
     const record=cacheRecording(recordingResult(ctx,deviceId));
-    try {
-      const snap=healthSnapshot(payload.health,now);
-      // Health uses a bounded cache, never raw samples in ScriptProperties.
-      if(!snap.latest && payload.version!==2 && payload.version!==3 && samples.length) {
-        const s=samples[0];snap.latest={t:s.t,h:s.h,p:s.p,g:s.g};snap.last_valid_age_ms=0;
-      }
-      snap.device_id=deviceId;snap.sensor_id=normalized.sensorId;
-      CacheService.getScriptCache().put('LIVE_V2:'+deviceId,JSON.stringify(snap),600);
-    } catch(_) {} // storage ACK must not fail solely because dashboard cache failed
-    return {success:true,version:payload.version===3?3:2,acks,stored:saved,recording:record,server_time:now};
+    try {cache.put(heartbeatStateKey,otaState,600);} catch(_) {}
+    cacheHealth(payload,normalized,samples,deviceId,now);
+    return {success:true,version:payload.version===3?3:2,acks,stored:saved,recording:record,server_time:Date.now()};
   });
 }
 function doPost(e) {
@@ -336,10 +392,11 @@ function json(v) {return ContentService.createTextOutput(JSON.stringify(v)).setM
 function getDashboard(requestedDeviceId) {
   const deviceId=validDeviceId(requestedDeviceId);
   const cache=CacheService.getScriptCache();
-  const cached=cache.get('RECORDING_V1:'+deviceId);
-  const recording=cached?JSON.parse(cached):locked(()=>{
+  const cached=cachedObject(cache,'RECORDING_V1:'+deviceId);
+  const attempt=cached?null:tryLocked(()=>{
     const ctx=sheets();recoverTransactions(ctx);return cacheRecording(recordingResult(ctx,deviceId));});
-  const raw=cache.get('LIVE_V2:'+deviceId), h=raw?JSON.parse(raw):null;
+  const recording=cached||(attempt&&attempt.acquired?attempt.value:unknownRecording(deviceId));
+  const h=cachedObject(cache,'LIVE_V2:'+deviceId);
   const now=Date.now(), transportStale=!h||now-h.server_seen_at>STALE_MS;
   const env=h&&h.environment;
   const age=env?env.age_ms+now-h.server_seen_at:
@@ -359,13 +416,21 @@ function getDashboard(requestedDeviceId) {
   return {device_id:deviceId,state,age,health:h,recording,server_time:now};
 }
 function getDashboardDevices() {
-  return locked(()=>{
+  const cache=CacheService.getScriptCache(), cached=cachedObject(cache,DEVICE_LIST_CACHE_KEY);
+  if(cached)return cached;
+  const attempt=tryLocked(()=>{
     const ctx=sheets(), rows=dataRows(ctx.devices);
     const ids=rows.map(r=>r[0]).filter(x=>typeof x==='string'&&/^[a-f0-9]{12}$/.test(x));
     sessionsList(ctx.sessions).forEach(s=>{if(s.device_id===LEGACY_DEVICE_ID||/^[a-f0-9]{12}$/.test(s.device_id))ids.push(s.device_id);});
     const unique=Array.from(new Set(ids));if(!unique.length)unique.push(LEGACY_DEVICE_ID);
-    return unique.map(id=>({device_id:id,first_seen_at:(rows.find(r=>r[0]===id)||[])[1]||null}));
+    const result=unique.map(id=>({device_id:id,first_seen_at:(rows.find(r=>r[0]===id)||[])[1]||null}));
+    try {cache.put(DEVICE_LIST_CACHE_KEY,JSON.stringify(result),600);} catch(_) {}
+    return result;
   });
+  if(attempt.acquired)return attempt.value;
+  const retry=cachedObject(cache,DEVICE_LIST_CACHE_KEY);
+  if(retry)return retry;
+  throw new Error('Device list temporarily busy; retry');
 }
 function getSensorData(deviceId) {return getDashboard(deviceId);}
 function csvCell(v) {if(v instanceof Date)v=v.toISOString();return '"'+String(v===null?'':v).replace(/"/g,'""')+'"';}

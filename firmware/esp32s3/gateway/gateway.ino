@@ -157,7 +157,7 @@ using namespace integrity;
 
 using namespace gateway_ui;
 
-constexpr uint32_t UPLOAD_INTERVAL_MS=5000, OUTAGE_FLUSH_MS=60000;
+constexpr uint32_t UPLOAD_INTERVAL_MS=5000, HEALTH_HEARTBEAT_INTERVAL_MS=5000, OUTAGE_FLUSH_MS=60000;
 
 constexpr uint32_t MAX_RETRY_MS=30000, RATE_LIMIT_RETRY_MS=150000, PERSIST_INFLIGHT_MS=10000;
 
@@ -171,7 +171,9 @@ constexpr uint8_t NEOPIXEL_PIN=48, NEOPIXEL_BRIGHTNESS=24;
 
 constexpr uint32_t LCD_REFRESH_MS=750;
 
-constexpr bool UART_DIAGNOSTICS=true;
+// Hardware CDC/JTAG is the verified console. Mirroring every line to UART0 made
+// combined captures show each event twice; UART0 remains available as an opt-in.
+constexpr bool UART_DIAGNOSTICS=false;
 constexpr char FIRMWARE_VERSION[]="2.0.8";
 constexpr uint64_t OTA_BUILD_NUMBER=2026101906ULL;
 
@@ -311,9 +313,9 @@ int64_t lastCloudUpload=0;
 // the ACK. Keeping another full Sample[32] alive during the TLS handshake costs
 // about 3.8 KiB of the same contiguous internal heap used by mbedTLS.
 struct AckIdentity { char boot[32]; uint32_t rx; };
-struct UploadJob { AckIdentity acks[BATCH_SIZE]; uint32_t count; char* json; };
+struct UploadJob { AckIdentity acks[BATCH_SIZE]; uint32_t count; bool heartbeat; char* json; };
 
-struct UploadResult { bool ok; int http; uint32_t unassigned; char recording[16]; char session[64]; };
+struct UploadResult { bool ok; bool heartbeat; int http; uint32_t unassigned; char recording[16]; char session[64]; };
 uint64_t wifiConnectedAt=0, bleConnectedAt=0, firstFrameAt=0;
 uint64_t firstPostAt=0, lastPostAt=0, lastRedirectAt=0, lastAckAt=0, backlogDrainedAt=0;
 
@@ -561,7 +563,7 @@ bool otaSafeState() {
 }
 
 bool otaSafeToStart() {
-  return otaMode==OTA_NORMAL&&!nrfPackageUploadActive&&otaPassword[0]&&spool.mounted&&!spool.fault&&
+  return otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&!nrfPackageUploadActive&&otaPassword[0]&&spool.mounted&&!spool.fault&&
     !otaPendingVerify&&!otaLeaseReleasePending&&WiFi.status()==WL_CONNECTED;
 }
 
@@ -666,7 +668,7 @@ void handleNrfPackagePage() {
   const bool valid=present&&validateNrfPackageAt(NRF_DFU_PACKAGE_PATH,info,error,sizeof(error));
   const bool ready=nrfPackageUploadSafe();
   const String page=String("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>nRF DFU</title>")+
-    "<h1>nRF52840 firmware update</h1><p>Gateway "+String(deviceId)+"</p><div id=s>Loading status…</div><p>Current package: "+
+    "<h1>nRF52840 firmware update</h1><p>Gateway "+String(deviceId)+"</p><p><a href='/'>Open ESP32-S3 gateway update</a></p><div id=s>Loading status…</div><p>Current package: "+
     (valid?String("valid, application ")+String(info.binarySize)+" bytes":present?String("invalid: ")+error:"none")+
     "</p><p>"+(ready?"Ready. Upload replaces only /nrf-dfu.zip after full validation.":
       "Blocked: recording must be STOPPED and RAM queue, spool, HTTP work, and other updates must be idle.")+
@@ -871,7 +873,7 @@ void handleOtaPage() {
   if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
   const bool safe=otaSafeToStart();
   const String page=String("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>Gateway OTA</title>")+
-    "<h1>ESP32-S3 firmware update</h1><p>Device " + String(deviceId) + " · " + FIRMWARE_VERSION + "</p><p>"+
+    "<h1>ESP32-S3 firmware update</h1><p>Device " + String(deviceId) + " · " + FIRMWARE_VERSION + "</p><p><a href='/nrf-dfu'>Open nRF52840 sensor update</a></p><p>"+
     (safe?"Ready to reserve a STOPPED recording state and drain stored samples before upload.":"Blocked: check SPIFFS health, Wi-Fi, pending boot verification, and the USB-issued OTA token.")+
     "</p><p>Choose the signed .manifest and matching .bin from the same release.</p><form id=f><label>Manifest <input id=m type=file accept='.manifest' required></label><br><label>Firmware <input id=b type=file accept='.bin' required></label><br><label><input id=c type=checkbox required> I approve flashing this signed firmware; the gateway will restart.</label><br><button "+
     (safe?"":"disabled")+">Verify and update</button></form><pre id=o></pre><script>const f=document.getElementById('f'),m=document.getElementById('m'),b=document.getElementById('b'),c=document.getElementById('c'),o=document.getElementById('o');f.onsubmit=async e=>{e.preventDefault();if(!c.checked)return;try{let r=await fetch('/prepare',{method:'POST'});if(!r.ok){o.textContent=await r.text();return;}let ready=false;for(let i=0;i<180;i++){let s=await fetch('/status');if(!s.ok)throw Error(await s.text());let v=await s.json();if(v.mode!='PREPARE')throw Error('OTA preparation stopped');if(v.ready){ready=true;break;}o.textContent='Draining queue '+v.queue+' and spool '+v.spool+'; waiting for HTTP '+v.http;await new Promise(resolve=>setTimeout(resolve,1000));}if(!ready)throw Error('OTA preparation timed out');let d=new FormData();d.append('manifest',m.files[0]);d.append('firmware',b.files[0]);o.textContent='Uploading and verifying…';r=await fetch('/update',{method:'POST',body:d});o.textContent=await r.text();}catch(err){o.textContent=String(err);await fetch('/cancel',{method:'POST'}).catch(()=>{});}}</script>";
@@ -1226,7 +1228,9 @@ void setGatewayPixel(PixelState state) {
 
   uint32_t color=0;
 
-  if(state==PIXEL_BLE_OFF)color=gatewayPixel.Color(255,0,0);
+  if(state==PIXEL_BOOT||state==PIXEL_UPDATE)color=gatewayPixel.Color(0,0,255);
+
+  else if(state==PIXEL_BLE_OFF)color=gatewayPixel.Color(255,0,0);
 
   else if(state==PIXEL_WIFI_OFF)color=gatewayPixel.Color(160,0,255);
 
@@ -1278,7 +1282,8 @@ void initGatewayLcd() {
 
 void updateGatewayUi(uint64_t now,bool wifi,CloudState cloud,uint32_t queueDepth,
 
-                     uint32_t spoolDepth,bool recordingKnown,bool recording,bool backlog) {
+                     uint32_t spoolDepth,bool recordingKnown,bool recording,bool backlog,
+                     bool updateActive) {
 
   bool ble;Sample sample;bool sampleKnown;
 
@@ -1293,7 +1298,7 @@ void updateGatewayUi(uint64_t now,bool wifi,CloudState cloud,uint32_t queueDepth
       }
     } else {otaRainbowActive=false;shownPixel=PIXEL_BOOT;}
   }
-  if(!otaRainbowActive)setGatewayPixel(pixelState(ble,wifi,cloud,backlog));
+  if(!otaRainbowActive)setGatewayPixel(pixelState(ble,wifi,cloud,backlog,updateActive));
 
   if(!lcdReady||now-lastLcdRefresh<LCD_REFRESH_MS)return;
 
@@ -1779,6 +1784,8 @@ void networkTask(void*) {
 
     UploadResult result = {};
 
+    result.heartbeat = job->heartbeat;
+
     result.http = -1;
 
 
@@ -1837,7 +1844,7 @@ void networkTask(void*) {
 
           if(!firstPostAt)firstPostAt=uptimeMs();
           lastPostAt=uptimeMs();
-          logEvent("HTTP POST begin uptime=%llu ms bytes=%u",(unsigned long long)lastPostAt,(unsigned)strlen(job->json));
+          logEvent("HTTP POST begin kind=%s uptime=%llu ms bytes=%u",job->heartbeat?"health":"data",(unsigned long long)lastPostAt,(unsigned)strlen(job->json));
           postCode =
 
             post.POST(
@@ -2276,9 +2283,11 @@ void loop() {
 
   static String activePath;
 
-  static bool busy=false, failed=false, haveCloudAck=false;
+  static bool busy=false, activeJobHeartbeat=false, failed=false, healthHeartbeatFailed=false, haveCloudAck=false;
 
-  static uint64_t due=0, activeSince=0, lastSpill=0;
+  static uint64_t due=0, healthHeartbeatDue=0, lastHealthHeartbeatStart=0,
+                  healthHeartbeatStartedAt=0, lastHealthHeartbeatAck=0,
+                  activeSince=0, lastSpill=0;
 
   static uint32_t retryDelay=UPLOAD_INTERVAL_MS;
 
@@ -2290,7 +2299,7 @@ void loop() {
 
   if(wifiState!=wifiPrevious){
     logEvent("Wi-Fi state=%d uptime=%llu ms",wifiState,(unsigned long long)now);
-    if(wifiState==WL_CONNECTED){wifiConnectedAt=now;due=now;retryDelay=UPLOAD_INTERVAL_MS;}
+    if(wifiState==WL_CONNECTED){wifiConnectedAt=now;due=now;healthHeartbeatDue=now;retryDelay=UPLOAD_INTERVAL_MS;}
     wifiPrevious=wifiState;
   }
 
@@ -2312,9 +2321,27 @@ void loop() {
 
   if(xQueueReceive(resultsQueue,&result,0)==pdTRUE) {
 
-    busy=false;
+    busy=false;activeJobHeartbeat=false;
 
-    if(result.ok) {
+    if(result.heartbeat) {
+      if(result.ok) {
+        const uint64_t interval=lastHealthHeartbeatAck?now-lastHealthHeartbeatAck:0;
+        const uint64_t duration=healthHeartbeatStartedAt?now-healthHeartbeatStartedAt:0;
+        lastHealthHeartbeatAck=now;healthHeartbeatFailed=false;haveCloudAck=true;
+        lastAckAt=now;otaLastCloudAckAt=now;lastCloudUpload=clockValid()?utcMs():0;
+        if(!strcmp(result.recording,"RECORDING")){cloudRecordingKnown=true;cloudRecording=true;}
+        else if(!strcmp(result.recording,"STOPPED")){cloudRecordingKnown=true;cloudRecording=false;}
+        logEvent("Health heartbeat ACK interval=%llu ms duration=%llu ms",
+          (unsigned long long)interval,(unsigned long long)duration);
+      } else {
+        ++uploadFailures;healthHeartbeatFailed=true;
+        // A transport failure gets one full quiet interval after completion.
+        // Successful heartbeats remain start-to-start and never overlap because busy stays set.
+        healthHeartbeatDue=now+HEALTH_HEARTBEAT_INTERVAL_MS;
+        logEvent("Health heartbeat failed http=%d; retry in %lu ms",
+          result.http,(unsigned long)HEALTH_HEARTBEAT_INTERVAL_MS);
+      }
+    } else if(result.ok) {
 
       // DATA INTEGRITY: only exact application ACK can release a batch. A
 
@@ -2334,6 +2361,8 @@ void loop() {
       else if(!strcmp(result.recording,"STOPPED")){cloudRecordingKnown=true;cloudRecording=false;}
 
       lastCloudUpload=clockValid()?utcMs():0;unassignedCount+=result.unassigned;
+      healthHeartbeatDue=now+HEALTH_HEARTBEAT_INTERVAL_MS;
+      healthHeartbeatFailed=false;
 
       logEvent("ACK recording=%s session=%s",result.recording,result.session);
 
@@ -2444,7 +2473,7 @@ void loop() {
       due=now+UPLOAD_INTERVAL_MS;
       logEvent("ERROR pending upload data could not form a non-empty batch");
     } else {
-      UploadJob* job=new UploadJob();job->count=activeCount;
+      UploadJob* job=new UploadJob();job->count=activeCount;job->heartbeat=false;
       for(uint32_t i=0;i<activeCount;++i){memcpy(job->acks[i].boot,active[i].boot,32);job->acks[i].rx=active[i].rx;}
 
       cJSON* root=cJSON_CreateObject();addNumber(root,"version",3);
@@ -2456,18 +2485,48 @@ void loop() {
 
       cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=cJSON_PrintUnformatted(root);cJSON_Delete(root);
 
-      if(job->json&&xQueueSend(jobsQueue,&job,0)==pdTRUE){busy=true;logEvent("Batch upload start n=%lu spool=%lu uptime=%llu ms",(unsigned long)activeCount,(unsigned long)spool.count,(unsigned long long)now);}
+      if(job->json&&xQueueSend(jobsQueue,&job,0)==pdTRUE){busy=true;activeJobHeartbeat=false;logEvent("Batch upload start n=%lu spool=%lu uptime=%llu ms",(unsigned long)activeCount,(unsigned long)spool.count,(unsigned long long)now);}
 
       else {if(job->json)cJSON_free(job->json);delete job;due=now+UPLOAD_INTERVAL_MS;logEvent("ERROR upload allocation/queue failed");}
     }
 
   }
 
+  const bool updateActive=nrfPackageUploadActive||otaMode!=OTA_NORMAL||nrfDfuMode!=NRF_DFU_NORMAL;
+  const uint32_t heartbeatQueued=uxQueueMessagesWaiting(samplesQueue);
+  if(shouldStartHealthHeartbeat(busy||failed,updateActive,
+       otaMaintenanceNetworkBusy||otaLeaseReleasePending,wifiState==WL_CONNECTED,
+       now,healthHeartbeatDue,activeCount,stagedCount,spool.count,heartbeatQueued)) {
+    UploadJob* job=new UploadJob();job->count=0;job->heartbeat=true;
+    cJSON* root=cJSON_CreateObject();addNumber(root,"version",3);
+    char sensorIdSnapshot[17];portENTER_CRITICAL(&stateMux);memcpy(sensorIdSnapshot,connectedSensorId,sizeof(sensorIdSnapshot));portEXIT_CRITICAL(&stateMux);
+    cJSON_AddStringToObject(root,"device_id",deviceId);cJSON_AddStringToObject(root,"sensor_id",sensorIdSnapshot);
+    cJSON_AddArrayToObject(root,"samples");
+    cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=cJSON_PrintUnformatted(root);cJSON_Delete(root);
+    if(job->json&&xQueueSend(jobsQueue,&job,0)==pdTRUE) {
+      busy=true;activeJobHeartbeat=true;
+      const uint64_t interval=lastHealthHeartbeatStart?now-lastHealthHeartbeatStart:0;
+      lastHealthHeartbeatStart=now;healthHeartbeatStartedAt=now;
+      healthHeartbeatDue=now+HEALTH_HEARTBEAT_INTERVAL_MS;
+      logEvent("Health heartbeat start interval=%llu ms target=%lu ms uptime=%llu ms",
+        (unsigned long long)interval,(unsigned long)HEALTH_HEARTBEAT_INTERVAL_MS,
+        (unsigned long long)now);
+    } else {
+      if(job->json)cJSON_free(job->json);delete job;
+      healthHeartbeatDue=now+HEALTH_HEARTBEAT_INTERVAL_MS;
+      logEvent("ERROR health heartbeat allocation/queue failed; retry in %lu ms",
+        (unsigned long)HEALTH_HEARTBEAT_INTERVAL_MS);
+    }
+  }
+
   uint32_t queueDepth=uxQueueMessagesWaiting(samplesQueue);
 
   bool wifiOnline=wifiState==WL_CONNECTED;
 
-  CloudState cloud=!wifiOnline?CLOUD_OFF:(busy||failed||!haveCloudAck)?CLOUD_WAIT:CLOUD_OK;
+  // Health-only work still blocks concurrent update I/O, but a normal heartbeat
+  // is not a warning condition for the status LED.
+  CloudState cloud=cloudState(wifiOnline,busy&&!activeJobHeartbeat,failed,
+                              healthHeartbeatFailed,haveCloudAck);
 
   bool backlog=queueDepth||spool.count||activeCount||stagedCount||failed;
 
@@ -2485,7 +2544,7 @@ void loop() {
     abortOtaSession();
   }
 
-  updateGatewayUi(now,wifiOnline,cloud,queueDepth,spool.count,cloudRecordingKnown,cloudRecording,backlog);
+  updateGatewayUi(now,wifiOnline,cloud,queueDepth,spool.count,cloudRecordingKnown,cloudRecording,backlog,updateActive);
 
   delay(10);
 

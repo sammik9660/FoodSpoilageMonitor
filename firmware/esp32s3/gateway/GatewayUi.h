@@ -14,7 +14,7 @@ constexpr uint32_t BUTTON_LONG_PRESS_MS = 3000;
 
 enum LcdMode : uint8_t { LCD_SENSOR, LCD_DEBUG };
 enum CloudState : uint8_t { CLOUD_OFF, CLOUD_WAIT, CLOUD_OK };
-enum PixelState : uint8_t { PIXEL_BOOT, PIXEL_BLE_OFF, PIXEL_WIFI_OFF, PIXEL_WAIT, PIXEL_OK };
+enum PixelState : uint8_t { PIXEL_BOOT, PIXEL_UPDATE, PIXEL_BLE_OFF, PIXEL_WIFI_OFF, PIXEL_WAIT, PIXEL_OK };
 
 constexpr uint32_t OTA_RAINBOW_MS = 3000;
 constexpr uint32_t OTA_RAINBOW_FRAME_MS = 30;
@@ -71,6 +71,14 @@ inline const char* cloudText(CloudState state) {
   return state == CLOUD_OK ? "OK" : state == CLOUD_WAIT ? "WAIT" : "--";
 }
 
+inline CloudState cloudState(bool wifiOnline, bool dataHttpBusy,
+                             bool dataUploadFailed, bool heartbeatFailed,
+                             bool haveCloudAck) {
+  if (!wifiOnline) return CLOUD_OFF;
+  return dataHttpBusy || dataUploadFailed || heartbeatFailed || !haveCloudAck
+           ? CLOUD_WAIT : CLOUD_OK;
+}
+
 inline void formatDebug(bool ble, bool wifi, CloudState cloud, uint32_t queue,
                         uint32_t spool, bool recordingKnown, bool recording,
                         char line1[LCD_COLUMNS + 1], char line2[LCD_COLUMNS + 1]) {
@@ -84,7 +92,9 @@ inline void formatDebug(bool ble, bool wifi, CloudState cloud, uint32_t queue,
   fixedLine(line2, temp);
 }
 
-inline PixelState pixelState(bool ble, bool wifi, CloudState cloud, bool backlog) {
+inline PixelState pixelState(bool ble, bool wifi, CloudState cloud, bool backlog,
+                             bool updateActive=false) {
+  if (updateActive) return PIXEL_UPDATE;
   if (!ble) return PIXEL_BLE_OFF;
   if (!wifi) return PIXEL_WIFI_OFF;
   if (cloud != CLOUD_OK || backlog) return PIXEL_WAIT;
@@ -103,6 +113,17 @@ inline bool shouldStartDataUpload(bool busy, bool otaActive,
                                   uint32_t queued) {
   return !busy && !otaActive && !otaMaintenanceNetworkBusy && now >= due &&
          uploadDataPending(active, staged, spool, queued);
+}
+
+inline bool shouldStartHealthHeartbeat(bool busy, bool updateActive,
+                                       bool otaMaintenanceNetworkBusy,
+                                       bool wifiOnline, uint64_t now,
+                                       uint64_t due, uint32_t active,
+                                       uint32_t staged, uint32_t spool,
+                                       uint32_t queued) {
+  return wifiOnline && !busy && !updateActive &&
+         !otaMaintenanceNetworkBusy && now >= due &&
+         !uploadDataPending(active, staged, spool, queued);
 }
 
 struct ButtonEvents { bool shortPress=false, longPress=false; };

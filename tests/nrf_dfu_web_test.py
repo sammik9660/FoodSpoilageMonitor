@@ -28,6 +28,10 @@ class NrfDfuWebFlowTest(unittest.TestCase):
                         SOURCE.index("void handleNrfDfuStatus")]
         self.assertNotIn("requestNrfDfuStart", upload)
 
+    def test_local_update_pages_link_to_each_other(self):
+        self.assertIn("href='/nrf-dfu'>Open nRF52840 sensor update", SOURCE)
+        self.assertIn("href='/'>Open ESP32-S3 gateway update", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()
