@@ -215,6 +215,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #endif
+#include "Battery.h"
 
 constexpr uint8_t BME_ADDRESS = 0x76;
 constexpr uint8_t OLED_ADDRESS = 0x3C;
@@ -223,6 +224,10 @@ constexpr int16_t OLED_HEIGHT = 32;
 constexpr int8_t OLED_RESET_PIN = -1;
 constexpr uint32_t OLED_REFRESH_INTERVAL_MS = 750;
 constexpr uint32_t ENV_INTERVAL_MS = 2000;
+constexpr uint32_t BATTERY_INTERVAL_MS = 60000;
+constexpr uint32_t USB_POWER_CHECK_INTERVAL_MS = 1000;
+constexpr uint32_t ADC_FULL_SCALE_MV = 3600;
+constexpr uint32_t ADC_MAX_CODE = (1UL << 14) - 1UL;
 constexpr uint32_t GAS_SCAN_INTERVAL_MS = 600000;
 constexpr uint32_t GAS_SCAN_TIMEOUT_MS = 60000;
 constexpr uint32_t COOLING_MS = 60000; // provisional stabilization delay; validate on hardware
@@ -230,7 +235,7 @@ constexpr uint32_t ENV_CONVERSION_TIMEOUT_MS = 200;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.6";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.7";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 bme68xData lastEnvData={};
@@ -246,6 +251,8 @@ uint32_t bootId, validSequence = 0, failures = 0, consecutiveFailures = 0;
 uint32_t envSequence = 0, envFailures = 0, envConsecutiveFailures = 0;
 uint32_t recoveryAttempts = 0, recoveries = 0, txErrors = 0;
 uint32_t nextMeasurement = 0, nextRecovery = 0, lastHealth = 0;
+uint32_t nextBatteryMeasurement = 0, nextUsbPowerCheck = 0, batteryMillivolts = 0;
+battery::Tracker batteryTracker;
 uint32_t lastSensorField = 0;
 uint32_t sensorReadyAt = 0;
 uint32_t nextEnvMeasurement = 0, envConversionAt = 0, nextGasScan = 0;
@@ -253,6 +260,11 @@ uint32_t scanStartedAt = 0, coolingStartedAt = 0, scanCompleteBefore = 0, scanIn
 uint32_t recoveryDelay = RECOVERY_MIN_MS;
 bool sensorReady = false, recoveryPending = false, lastReadOK = false;
 bool envReadOK = false, envConversionPending = false;
+bool batteryMeasurementValid = false, usbPowerPresent = false;
+#if defined(_MSC_VER)
+bool testUsbPowerPresent = false;
+uint32_t testVddhRaw = 3723; // Approximately 4.09 V after VDDH/5 conversion.
+#endif
 bool haveEnvMeasurementIndex=false;
 uint8_t lastEnvMeasurementIndex=0;
 bool recoveringGas = false;
@@ -269,6 +281,81 @@ bool isMeasurementValid(bool readOK, double temperature, double humidity,
   // incident signature. G<=0 is the confirmed invalid condition.
   return readOK && isfinite(temperature) && isfinite(humidity) &&
          isfinite(pressure) && isfinite(gasResistance) && gasResistance > 0;
+}
+
+uint32_t vddhMillivoltsFromRaw(uint32_t raw) {
+  const uint32_t inputMv = (raw * ADC_FULL_SCALE_MV + ADC_MAX_CODE / 2) /
+                           ADC_MAX_CODE;
+  return inputMv * 5;
+}
+
+bool readUsbPowerPresent(bool& present) {
+#if defined(_MSC_VER)
+  present = testUsbPowerPresent;
+  return true;
+#else
+  uint32_t status = 0;
+  if (sd_power_usbregstatus_get(&status) != NRF_SUCCESS) return false;
+  present = (status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+  return true;
+#endif
+}
+
+uint32_t readVddhRaw() {
+#if defined(_MSC_VER)
+  return testVddhRaw;
+#else
+  uint32_t total = 0;
+  for (uint8_t i = 0; i < 8; ++i) {
+    total += analogReadVDDHDIV5();
+    delay(10);
+  }
+  return (total + 4) / 8;
+#endif
+}
+
+void measureBatteryVoltage() {
+  bool usb = true; // Fail closed: an unknown supply must not be called a battery.
+  if (!readUsbPowerPresent(usb)) {
+    usbPowerPresent = true;
+    batteryMeasurementValid = false;
+    batteryMillivolts = 0;
+    return;
+  }
+  usbPowerPresent = usb;
+  if (usb) {
+    batteryMeasurementValid = false;
+    batteryMillivolts = 0;
+    return;
+  }
+  const uint32_t mv = vddhMillivoltsFromRaw(readVddhRaw());
+  batteryMeasurementValid = mv >= 2500 && mv <= 5500;
+  batteryMillivolts = batteryMeasurementValid ? mv : 0;
+
+  // 유효한 배터리 전압을 측정했을 때만 기록
+  if (batteryMeasurementValid) {
+    batteryTracker.observe(batteryMillivolts);
+  }
+}
+
+void serviceBatteryVoltage(uint32_t now) {
+  if ((int32_t)(now - nextUsbPowerCheck) >= 0) {
+    nextUsbPowerCheck = now + USB_POWER_CHECK_INTERVAL_MS;
+    bool usb = true;
+    const bool wasUsb = usbPowerPresent;
+    if (!readUsbPowerPresent(usb)) usb = true;
+    usbPowerPresent = usb;
+    if (usb) {
+      batteryMeasurementValid = false;
+      batteryMillivolts = 0;
+      return;
+    }
+    if (wasUsb) nextBatteryMeasurement = now;
+  }
+  if (usbPowerPresent) return;
+  if ((int32_t)(now - nextBatteryMeasurement) < 0) return;
+  nextBatteryMeasurement = now + BATTERY_INTERVAL_MS;
+  measureBatteryVoltage();
 }
 
 #if !defined(_MSC_VER)
@@ -300,12 +387,18 @@ void initializeOled() {
   Serial.print(" "); Serial.print(OLED_WIDTH); Serial.print("x"); Serial.println(OLED_HEIGHT);
 }
 
+
 void formatOledCounter(uint32_t value, char* out, size_t outSize) {
-  if (value < 1000) snprintf(out, outSize, "%lu", (unsigned long)value);
-  else if (value < 1000000) snprintf(out, outSize, "%luk", (unsigned long)(value / 1000));
-  else if (value < 1000000000) snprintf(out, outSize, "%luM", (unsigned long)(value / 1000000));
-  else snprintf(out, outSize, "%luG", (unsigned long)(value / 1000000000));
+  if (value < 1000)
+    snprintf(out, outSize, "%lu", (unsigned long)value);
+  else if (value < 1000000)
+    snprintf(out, outSize, "%luk", (unsigned long)(value / 1000));
+  else if (value < 1000000000)
+    snprintf(out, outSize, "%luM", (unsigned long)(value / 1000000));
+  else
+    snprintf(out, outSize, "%luG", (unsigned long)(value / 1000000000));
 }
+
 
 void updateOled(uint32_t now) {
   if (!oledReady || (uint32_t)(now - lastOledRefresh) < OLED_REFRESH_INTERVAL_MS) {
@@ -335,7 +428,24 @@ void updateOled(uint32_t now) {
   if (sensorMode==MODE_ENV && envReadOK) {
     snprintf(line, sizeof(line), "Tem:%.1fC Hum:%.1f%%", lastEnvData.temperature, lastEnvData.humidity);
     oled.println(line);
-    snprintf(line, sizeof(line), "hPa:%.1f", lastEnvData.pressure / 100.0);
+    
+    if (usbPowerPresent) {
+      snprintf(line, sizeof(line),
+               "hPa:%.1f B:USB",
+               lastEnvData.pressure / 100.0);
+
+    } else if (batteryMeasurementValid) {
+      snprintf(line, sizeof(line),
+               "hPa:%.1f B:%u%%",
+               lastEnvData.pressure / 100.0,
+               battery::percent(batteryMillivolts));
+
+    } else {
+      snprintf(line, sizeof(line),
+               "hPa:%.1f B:--%%",
+               lastEnvData.pressure / 100.0);
+    }
+
     oled.println(line);
   } else {
     oled.println(F("T:--.-C H:--.-%"));
@@ -438,15 +548,17 @@ bool sendLine(const char* line) {
 }
 
 void sendHealth() {
-  char line[160];
+  char line[192];
   const char* mode=sensorMode==MODE_GAS?"GAS":sensorMode==MODE_COOL?"COOL":
                    sensorMode==MODE_REC?"REC":"ENV";
-  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u",
+  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u,BV=%lu,BOK=%u,USB=%u",
            (unsigned long)bootId, (unsigned long)millis(), (unsigned long)failures,
            (unsigned long)recoveries, (unsigned long)recoveryAttempts,
            (unsigned long)txErrors, sensorMode==MODE_ENV ? (envReadOK ? 1 : 0) :
            sensorMode==MODE_GAS ? (lastReadOK ? 1 : 0) : 0, mode,
-           envReadOK ? 1 : 0, lastReadOK ? 1 : 0);
+           envReadOK ? 1 : 0, lastReadOK ? 1 : 0,
+           (unsigned long)batteryMillivolts, batteryMeasurementValid ? 1 : 0,
+           usbPowerPresent ? 1 : 0);
   sendLine(line);
 }
 
@@ -576,6 +688,13 @@ void finishGasScan() {
 
 void setup() {
   Serial.begin(115200);
+#if !defined(_MSC_VER)
+  analogReference(AR_INTERNAL); // 0.6 V reference, gain 1/6: 0..3.6 V ADC input.
+  analogReadResolution(14);
+  analogOversampling(8);
+  analogSampleTime(40);
+  analogCalibrateOffset();
+#endif
   Bluefruit.begin();
   Bluefruit.setTxPower(4);
   char sensorName[24];
@@ -606,6 +725,7 @@ void setup() {
   Bluefruit.Advertising.start(0);
   Serial.print("BOOT gas-scan-v3 version=");Serial.print(SENSOR_FIRMWARE_VERSION);
   Serial.println("; 0x76; D21/D20; HP354 parallel; BLE DFU service");
+  nextBatteryMeasurement = millis();
   nextGasScan = millis() + 10000;  // 부팅 10초 후 첫 가스 스캔
   recoverSensor();
 #if !defined(_MSC_VER)
@@ -674,6 +794,7 @@ void serviceEnvironment(uint32_t now) {
 
 void loop() {
   const uint32_t now = millis();
+  serviceBatteryVoltage(now);
   if (now - lastHealth >= 10000) { lastHealth = now; sendHealth(); }
   if (!sensorReady) {
     if ((int32_t)(now - nextRecovery) >= 0) recoverSensor();

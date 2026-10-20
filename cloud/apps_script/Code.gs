@@ -266,6 +266,10 @@ function healthSnapshot(h, now, ageDelta) {
     'last_post_ms','last_redirect_ms','last_ack_ms','backlog_drained_ms'];
   numeric.forEach(k=>{if(typeof h[k]==='number'&&Number.isFinite(h[k])&&h[k]>=0)out[k]=h[k];});
   ['ble_connected','sensor_ok','spool_error','spool_full'].forEach(k=>{if(typeof h[k]==='boolean')out[k]=h[k];});
+  if(typeof h.usb_power==='boolean')out.usb_power=h.usb_power;
+  if(typeof h.battery_measurement_valid==='boolean')out.battery_measurement_valid=h.battery_measurement_valid;
+  if(h.battery_measurement_valid===true&&h.usb_power===false&&typeof h.battery_mv==='number')
+    out.battery_mv=number(h.battery_mv,2500,5500,'battery mV');
   if(['ENV','GAS','COOL','REC','LEGACY'].includes(h.sensor_mode))out.sensor_mode=h.sensor_mode;
   if(typeof h.environment_ok==='boolean')out.environment_ok=h.environment_ok;
   if(typeof h.gas_ok==='boolean')out.gas_ok=h.gas_ok;

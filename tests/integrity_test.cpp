@@ -59,6 +59,11 @@ int main(){
  Health h;assert(parseHealth("STAT,BID=1234ABCD,MS=1,FAIL=3,REC=1,TRY=1,TXERR=0,OK=0",h));assert(h.failures==3);
  assert(parseHealth("STAT,BID=1234ABCD,MS=2,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0",h));
  assert(h.mode==1&&h.envOK==1&&h.gasOK==0);
+ assert(parseHealth("STAT,BID=1234ABCD,MS=2,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0,BV=4090,BOK=1,USB=0",h));
+ assert(h.batteryKnown==1&&h.batteryMillivolts==4090&&h.usbPower==0);
+ assert(parseHealth("STAT,BID=1234ABCD,MS=2,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0,BV=0,BOK=0,USB=1",h));
+ assert(!h.batteryKnown&&h.usbPower);
+ assert(!parseHealth("STAT,BID=1234ABCD,MS=2,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0,BV=4090,BOK=1,USB=1",h));
  assert(!parseHealth("STAT,BID=1234ABCD,MS=2,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=NOPE,EOK=1,GOK=0",h));
  Sample s={};s.rx=1;s.t=25;seal(s);assert(intact(s));s.rx=2;assert(!intact(s));
  PendingBatch batch;batch.count=1;batch.samples[0]=s;

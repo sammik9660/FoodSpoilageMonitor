@@ -25,7 +25,9 @@ struct Frame {
   uint8_t version=2, step=0, gasIndex=0, measIndex=0, status=0;
 };
 struct Health { uint32_t boot, ms, failures, recoveries, attempts, txErrors, ok;
-  uint8_t mode=0, envOK=0, gasOK=0; }; // mode 0=legacy, 1=ENV, 2=GAS, 3=COOL, 4=REC
+  uint32_t batteryMillivolts=0;
+  uint8_t mode=0, envOK=0, gasOK=0, batteryKnown=0, usbPower=0;
+}; // mode 0=legacy, 1=ENV, 2=GAS, 3=COOL, 4=REC
 // On-disk v2 layout is immutable. A deployed gateway may still have these
 // unacknowledged chunks when the v3 firmware boots.
 struct LegacySample {
@@ -160,8 +162,15 @@ inline bool parseHealth(const char* p, Health& h) {
   else return false;
   uint32_t env=0,gas=0;
   if(!literal(p,",EOK=")||!integer(p,env)||env>1||
-     !literal(p,",GOK=")||!integer(p,gas)||gas>1||*p)return false;
-  h.envOK=(uint8_t)env;h.gasOK=(uint8_t)gas;return true;
+     !literal(p,",GOK=")||!integer(p,gas)||gas>1)return false;
+  h.envOK=(uint8_t)env;h.gasOK=(uint8_t)gas;
+  if(!*p)return true; // Existing sensor firmware has no battery fields.
+  uint32_t known=0,usb=0;
+  if(!literal(p,",BV=")||!integer(p,h.batteryMillivolts)||h.batteryMillivolts>5500||
+     !literal(p,",BOK=")||!integer(p,known)||known>1||
+     !literal(p,",USB=")||!integer(p,usb)||usb>1||*p)return false;
+  if((known&&(!h.batteryMillivolts||usb))||(!known&&h.batteryMillivolts))return false;
+  h.batteryKnown=(uint8_t)known;h.usbPower=(uint8_t)usb;return true;
 }
 struct Framer {
   char line[MAX_FRAME+1] = {};

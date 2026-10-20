@@ -1,6 +1,19 @@
 # 프로젝트 현재 상태
 
-갱신일: 2026-10-19. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
+갱신일: 2026-10-21. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
+
+## 2026-10-21 V1940 battery voltage integration (소스/빌드 검증)
+
+- 사용자 실기에서 LiPo 단독 VDDH/5 환산 4.09--4.10 V와 B+/B- 멀티미터 4.09 V가 일치했고 P0.04는 배터리 탈착에 반응하지 않았다. USB 연결 시 VDDH가 실제 배터리와 달라지는 것도 확인했다. 생산 nRF 2.0.7은 P0.04를 사용하지 않고 60초마다 VDDH/5를 읽으며, SoftDevice `sd_power_usbregstatus_get()`의 VBUS 감지 시 값을 배터리로 인정하지 않는다. OLED 정상 ENV 화면은 `BAT 4.09V`, USB 상태는 `BAT USB`, 무효 상태는 `BAT --.--V`로 표시한다. 잔량 %, 용량 및 충전 완료 판정은 추가하지 않았다.
+- 기존 newline/20-byte NUS의 `STAT` 끝에 선택적인 `BV/BOK/USB`만 추가했다. ESP 2.0.9/build 2026102101은 구형 STAT과 새 suffix를 모두 수용하고 battery 상태를 기존 health heartbeat로 전달한다. Apps Script `LIVE_V2`와 대시보드는 optional `battery_mv`를 표시하며 USB 전원일 때 배터리 전압을 숨긴다. ENV/gas 프레임, UID/ACK, SensorData/EnvironmentHistory, 88/120-byte SPIFFS 레코드와 DFU/OTA 형식은 변경하지 않았다. 따라서 battery health는 outage spool 이력으로 저장되지 않고 연결 복구 후 최신 상태로 다시 게시된다. 배포 순서는 새 suffix를 이해하는 ESP/Apps Script를 먼저, nRF를 나중에 적용한다.
+- 실제 소스를 포함한 MSVC sensor/integrity 및 gateway UI/spool/Wi-Fi/Legacy DFU/package 테스트, mock Sheets 36개, fingerprint 5개, DFU web/upload 및 OTA partition 테스트와 `git diff --check`가 통과했다. nRF core 1.7.0 `adafruit:nrf52:feather52840` 빌드는 Flash 162,596/815,104 bytes, RAM 16,584/237,568 bytes로 성공했다. ESP core 3.3.12의 16MB/custom OTA/OPI/CDC 설정 빌드는 Flash 1,559,591 bytes, RAM 65,504/327,680 bytes로 성공했고 생성 partition binary가 기존 NVS, otadata, app0 3MiB, SPIFFS 896KiB, coredump, app1 3MiB 배치를 유지함을 확인했다. 실제 생산 펌웨어 업로드, OLED/BLE/클라우드 end-to-end, USB 감지 전환과 장기 방전 정확도는 미검증이다.
+
+## 2026-10-21 V1940 battery ADC diagnostic (소스/빌드 준비)
+
+- 생산 펌웨어와 분리된 `battery_adc_diagnostic` 스케치를 추가했다. Feather target의 `PIN_VBAT`는 D20/P0.29이며 실제 V1940 장치에서 검증된 BME688 SCL과 충돌하므로 사용하지 않는다. P0.24는 nRF52840 SAADC 입력이 아니어서 읽지 않는다. P0.04/AIN2와 내부 VDDH/5만 14-bit, internal 0.6 V reference/gain 1/6, 8x oversampling, 40 us acquisition으로 느리게 출력한다.
+- 정품 nice!nano와 유사 clone 자료만으로 V1940의 실제 분압 배선·비율을 확정하지 않았다. 출력은 ADC 입력 전압과 VDDH 추정치이며 배터리 전압이나 잔량으로 표현하지 않는다. 본체 OLED/BLE/ESP/cloud 통합과 새 OTA/DFU 패키지는 실측 전까지 보류한다. 현재 장치 업로드와 실험 중 장치 접근은 수행하지 않았다.
+- Adafruit nRF52 core 1.7.0의 `adafruit:nrf52:feather52840` 대상으로 독립 스케치 컴파일이 통과했다(Flash 54,648/815,104 bytes, RAM 8,772/237,568 bytes). 첫 sandbox 시도는 Arduino15 격리, 다음 시도는 USB CDC core archive 캐시 때문에 실패했으며 core 제공 `Adafruit_TinyUSB.h`를 명시한 깨끗한 build에서 성공했다. 실제 ADC 값과 USB/충전 영향은 실기 전까지 미검증이다.
+- 배터리 단독 진단을 위해 독립 스케치에만 BLE NUS를 추가했다. `V1940-ADC-TEST`로 광고하며 연결·Notify 여부와 무관하게 5초 측정을 계속하고, 연결 시 P0.04 raw/input mV와 VDDH/5 raw/input mV/5배 VDDH 추정치를 newline 단위, 최대 20-byte write로 보낸다. 생산 `bme688_node.ino`, BLE 프로토콜과 기존 DFU ZIP은 변경하지 않았다. 동일 Feather/S140 환경의 BLE 진단 빌드는 통과했다(Flash 131,024/815,104 bytes, RAM 15,612/237,568 bytes). USB 및 LiPo 단독 BLE 실기는 미검증이다.
 
 ## 2026-10-20 live environment health heartbeat (소스/호스트 검증)
 
