@@ -270,6 +270,16 @@ function healthSnapshot(h, now, ageDelta) {
   if(typeof h.battery_measurement_valid==='boolean')out.battery_measurement_valid=h.battery_measurement_valid;
   if(h.battery_measurement_valid===true&&h.usb_power===false&&typeof h.battery_mv==='number')
     out.battery_mv=number(h.battery_mv,2500,5500,'battery mV');
+  if(h.battery_measurement_valid===true&&h.usb_power===false&&typeof h.battery_percent==='number')
+    out.battery_percent=number(h.battery_percent,0,100,'battery percent');
+  const batteryStates=['DEFAULT','COLLECTING','CALIBRATED','INSUFFICIENT_DATA','INVALID'];
+  if(batteryStates.includes(h.battery_calibration_state))
+    out.battery_calibration_state=h.battery_calibration_state;
+  if(typeof h.battery_calibrated==='boolean')out.battery_calibrated=h.battery_calibrated;
+  if(typeof h.battery_min_mv==='number')out.battery_min_mv=number(h.battery_min_mv,2500,5500,'battery min mV');
+  if(typeof h.battery_max_mv==='number')out.battery_max_mv=number(h.battery_max_mv,2500,5500,'battery max mV');
+  if(out.battery_min_mv!==undefined&&out.battery_max_mv!==undefined&&out.battery_max_mv<out.battery_min_mv)
+    throw Error('battery extrema order');
   if(['ENV','GAS','COOL','REC','LEGACY'].includes(h.sensor_mode))out.sensor_mode=h.sensor_mode;
   if(typeof h.environment_ok==='boolean')out.environment_ok=h.environment_ok;
   if(typeof h.gas_ok==='boolean')out.gas_ok=h.gas_ok;

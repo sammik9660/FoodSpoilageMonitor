@@ -2,6 +2,14 @@
 
 갱신일: 2026-10-21. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-21 battery estimate/calibration integration (소스/호스트 검증)
+
+- 사용자가 추가한 `Battery.h` 비선형 3.50--4.20 V 곡선과 OLED `B:n%` 표시를 기준으로 보존했다. 5-sample median, ENV-only 100 mV residence summaries, fixed endpoint를 바꾸지 않는 제한 보정, DEFAULT/COLLECTING/CALIBRATED/INSUFFICIENT_DATA/INVALID 상태를 추가했다. GAS/COOL/REC/USB 측정은 학습하지 않으며 보정값은 기본 곡선과 혼합 후 +/-10 percentage points로 제한한다. 이는 mAh, 정확한 SOC, 열화도나 충전 완료 측정이 아니다.
+- Adafruit nRF52 core 1.7.0의 기존 bonding InternalFS(0xED000, 28 KiB)를 재사용한다. 배터리 코드는 자동 포맷 API를 호출하지 않는다. version/CRC/generation을 가진 두 파일을 교대로 저장하며 첫 6 sample 이후, 상태·50 mV extremum·6시간 stable history 변화가 있어도 6시간보다 자주 쓰지 않는다. mount 불가·손상 시 default curve로 계속 동작한다. 실제 flash 저장·전원 차단 복구는 실기 미검증이다.
+- nRF version은 2.0.8, gateway는 2.0.10/build 2026102102로 구분했다. 기존 STAT `BV/BOK/USB` 뒤에 optional `BP/BS/MN/MX`를 추가했다. 최악 169 bytes로 gateway 200-byte frame 제한 안이며 20-byte NUS chunk/newline은 유지한다. gateway는 구형 STAT도 허용하고 새 상태를 health heartbeat로 전달한다. Apps Script와 dashboard는 nRF가 계산한 전압/퍼센트/보정 상태/min/max를 표시하며 웹에서 퍼센트를 재계산하지 않는다. USB는 `BAT USB`, 구형·누락 데이터는 `BAT --`다. SensorData/EnvironmentHistory, spool 및 UID/ACK 형식은 바꾸지 않았다.
+- MSVC battery/sensor/integrity/UI/spool/Wi-Fi/Legacy DFU host test, mock Sheets 36개, fingerprint/OTA partition/DFU web/access/upload tests와 `git diff --check`가 통과했다. Adafruit nRF52 core 1.7.0 Feather 빌드는 최종 소스보다 새 ELF/HEX를 생성해 성공했다(직전 요약: Flash 166,560 bytes, RAM 16,704 bytes; 마지막 작은 상태필드 변경 뒤 size tool 자체는 Windows DLL relocation으로 실행 불가). ESP compile은 같은 Codex 환경의 Windows tool process가 최종 ELF/BIN과 오류 출력을 남기지 못해 완료로 판정하지 않았다. 실제 OLED/BLE/cloud/persistence 동작은 아직 검증 전이다.
+- 잔여 기능 점검: NeoPixel은 BOOT/UPDATE blue, BLE red, Wi-Fi purple, cloud/backlog wait yellow, healthy green으로 이미 구현되어 있으며 부패 판정이 아니다. HP-354 complete fingerprint 추출기는 있으나 검증된 부패 모델/학습 데이터셋은 없다. session label은 ground truth가 아니므로 UI에 안전 판정을 추가하지 않았다. 다중 장치 cloud/UI, signed ESP OTA와 Legacy nRF DFU 경로는 기존 구현을 유지했고 두 번째 실제 장치 동시 운용은 미검증이다.
+
 ## 2026-10-21 V1940 battery voltage integration (소스/빌드 검증)
 
 - 사용자 실기에서 LiPo 단독 VDDH/5 환산 4.09--4.10 V와 B+/B- 멀티미터 4.09 V가 일치했고 P0.04는 배터리 탈착에 반응하지 않았다. USB 연결 시 VDDH가 실제 배터리와 달라지는 것도 확인했다. 생산 nRF 2.0.7은 P0.04를 사용하지 않고 60초마다 VDDH/5를 읽으며, SoftDevice `sd_power_usbregstatus_get()`의 VBUS 감지 시 값을 배터리로 인정하지 않는다. OLED 정상 ENV 화면은 `BAT 4.09V`, USB 상태는 `BAT USB`, 무효 상태는 `BAT --.--V`로 표시한다. 잔량 %, 용량 및 충전 완료 판정은 추가하지 않았다.

@@ -39,7 +39,7 @@ int main(){
  testUsbPowerPresent=true;measureBatteryVoltage();
  assert(!batteryMeasurementValid&&batteryMillivolts==0&&usbPowerPresent);
  testUsbPowerPresent=false;measureBatteryVoltage();sendHealth();
- assert(transmitted.find(",BV=")!=std::string::npos&&transmitted.find(",BOK=1,USB=0")!=std::string::npos);
+ assert(transmitted.find(",BV=")!=std::string::npos&&transmitted.find(",BOK=1,USB=0,BP=")!=std::string::npos);
  assert(Wire.sda==21&&Wire.scl==20&&profileCount==0&&sensorMode==MODE_ENV);
  assert((testGas0&BME68X_HCTRL_MSK)&&!(testGas1&BME68X_RUN_GAS_MSK));
  const uint32_t bootAt=testMillis;

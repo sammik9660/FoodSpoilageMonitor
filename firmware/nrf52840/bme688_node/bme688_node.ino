@@ -216,6 +216,11 @@
 #include <Adafruit_SSD1306.h>
 #endif
 #include "Battery.h"
+#if !defined(_MSC_VER)
+#include <Adafruit_LittleFS.h>
+#include <InternalFileSystem.h>
+using namespace Adafruit_LittleFS_Namespace;
+#endif
 
 constexpr uint8_t BME_ADDRESS = 0x76;
 constexpr uint8_t OLED_ADDRESS = 0x3C;
@@ -235,7 +240,7 @@ constexpr uint32_t ENV_CONVERSION_TIMEOUT_MS = 200;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.7";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.8";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 bme68xData lastEnvData={};
@@ -253,6 +258,11 @@ uint32_t recoveryAttempts = 0, recoveries = 0, txErrors = 0;
 uint32_t nextMeasurement = 0, nextRecovery = 0, lastHealth = 0;
 uint32_t nextBatteryMeasurement = 0, nextUsbPowerCheck = 0, batteryMillivolts = 0;
 battery::Tracker batteryTracker;
+#if !defined(_MSC_VER)
+bool batteryStorageReady = false;
+constexpr char BATTERY_STATE_A[] = "/battery-a.bin";
+constexpr char BATTERY_STATE_B[] = "/battery-b.bin";
+#endif
 uint32_t lastSensorField = 0;
 uint32_t sensorReadyAt = 0;
 uint32_t nextEnvMeasurement = 0, envConversionAt = 0, nextGasScan = 0;
@@ -270,6 +280,11 @@ uint8_t lastEnvMeasurementIndex=0;
 bool recoveringGas = false;
 enum SensorMode : uint8_t { MODE_ENV, MODE_GAS, MODE_COOL, MODE_REC };
 SensorMode sensorMode = MODE_REC;
+
+battery::LoadMode batteryLoadMode() {
+  return sensorMode==MODE_ENV ? battery::LOAD_ENV : sensorMode==MODE_GAS ? battery::LOAD_GAS :
+         sensorMode==MODE_COOL ? battery::LOAD_COOL : battery::LOAD_REC;
+}
 #if !defined(_MSC_VER)
 uint32_t lastOledRefresh = 0;
 bool oledReady = false;
@@ -334,9 +349,58 @@ void measureBatteryVoltage() {
 
   // 유효한 배터리 전압을 측정했을 때만 기록
   if (batteryMeasurementValid) {
-    batteryTracker.observe(batteryMillivolts);
+    batteryTracker.observe(batteryMillivolts, millis(), batteryLoadMode());
   }
 }
+
+#if !defined(_MSC_VER)
+bool readBatteryState(const char* path, battery::PersistedState& state) {
+  File file(path, FILE_O_READ, InternalFS);
+  if (!file || file.size() != sizeof(state)) { if (file) file.close(); return false; }
+  const bool readOK = file.read(&state, sizeof(state)) == (int)sizeof(state);
+  file.close(); return readOK && battery::intact(state);
+}
+
+void initializeBatteryStorage() {
+  // Bluefruit.begin() has already mounted the core's bonding filesystem.
+  // Do not call InternalFS.begin() here: that BSP API formats on mount failure.
+  batteryStorageReady = InternalFS.exists("/");
+  if (!batteryStorageReady) {
+    Serial.println("BAT persistence disabled: existing InternalFS unavailable; no format requested");
+    return;
+  }
+  battery::PersistedState a, b;const bool aOK=readBatteryState(BATTERY_STATE_A,a);
+  const bool bOK=readBatteryState(BATTERY_STATE_B,b);
+  const battery::PersistedState* newest = aOK&&bOK ? (a.generation>=b.generation?&a:&b) : aOK?&a:bOK?&b:nullptr;
+  if (newest) {
+    batteryTracker.restore(*newest);
+    Serial.print("BAT state restored generation=");Serial.println(newest->generation);
+  } else if (InternalFS.exists(BATTERY_STATE_A) || InternalFS.exists(BATTERY_STATE_B)) {
+    batteryTracker.state=battery::INVALID;
+    Serial.println("BAT state invalid; default curve retained");
+  } else Serial.println("BAT state new; default curve retained");
+}
+
+bool writeBatteryState(const char* path, const battery::PersistedState& state) {
+  // Alternate slots: a power loss cannot invalidate the previously verified slot.
+  if (InternalFS.exists(path) && !InternalFS.remove(path)) return false;
+  File file(path, FILE_O_WRITE, InternalFS);
+  if (!file) return false;
+  const bool wrote=file.write((const uint8_t*)&state,sizeof(state))==sizeof(state);
+  file.flush();file.close();if(!wrote)return false;
+  battery::PersistedState check;return readBatteryState(path,check)&&check.generation==state.generation;
+}
+
+void serviceBatteryStorage(uint32_t now) {
+  if (!batteryStorageReady || !batteryTracker.shouldPersist(now)) return;
+  battery::PersistedState state=batteryTracker.snapshot();
+  const char* path=(state.generation&1)?BATTERY_STATE_A:BATTERY_STATE_B;
+  if(writeBatteryState(path,state)){
+    batteryTracker.persisted(now,state.generation);
+    Serial.print("BAT state saved generation=");Serial.println(state.generation);
+  } else Serial.println("BAT state save failed; previous slot retained");
+}
+#endif
 
 void serviceBatteryVoltage(uint32_t now) {
   if ((int32_t)(now - nextUsbPowerCheck) >= 0) {
@@ -438,7 +502,7 @@ void updateOled(uint32_t now) {
       snprintf(line, sizeof(line),
                "hPa:%.1f B:%u%%",
                lastEnvData.pressure / 100.0,
-               battery::percent(batteryMillivolts));
+               batteryTracker.estimatedPercent());
 
     } else {
       snprintf(line, sizeof(line),
@@ -548,17 +612,21 @@ bool sendLine(const char* line) {
 }
 
 void sendHealth() {
-  char line[192];
+  char line[224];
   const char* mode=sensorMode==MODE_GAS?"GAS":sensorMode==MODE_COOL?"COOL":
                    sensorMode==MODE_REC?"REC":"ENV";
-  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u,BV=%lu,BOK=%u,USB=%u",
+  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u,BV=%lu,BOK=%u,USB=%u,BP=%u,BS=%u,MN=%lu,MX=%lu",
            (unsigned long)bootId, (unsigned long)millis(), (unsigned long)failures,
            (unsigned long)recoveries, (unsigned long)recoveryAttempts,
            (unsigned long)txErrors, sensorMode==MODE_ENV ? (envReadOK ? 1 : 0) :
            sensorMode==MODE_GAS ? (lastReadOK ? 1 : 0) : 0, mode,
            envReadOK ? 1 : 0, lastReadOK ? 1 : 0,
            (unsigned long)batteryMillivolts, batteryMeasurementValid ? 1 : 0,
-           usbPowerPresent ? 1 : 0);
+           usbPowerPresent ? 1 : 0,
+           batteryMeasurementValid ? batteryTracker.estimatedPercent() : 0,
+           (unsigned)batteryTracker.state,
+           (unsigned long)(batteryTracker.minMv==UINT32_MAX?0:batteryTracker.minMv),
+           (unsigned long)batteryTracker.maxMv);
   sendLine(line);
 }
 
@@ -696,6 +764,9 @@ void setup() {
   analogCalibrateOffset();
 #endif
   Bluefruit.begin();
+#if !defined(_MSC_VER)
+  initializeBatteryStorage();
+#endif
   Bluefruit.setTxPower(4);
   char sensorName[24];
   snprintf(sensorName,sizeof(sensorName),"BME688-%08lx%08lx",
@@ -795,6 +866,9 @@ void serviceEnvironment(uint32_t now) {
 void loop() {
   const uint32_t now = millis();
   serviceBatteryVoltage(now);
+#if !defined(_MSC_VER)
+  serviceBatteryStorage(now);
+#endif
   if (now - lastHealth >= 10000) { lastHealth = now; sendHealth(); }
   if (!sensorReady) {
     if ((int32_t)(now - nextRecovery) >= 0) recoverSensor();

@@ -214,18 +214,19 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  const ctx={document:{getElementById:element},google:{script:{run:runner}},setInterval(){},setTimeout(){},Number,String,JSON,encodeURIComponent,Map,Date};
  vm.createContext(ctx);vm.runInContext(script,ctx);
  assert(element('panel-'+a)&&element('panel-'+b));
- ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_mv:4090,battery_measurement_valid:true,usb_power:false},
+ ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_mv:4090,battery_percent:89,battery_calibration_state:'COLLECTING',battery_min_mv:3600,battery_max_mv:4150,battery_measurement_valid:true,usb_power:false},
   recording:{state:'STOPPED',session_id:null,download_session_id:'EXP-recent',download_experiment_label:'바나나껍데기',download_started_at:e.now(),download_kind:'LATEST'}});
  assert.equal(element('state-'+a).textContent,'STALE');
  assert.equal(element('values-'+a).textContent,'24.50 °C · 47.25 % · 1002.50 hPa');
- assert.equal(element('battery-'+a).textContent,'BAT 4.09 V');
+ assert.equal(element('battery-'+a).textContent,'BAT 4.09 V · 89%');
+ assert(element('battery-'+a).title.includes('COLLECTING'));
  assert.equal(element('age-'+a).textContent,'Last environment sample: 20.0 s ago');
  assert.equal(element('recording-'+a).textContent,'실험 종료됨');assert.equal(element('sessionName-'+a).textContent,'바나나껍데기');
  assert(element('sessionDate-'+a).textContent.startsWith('실험 시작: '));assert.equal(element('sessionId-'+a).textContent,'EXP-recent');
  element('page-'+a).value='2';ctx.csvLinks(a);assert(element('all-'+a).href.includes('offset=10000'));assert(element('sessionCsv-'+a).href.includes('offset=10000'));
  ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_measurement_valid:false,usb_power:true},
   recording:{state:'UNKNOWN',session_id:null,download_session_id:null}});
- assert.equal(element('battery-'+a).textContent,'Battery voltage: unavailable (USB power connected)');
+ assert.equal(element('battery-'+a).textContent,'BAT USB');
  assert.equal(element('start-'+a).disabled,true);assert.equal(element('stop-'+a).disabled,true);
  ctx.control(a,true);assert.equal(e.api.getDashboard(a).recording.state,'RECORDING');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
  assert.equal(element('message-'+a).textContent,'새 실험을 시작했습니다.');
@@ -307,16 +308,20 @@ test('health-only heartbeat refreshes live environment without storing history',
 });
 test('battery health remains optional and USB-powered VDDH is not exposed as battery voltage',()=>{
  const e=environment(),a='111111111111';
- e.api.ingest({version:3,device_id:a,samples:[],health:{battery_mv:4090,
+ e.api.ingest({version:3,device_id:a,samples:[],health:{battery_mv:4090,battery_percent:89,
+  battery_calibration_state:'COLLECTING',battery_calibrated:false,battery_min_mv:3600,battery_max_mv:4150,
   battery_measurement_valid:true,usb_power:false}});
  let h=e.api.getDashboard(a).health;assert.equal(h.battery_mv,4090);
  assert.equal(h.battery_measurement_valid,true);assert.equal(h.usb_power,false);
+ assert.equal(h.battery_percent,89);assert.equal(h.battery_calibration_state,'COLLECTING');
  e.api.ingest({version:3,device_id:a,samples:[],health:{battery_mv:5000,
   battery_measurement_valid:false,usb_power:true}});
  h=e.api.getDashboard(a).health;assert.equal(h.usb_power,true);
  assert.equal(h.battery_measurement_valid,false);assert.equal(h.battery_mv,undefined);
  assert.throws(()=>e.api.ingest({version:3,device_id:a,samples:[],health:{battery_mv:6000,
   battery_measurement_valid:true,usb_power:false}}),/battery mV/);
+ assert.throws(()=>e.api.ingest({version:3,device_id:a,samples:[],health:{battery_min_mv:4100,
+  battery_max_mv:3600,battery_measurement_valid:false,usb_power:true}}),/battery extrema order/);
 });
 test('routine heartbeats become lock-free while data and OTA state changes stay serialized',()=>{
  const e=environment(),a='111111111111',heartbeat={version:3,device_id:a,sensor_id:'a1b2c3d4e5f60708',samples:[],
