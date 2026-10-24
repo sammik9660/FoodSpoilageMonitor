@@ -228,8 +228,10 @@ constexpr int16_t OLED_WIDTH = 128;
 constexpr int16_t OLED_HEIGHT = 32;
 constexpr int8_t OLED_RESET_PIN = -1;
 constexpr uint32_t OLED_REFRESH_INTERVAL_MS = 750;
-constexpr uint32_t ENV_INTERVAL_MS = 2000;
+constexpr uint32_t ENV_INTERVAL_MS = 120000;
 constexpr uint32_t LOOP_IDLE_MS = 10;
+constexpr uint32_t LOOP_LIVENESS_CHECK_MS = 30000;
+constexpr uint32_t LOOP_LIVENESS_TIMEOUT_MS = 120000;
 constexpr uint32_t BATTERY_INTERVAL_MS = 60000;
 constexpr uint32_t USB_POWER_CHECK_INTERVAL_MS = 1000;
 constexpr uint32_t ADC_FULL_SCALE_MV = 3600;
@@ -238,16 +240,19 @@ constexpr uint32_t GAS_SCAN_INTERVAL_MS = 600000;
 constexpr uint32_t GAS_SCAN_TIMEOUT_MS = 60000;
 constexpr uint32_t COOLING_MS = 60000; // provisional stabilization delay; validate on hardware
 constexpr uint32_t ENV_CONVERSION_TIMEOUT_MS = 200;
+constexpr uint32_t ENV_FAILURE_RETRY_MS = 5000;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.9";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.10";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 bme68xData lastEnvData={};
 #if !defined(_MSC_VER)
 BLEDfu bledfu; // Buttonless entry into the existing Adafruit legacy BLE DFU bootloader.
 BLEDis bledis; // Standard Device Information Service exposes the firmware version without changing NUS frames.
+SoftwareTimer loopLivenessTimer; // FreeRTOS timer; it does not persist into the DFU bootloader.
+volatile uint32_t loopHeartbeatAt = 0;
 #endif
 BLEUart bleuart;
 #if !defined(_MSC_VER)
@@ -282,6 +287,21 @@ uint8_t lastEnvMeasurementIndex=0;
 bool recoveringGas = false;
 enum SensorMode : uint8_t { MODE_ENV, MODE_GAS, MODE_COOL, MODE_REC };
 SensorMode sensorMode = MODE_REC;
+
+inline bool loopLivenessExpired(uint32_t now, uint32_t heartbeat) {
+  return (uint32_t)(now - heartbeat) >= LOOP_LIVENESS_TIMEOUT_MS;
+}
+
+#if !defined(_MSC_VER)
+void loopLivenessCallback(TimerHandle_t timer) {
+  (void)timer;
+  // The bundled Wire implementation can wait forever for a TWIM event.  The
+  // timer task has higher priority than Arduino loop(), so recover the whole
+  // application if loop progress stops.  A software timer disappears on the
+  // buttonless reset into the existing Legacy DFU bootloader.
+  if (loopLivenessExpired(millis(), loopHeartbeatAt)) NVIC_SystemReset();
+}
+#endif
 
 battery::LoadMode batteryLoadMode() {
   return sensorMode==MODE_ENV ? battery::LOAD_ENV : sensorMode==MODE_GAS ? battery::LOAD_GAS :
@@ -337,14 +357,12 @@ void measureBatteryVoltage() {
     usbPowerPresent = true;
     batteryMeasurementValid = false;
     batteryMillivolts = 0;
-    batteryMeasuredAt = millis();
     return;
   }
   usbPowerPresent = usb;
   if (usb) {
     batteryMeasurementValid = false;
     batteryMillivolts = 0;
-    batteryMeasuredAt = millis();
     return;
   }
   const uint32_t mv = vddhMillivoltsFromRaw(readVddhRaw());
@@ -414,7 +432,6 @@ void serviceBatteryVoltage(uint32_t now) {
     const bool wasUsb = usbPowerPresent;
     if (!readUsbPowerPresent(usb)) usb = true;
     usbPowerPresent = usb;
-    if (usb != wasUsb) batteryMeasuredAt = now;
     if (usb) {
       batteryMeasurementValid = false;
       batteryMillivolts = 0;
@@ -431,12 +448,16 @@ void serviceBatteryVoltage(uint32_t now) {
 void formatUnavailableSensorOledLine(char* out, size_t outSize,
                                      bool usbPresent, bool batteryValid,
                                      uint8_t batteryPercent) {
-  if (usbPresent)
-    snprintf(out, outSize, "P:----.- B:USB");
-  else if (batteryValid)
+  if (usbPresent) {
+    if (batteryPercent <= 100)
+      snprintf(out, outSize, "P:----.- U:%u%%", batteryPercent);
+    else
+      snprintf(out, outSize, "P:----.- B:USB");
+  } else if (batteryValid) {
     snprintf(out, outSize, "P:----.- B:%u%%", batteryPercent);
-  else
+  } else {
     snprintf(out, outSize, "P:----.- B:--%%");
+  }
 }
 
 #if !defined(_MSC_VER)
@@ -511,9 +532,11 @@ void updateOled(uint32_t now) {
     oled.println(line);
     
     if (usbPowerPresent) {
-      snprintf(line, sizeof(line),
-               "hPa:%.1f B:USB",
-               lastEnvData.pressure / 100.0);
+      if (batteryTracker.filteredMv)
+        snprintf(line, sizeof(line), "hPa:%.1f U:%u%%", lastEnvData.pressure / 100.0,
+                 batteryTracker.estimatedPercent());
+      else
+        snprintf(line, sizeof(line), "hPa:%.1f B:USB", lastEnvData.pressure / 100.0);
 
     } else if (batteryMeasurementValid) {
       snprintf(line, sizeof(line),
@@ -533,6 +556,7 @@ void updateOled(uint32_t now) {
     if (!sensorReady) {
       formatUnavailableSensorOledLine(line, sizeof(line), usbPowerPresent,
                                       batteryMeasurementValid,
+                                      usbPowerPresent && !batteryTracker.filteredMv ? 255 :
                                       batteryTracker.estimatedPercent());
       oled.println(line);
     } else
@@ -638,7 +662,7 @@ void sendHealth() {
   char line[224];
   const char* mode=sensorMode==MODE_GAS?"GAS":sensorMode==MODE_COOL?"COOL":
                    sensorMode==MODE_REC?"REC":"ENV";
-  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u,BV=%lu,BOK=%u,USB=%u,BP=%u,BS=%u,MN=%lu,MX=%lu,BM=%lu",
+  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u,BV=%lu,BOK=%u,USB=%u,BP=%u,BS=%u,MN=%lu,MX=%lu,BM=%lu,BLP=%u",
            (unsigned long)bootId, (unsigned long)millis(), (unsigned long)failures,
            (unsigned long)recoveries, (unsigned long)recoveryAttempts,
            (unsigned long)txErrors, sensorMode==MODE_ENV ? (envReadOK ? 1 : 0) :
@@ -650,7 +674,8 @@ void sendHealth() {
            (unsigned)batteryTracker.state,
            (unsigned long)(batteryTracker.minMv==UINT32_MAX?0:batteryTracker.minMv),
            (unsigned long)batteryTracker.maxMv,
-           (unsigned long)batteryMeasuredAt);
+           (unsigned long)batteryMeasuredAt,
+           batteryTracker.filteredMv ? batteryTracker.estimatedPercent() : 255);
   sendLine(line);
 }
 
@@ -794,6 +819,9 @@ void setup() {
   // second WFE loop that could interfere with SoftDevice/BLE scheduling.
   const uint32_t powerModeResult=sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
   Serial.print("POWER System ON low-power mode result=");Serial.println(powerModeResult);
+  loopHeartbeatAt=millis();
+  loopLivenessTimer.begin(LOOP_LIVENESS_CHECK_MS,loopLivenessCallback);
+  loopLivenessTimer.start();
 #endif
 #if !defined(_MSC_VER)
   initializeBatteryStorage();
@@ -837,6 +865,7 @@ void setup() {
 
 void environmentFailure(const char* reason) {
   ++failures;++envFailures;++envConsecutiveFailures;envReadOK=false;
+  nextEnvMeasurement=millis()+ENV_FAILURE_RETRY_MS;
   Serial.print("SENSOR ERROR environment ");Serial.println(reason);
   if(envConsecutiveFailures>=FAILURE_THRESHOLD) {
     sensorReady=false;sensorMode=MODE_REC;envConversionPending=false;
@@ -847,11 +876,8 @@ void environmentFailure(const char* reason) {
 
 void serviceEnvironment(uint32_t now) {
   if(!envConversionPending) {
-    if(!recoveryPending && (int32_t)(now-nextGasScan)>=0) {
-      if(!startGasScan()){Serial.println("SENSOR ERROR start gas scan");recoveringGas=true;recoverSensor();}
-      return;
-    }
-    if((int32_t)(now-nextEnvMeasurement)<0)return;
+    const bool gasDue=!recoveryPending && (int32_t)(now-nextGasScan)>=0;
+    if(!gasDue && (int32_t)(now-nextEnvMeasurement)<0)return;
     nextEnvMeasurement=now+ENV_INTERVAL_MS; // start-to-start; never catch up in a burst
     bme.setOpMode(BME68X_FORCED_MODE); // heater remains disabled in CTRL_GAS_0/1
     if(bme.checkStatus()==BME68X_ERROR){environmentFailure("forced mode");return;}
@@ -892,10 +918,19 @@ void serviceEnvironment(uint32_t now) {
     data.temperature,data.humidity,hpa);
   if(n<=0 || n>=(int)sizeof(frame)){++txErrors;Serial.println("ERROR BLE environment frame overflow");return;}
   if(sendLine(frame)){Serial.print("TX ");Serial.println(frame);}
+  // A gas scan always follows a just-completed heater-off T/H/P conversion.
+  // nextGasScan is advanced only by startGasScan(), so a failed pre-scan ENV
+  // conversion remains due and is retried through ENV_FAILURE_RETRY_MS.
+  if(!recoveryPending && (int32_t)(millis()-nextGasScan)>=0) {
+    if(!startGasScan()){Serial.println("SENSOR ERROR start gas scan");recoveringGas=true;recoverSensor();}
+  }
 }
 
 void loop() {
   const uint32_t now = millis();
+#if !defined(_MSC_VER)
+  loopHeartbeatAt = now;
+#endif
   serviceBatteryVoltage(now);
 #if !defined(_MSC_VER)
   serviceBatteryStorage(now);

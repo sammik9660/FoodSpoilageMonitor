@@ -27,7 +27,7 @@ struct Frame {
 struct Health { uint32_t boot, ms, failures, recoveries, attempts, txErrors, ok;
   uint32_t batteryMillivolts=0, batteryMinMv=0, batteryMaxMv=0, batteryMeasuredAt=0;
   uint8_t mode=0, envOK=0, gasOK=0, batteryKnown=0, usbPower=0;
-  uint8_t batteryPercent=0, batteryState=0, batteryExtended=0;
+  uint8_t batteryPercent=0, batteryState=0, batteryExtended=0, batteryLastPercent=255;
 }; // mode 0=legacy, 1=ENV, 2=GAS, 3=COOL, 4=REC
 // On-disk v2 layout is immutable. A deployed gateway may still have these
 // unacknowledged chunks when the v3 firmware boots.
@@ -182,7 +182,12 @@ inline bool parseHealth(const char* p, Health& h) {
   h.batteryPercent=(uint8_t)pct;h.batteryState=(uint8_t)state;
   h.batteryMinMv=minMv;h.batteryMaxMv=maxMv;h.batteryExtended=1;
   if(!*p)return true; // Extended firmware before battery measurement uptime.
-  return literal(p,",BM=")&&integer(p,h.batteryMeasuredAt)&&!*p;
+  if(!literal(p,",BM=")||!integer(p,h.batteryMeasuredAt))return false;
+  if(!*p)return true;
+  uint32_t lastPercent=0;
+  if(!literal(p,",BLP=")||!integer(p,lastPercent)||lastPercent>255||*p)return false;
+  h.batteryLastPercent=(uint8_t)lastPercent;
+  return lastPercent<=100 || lastPercent==255;
 }
 struct Framer {
   char line[MAX_FRAME+1] = {};

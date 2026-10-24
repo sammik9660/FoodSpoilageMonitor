@@ -6,7 +6,8 @@
 
 ## 현재 동작과 적용한 최적화
 
-- 환경 측정은 BME688 히터를 끈 forced mode로 2초마다 실행한다.
+- 환경 측정은 BME688 히터를 끈 forced mode로 120초마다 실행한다. 가스 시각에는
+  최신 forced T/H/P 변환을 한 번 더 성공시킨 뒤 HP-354를 시작한다.
 - HP-354 parallel gas scan은 10분마다 실행하며 프로파일, 140 ms polling, 유효성
   검사를 그대로 유지한다. 히터가 켜지는 이 구간이 평균 전력의 중요한 부분이다.
 - BLE NUS의 20-byte chunk/newline 형식과 연결 유지, 10초 STAT, 재연결 광고를
@@ -15,7 +16,7 @@
   System ON variable-latency low-power 모드를 고정한다. nRF52840은 원래 이 모드가
   기본값이므로, 이는 다른 코드가 Constant Latency를 선택하지 않았음을 명시하고
   진단하는 방어적 설정이다. 그 자체의 절감량은 아직 측정하지 않았다.
-- 센서 loop의 유휴 delay를 5 ms에서 10 ms로 늘렸다. 2초 ENV 및 140 ms gas
+- 센서 loop의 유휴 delay를 5 ms에서 10 ms로 늘렸다. 120초 ENV 및 140 ms gas
   polling보다 충분히 짧으며, 불필요한 loop task wakeup을 줄인다. BLE radio와
   callbacks는 SoftDevice/FreeRTOS가 별도로 처리한다.
 - 설치된 Adafruit core는 `configUSE_TICKLESS_IDLE=1`이며 idle에서
@@ -35,7 +36,7 @@ event/interrupt가 있으면 CPU를 깨운다.
 
 System OFF는 core와 대부분의 주변장치를 끄고 진행 중인 BLE 연결과 작업을 끝낸다.
 깨울 수 있는 원인은 GPIO/LPCOMP/NFC field/VBUS/reset이며 wake는 reset으로 처리된다.
-내부 RTC만으로 2초마다 깨어 ENV를 측정하고 같은 BLE 연결을 유지하는 현재 요구에는
+내부 RTC만으로 120초마다 깨어 ENV를 측정하고 같은 BLE 연결을 유지하는 현재 요구에는
 맞지 않는다. 따라서 현재 펌웨어에는 적용하지 않았다. System OFF는 장기 보관 모드,
 외부 RTC/alarm 또는 사용자가 누르는 wake pin을 갖춘 별도 실험으로 다룬다.
 
@@ -43,7 +44,7 @@ System OFF는 core와 대부분의 주변장치를 끄고 진행 중인 BLE 연�
 
 연결 간격이 길고 slave latency가 크면 radio wakeup 횟수를 줄일 수 있지만, 실제 간격은
 central(ESP32)과 협상되며 전송 지연·supervision timeout·재연결에 영향을 준다. 현재
-2초 ENV와 DFU/NUS 호환성을 실기 검증하지 않은 상태에서 연결 파라미터를 바꾸지 않았다.
+120초 ENV와 DFU/NUS 호환성을 실기 검증하지 않은 상태에서 연결 파라미터를 바꾸지 않았다.
 향후에는 현재 negotiated interval/latency를 먼저 기록하고 30/50/100 ms 후보를 같은
 RSSI 조건에서 비교한다. Nordic 문서는 100 ms 연결 간격에서 peripheral link 1개와
 양방향 packet 1개인 예의 CPU 가용 시간이 99% 이상이라고 설명하지만, 이는 보드 전체
@@ -86,7 +87,7 @@ LiPo 입력 경로가 허용하는 전압을 먼저 확인하고, PPK2 Source Me
 설정한다.
 
 1. 기존 펌웨어와 변경 펌웨어를 같은 보드, 공급 전압, RSSI, ESP32 위치에서 비교한다.
-2. 최소 20분을 기록해 idle, 2초 ENV, 10분 gas scan을 모두 포함한다.
+2. 최소 30분을 기록해 idle, 120초 ENV, 10분 gas scan을 여러 번 포함한다.
 3. 평균/peak/누적 charge와 BLE reconnect 횟수를 함께 저장한다.
 4. OLED/LED를 포함한 실제 사용 상태와 표시를 끈 실험 상태를 별도 기록한다.
 5. gas scan이 포함되지 않은 짧은 구간만으로 하루 수명을 외삽하지 않는다.

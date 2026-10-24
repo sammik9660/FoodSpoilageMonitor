@@ -226,9 +226,10 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  assert.equal(element('recording-'+a).textContent,'실험 종료됨');assert.equal(element('sessionName-'+a).textContent,'바나나껍데기');
  assert(element('sessionDate-'+a).textContent.startsWith('실험 시작: '));assert.equal(element('sessionId-'+a).textContent,'EXP-recent');
  element('page-'+a).value='2';ctx.csvLinks(a);assert(element('all-'+a).href.includes('offset=10000'));assert(element('sessionCsv-'+a).href.includes('offset=10000'));
- ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_measurement_valid:false,usb_power:true},
+ ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_measurement_valid:false,usb_power:true,battery_last_percent:89},
   recording:{state:'UNKNOWN',session_id:null,download_session_id:null}});
- assert.equal(element('battery-'+a).textContent,'BAT USB');
+ assert.equal(element('battery-'+a).textContent,'BAT USB · last 89%');
+ assert.match(element('battery-'+a).title,/마지막 배터리 단독 추정치/);
  assert.equal(element('start-'+a).disabled,true);assert.equal(element('stop-'+a).disabled,true);
  ctx.control(a,true);assert.equal(e.api.getDashboard(a).recording.state,'RECORDING');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
  assert.equal(element('message-'+a).textContent,'새 실험을 시작했습니다.');
@@ -356,6 +357,16 @@ test('stale gas age is not data corruption and integrity causes remain explicit'
  d=e.api.getDashboard(a);assert.equal(d.state,'DATA BUFFER FULL');
  e.api.ingest({version:3,device_id:a,samples:[],health:{...base,spool_error:true}});
  d=e.api.getDashboard(a);assert.equal(d.state,'DATA STORAGE ERROR');
+});
+test('120-second environment cadence does not become stale while cloud transport stays fresh',()=>{
+ const e=environment(),a='111111111111',health={sensor_mode:'ENV',environment_ok:true,sensor_ok:true,
+  ble_connected:true,environment:{t:25,h:50,p:1000,age_ms:119000}};
+ e.api.ingest({version:3,device_id:a,samples:[],health});
+ assert.equal(e.api.getDashboard(a).state,'LIVE / ONLINE');
+ e.setTime(e.now()+32000);
+ e.api.ingest({version:3,device_id:a,samples:[],health:{...health,environment:undefined}});
+ assert.equal(e.api.getDashboard(a).state,'STALE');
+ e.setTime(e.now()+16000);assert.equal(e.api.getDashboard(a).state,'STALE / CLOUD CONTACT UNKNOWN');
 });
 test('routine heartbeats become lock-free while data and OTA state changes stay serialized',()=>{
  const e=environment(),a='111111111111',heartbeat={version:3,device_id:a,sensor_id:'a1b2c3d4e5f60708',samples:[],

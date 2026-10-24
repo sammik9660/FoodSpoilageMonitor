@@ -19,13 +19,14 @@
 | 기능 | 구현 내용 | 검증 상태 |
 |---|---|---|
 | 보드와 I²C | V1940 Pro Micro nRF52840/nice!nano V2 호환 보드를 Adafruit Feather nRF52840 Express variant로 빌드한다. `Wire.setPins(21, 20)`으로 D21/P0.31 SDA와 D20/P0.29 SCL을 사용한다. | 배선·BME688·OLED 실기 검증 |
-| BME688 환경 측정 | 주소 `0x76`, T/H/P oversampling 8X/2X/4X, IIR 3, 히터 OFF forced mode로 약 2초마다 측정한다. | 실기 검증 |
-| HP-354 가스 스캔 | Bosch BME68x 고정본과 10단계 parallel heater profile을 사용한다. 현재 소스의 시도 주기는 10분이며 140 ms polling, 60초 timeout/cooling을 적용한다. | 다중 gas step 수집·클라우드 저장 실기 검증. 현재 주기 조합의 장기 시험은 별도 |
+| BME688 환경 측정 | 주소 `0x76`, T/H/P oversampling 8X/2X/4X, IIR 3, 히터 OFF forced mode로 약 120초마다 측정한다. 실패는 5초 간격으로 재시도한다. | 이전 2초 주기는 실기 검증. 120초 주기는 자동 검증, 실기 미검증 |
+| HP-354 가스 스캔 | Bosch BME68x 고정본과 10단계 parallel heater profile을 사용한다. 현재 소스의 시도 주기는 10분이며 직전 forced T/H/P 성공 후 시작한다. 140 ms polling, 60초 timeout/cooling을 적용한다. | 다중 gas step 수집·클라우드 저장 실기 검증. 현재 주기 조합의 장기 시험은 별도 |
 | 무효 측정 처리 | `GASM_VALID=0` dummy 변환은 대기로 처리하고 HEAT_STAB, 유한값, 양수 gas resistance를 만족한 실제 step만 전송한다. 성공한 측정만 sequence를 증가시키며 연속 실패 시 복구/backoff를 수행한다. | 소스·호스트 테스트 검증, 장애 복구는 과거 실기 기록 존재 |
 | OLED | 128×32 OLED에 온도·습도·기압, 동작 상태와 배터리 정보를 표시한다. OLED가 없어도 측정과 BLE는 계속한다. | 기본 표시 실기 검증. 최신 통합 배터리 표시는 현장 재검증 필요 |
-| 배터리 전압 | 내부 VDDH/5 ADC를 14-bit로 읽어 mV 정수로 관리한다. USB 전원 상태에서는 배터리 전압으로 단정하지 않는다. | 독립 진단에서 배터리 단독 VDDH와 멀티미터 일치 실기 검증 |
+| 배터리 전압 | 내부 VDDH/5 ADC를 14-bit로 읽어 mV 정수로 관리한다. USB 전원 상태에서는 배터리 전압으로 단정하지 않으며 마지막 runtime 배터리 단독 추정치만 `last`로 표시할 수 있다. | 독립 진단에서 배터리 단독 VDDH와 멀티미터 일치 실기 검증. USB 중 실제 충전율 측정은 미지원 |
 | 배터리 잔량 추정 | 4.20–3.50 V 비선형 곡선, 5-sample median과 제한된 자가 보정 상태를 사용한다. `/battery-a.bin`, `/battery-b.bin` 교대 저장에 version, generation, CRC를 둔다. 실제 mAh 측정이나 정밀 SOC가 아니다. | 자동 테스트 통과. 최신 OLED→BLE→클라우드 통합은 실기 미검증 |
-| System ON 저전력 | Adafruit core의 FreeRTOS tickless idle/SoftDevice event wait를 재사용하고 variable-latency low-power mode를 명시한다. loop idle은 10 ms이며 ENV 2초/HP-354 10분 주기는 유지한다. | 소스·호스트 검증. 실제 전류/수명 실측 전 |
+| System ON 저전력 | Adafruit core의 FreeRTOS tickless idle/SoftDevice event wait를 재사용하고 variable-latency low-power mode를 명시한다. loop idle은 10 ms이며 ENV 120초/HP-354 10분 주기를 사용한다. | 소스·호스트 검증. 실제 전류/수명 실측 전 |
+| Loop liveness 복구 | core Wire의 무제한 TWIM wait 등으로 loop 진행이 120초 멈추면 상위 FreeRTOS software timer가 application reset을 수행한다. DFU bootloader에는 지속되지 않는다. | 소스·호스트 정책 검증. 4,000초 현상의 정확한 원인 및 실기 복구는 미검증 |
 | BLE NUS | Nordic UART Service로 한 줄 프레임을 최대 20-byte chunk로 나누고 newline으로 종료한다. 연결 해제 후 재광고·재연결한다. | 실기 검증 |
 | 펌웨어 식별 | 부팅 로그와 Device Information Service/진단 상태에서 센서 펌웨어 버전을 확인할 수 있다. | 구현 및 DFU 후 버전 확인 경로 존재 |
 
@@ -35,7 +36,7 @@
 
 - 환경 프레임: `ENV,BID=...,SEQ=...,MS=...,T=...,H=...,P=...`
 - 가스 v3 프레임: `V=3,BID=...,SEQ=...,SCAN=...,STEP=...,GI=...,MI=...,MS=...,ST=...,PID=354,T=...,H=...,P=...,G=...`
-- 진단 `STAT` 프레임: 센서 상태와 `BV`, `BOK`, `USB`, `BP`, `BS`, 보정 범위, 선택적 측정 uptime `BM`을 전달한다.
+- 진단 `STAT` 프레임: 센서 상태와 `BV`, `BOK`, `USB`, `BP`, `BS`, 보정 범위, 선택적 측정 uptime `BM`, USB 중 선택적 마지막 추정치 `BLP`를 전달한다.
 
 환경 프레임에 가짜 `G=0`이나 `STEP`을 추가하지 않는다. ESP32 parser는 배터리 확장 필드가 없는 구버전 프레임도 허용한다. BLE framing과 v2/v3 호환 규칙은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 정리되어 있다.
 
@@ -63,7 +64,7 @@
 - sample UID는 gateway boot ID와 receive sequence를 포함하며 retry와 reboot replay에서 유지된다.
 - 정확한 application ACK를 받은 sample만 queue/spool에서 해제한다. cloud는 UID dedup과 gateway boot high-water를 함께 사용한다.
 - queue/spool overflow, filesystem fault와 불완전 scan은 조용히 덮어쓰지 않고 오류 또는 missing data로 남긴다.
-- 환경 최신값과 5분 `EnvironmentHistory`는 분리된다. 2초 ENV 전체를 Sheets 행이나 spool record로 만들지 않는다.
+- 환경 최신값과 `EnvironmentHistory`는 분리된다. 120초 ENV 전체를 Sheets 행이나 spool record로 만들지 않으며 기존 5분 gate를 지난 첫 프레임만 저장한다.
 
 이 보존 경로는 실제 SPIFFS 재부팅 복원, backlog drain, cloud ACK로 실기 검증된 기록이 있다. 현재 소스의 모든 failure 조합을 장시간 검증한 것은 아니다.
 

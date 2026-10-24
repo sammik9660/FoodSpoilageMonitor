@@ -2,6 +2,14 @@
 
 갱신일: 2026-10-25. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-25 ENV 120초·gas preflight·loop liveness (소스/자동 검증)
+
+- nRF 2.0.10의 heater-off ENV start-to-start 간격을 2초에서 120초로 변경했다. HP-354 시작 간격 600,000 ms, 140 ms poll, 60초 scan timeout/cooling은 유지한다. gas deadline에는 이전 ENV age와 무관하게 forced T/H/P를 새로 성공시킨 다음 scan을 시작하며, ENV 실패는 120초를 기다리지 않고 5초 간격으로 재시도해 기존 3회 recovery로 들어간다.
+- 설치된 Adafruit nRF52 core 1.7.0의 `Wire_nRF52.cpp`는 TWIM `RXSTARTED/LASTRX/TXSTARTED/LASTTX/STOPPED`를 timeout 없이 기다린다. 사용자 관찰의 4,000초 gas 공백이 이 정확한 위치에서 멈췄다는 stack/log는 없어 원인은 미확정이지만, 이 경우 일반 loop의 gas timeout/recovery도 실행되지 않는다. main loop progress가 120초 멈추면 더 높은 priority의 FreeRTOS software timer가 application reset하도록 했다. 이 timer는 reset 뒤 Legacy DFU bootloader에 지속되는 hardware watchdog가 아니며 실제 stall 복구는 실기 미검증이다.
+- Apps Script는 15초 cloud transport freshness와 150초 environment freshness를 분리해 정상 120초 ENV를 offline/stale로 오판하지 않는다. 기존 300,000 ms EnvironmentHistory gate는 유지하므로 120초 frame cadence에서는 gate를 지난 첫 frame, 보통 약 6분마다 저장되고 가짜 5분 sample은 만들지 않는다. heartbeat/polling은 5초, battery는 60초, gas는 10분이다.
+- V1940에서 USB 중 VDDH/5가 실제 LiPo와 다르다는 사용자 실측과 별도 battery ADC 배선 부재를 유지한다. 따라서 현재 충전율을 계산하지 않는다. 같은 runtime에 battery-only 측정이 있었으면 OLED/dashboard에 `USB · last n%`로 명시적인 마지막 추정치만 표시하고, USB-only boot에서는 기존 `USB`만 표시한다. BLE STAT의 optional `BLP`와 gateway/cloud optional field는 구형 frame을 계속 허용하며 SensorData/spool 형식은 바꾸지 않는다.
+- Adafruit nRF52 core 1.7.0의 `adafruit:nrf52:feather52840` 빌드가 통과했다(Flash 169,296/815,104 bytes, RAM 16,720/237,568 bytes). MSVC sensor/integrity/battery/gateway UI 회귀 테스트, mock Sheets/browser 39개, fingerprint 5개와 `git diff --check`도 통과했다. 120초 실기 cadence, gas 장기 재발 여부, software-timer reset, USB 전환 뒤 `last` 표시, 실제 Apps Script 배포는 미검증이며 소비전력 개선율을 주장하지 않는다.
+
 ## 2026-10-25 nRF System ON 저전력·배터리 이력·무결성 상태 분리 (소스/호스트 검증)
 
 - 대시보드의 과거 `DATA INTEGRITY ERROR`는 gas age가 아니라 active `spool_error`, active `spool_full` 또는 boot 이후 누적 `queue_drops>0` 중 하나였다. `Last valid gas: 1652 s ago`는 별도 표시이며 상태 판정에 사용되지 않았다. 단순 gas 지연을 corruption으로 만들지 않도록 하고, 원인을 각각 `DATA STORAGE ERROR`, `DATA BUFFER FULL`, `DATA LOSS RECORDED`와 설명으로 구분했다. queue drop은 실제 enqueue 거부 기록이므로 숨기거나 정상으로 되돌리지 않는다.

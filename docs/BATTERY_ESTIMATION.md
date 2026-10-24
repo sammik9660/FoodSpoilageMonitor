@@ -18,9 +18,9 @@ Two CRC/version/generation slots (`/battery-a.bin`, `/battery-b.bin`) alternate 
 
 ## Transport and deployment order
 
-The existing `BV`, `BOK`, `USB` STAT fields remain. Optional `BP`, `BS`, `MN`, `MX` carry the nRF-computed percentage, calibration state code, and observed extrema. The worst-case STAT line is 169 bytes, below the gateway's 200-byte newline frame limit, and NUS still writes 20-byte chunks. Old sensor STAT messages are accepted.
+The existing `BV`, `BOK`, `USB` STAT fields remain. Optional `BP`, `BS`, `MN`, `MX` carry the nRF-computed percentage, calibration state code, and observed extrema. `BM` carries the last battery-only observation uptime and `BLP` may carry the last runtime battery-only percentage while USB is present. `BLP` is explicitly stale and is not charging progress. The worst-case STAT line remains below the gateway's 200-byte newline frame limit, and NUS still writes 20-byte chunks. Old sensor STAT messages are accepted.
 
-Deploy Apps Script and the gateway parser before the new nRF firmware. The dashboard displays the sensor's percentage; it does not calculate another voltage table. USB displays `BAT USB`, and old/missing battery telemetry displays `BAT --`. Battery telemetry stays in `LIVE_V2`; it does not change SensorData, EnvironmentHistory, UID/ACK, or SPIFFS record layouts. Historical battery graphs are not implemented because no separate battery-history schema has been validated.
+Deploy Apps Script and the gateway parser before the new nRF firmware. The dashboard displays the sensor's percentage; it does not calculate another voltage table. USB displays `BAT USB` and, when available in the same runtime, the last battery-only percentage as `last`; old/missing battery telemetry displays `BAT --`. VDDH/5 cannot reveal current cell voltage while USB powers this board, so charging progress remains unavailable without verified hardware support. Battery telemetry stays outside SensorData/EnvironmentHistory and does not change UID/ACK or SPIFFS record layouts. `BatteryHistory` stores battery-only voltage/percentage points separately.
 
 ## Remaining hardware checks
 

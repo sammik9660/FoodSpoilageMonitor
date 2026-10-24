@@ -59,13 +59,15 @@ function show(id,d){el(id,'state').textContent=d.state;const h=d.health||{};
  const gasAge=h.last_valid_age_ms!=null&&h.server_seen_at!=null?h.last_valid_age_ms+d.server_time-h.server_seen_at:null;
  el(id,'gas').textContent=h.latest&&h.latest.g>0&&gasAge!=null?`Last valid gas: ${h.latest.g.toFixed(2)} kΩ · ${(gasAge/1000).toFixed(0)} s ago`:'No valid gas sample';
  const battery=el(id,'battery');
- if(h.usb_power===true)battery.textContent='BAT USB';
+ if(h.usb_power===true)battery.textContent=Number.isFinite(h.battery_last_percent)?`BAT USB · last ${Math.round(h.battery_last_percent)}%`:'BAT USB';
  else if(h.battery_measurement_valid===true&&Number.isFinite(h.battery_mv)){
    const pct=Number.isFinite(h.battery_percent)?` · ${Math.round(h.battery_percent)}%`:'';
    battery.textContent=`BAT ${(h.battery_mv/1000).toFixed(2)} V${pct}`;
  } else battery.textContent='BAT --';
  const cal=h.battery_calibration_state||'상태 정보 없음',min=Number.isFinite(h.battery_min_mv)?(h.battery_min_mv/1000).toFixed(2)+' V':'--',max=Number.isFinite(h.battery_max_mv)?(h.battery_max_mv/1000).toFixed(2)+' V':'--';
- battery.title=`잔량은 전압 기반 추정치 · 보정 ${cal} · 관측 ${min}–${max}`;
+ battery.title=h.usb_power===true&&Number.isFinite(h.battery_last_percent)?
+   `USB 연결 중에는 현재 배터리 전압을 측정할 수 없습니다. ${Math.round(h.battery_last_percent)}%는 마지막 배터리 단독 추정치입니다.`:
+   `잔량은 전압 기반 추정치 · 보정 ${cal} · 관측 ${min}–${max}`;
  const r=d.recording,active=r.state==='RECORDING',stopped=r.state==='STOPPED',sessionId=active?r.session_id:r.download_session_id,label=active?r.experiment_label:r.download_experiment_label,startedAt=active?r.started_at:r.download_started_at;
  el(id,'recording').textContent=active?'실험 기록 중':stopped?'실험 종료됨':'실험 상태 확인 불가';
  el(id,'sessionName').textContent=label||'실험 기록 없음';el(id,'sessionDate').textContent=startedAt?'실험 시작: '+koreanDateTime(startedAt):'';

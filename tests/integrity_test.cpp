@@ -65,6 +65,8 @@ int main(){
  assert(h.batteryExtended&&h.batteryPercent==89&&h.batteryState==1&&h.batteryMinMv==3600&&h.batteryMaxMv==4150);
  assert(parseHealth("STAT,BID=1234ABCD,MS=60002,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0,BV=4090,BOK=1,USB=0,BP=89,BS=1,MN=3600,MX=4150,BM=60000",h));
  assert(h.batteryMeasuredAt==60000);
+ assert(parseHealth("STAT,BID=1234ABCD,MS=70002,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0,BV=0,BOK=0,USB=1,BP=0,BS=1,MN=3600,MX=4150,BM=60000,BLP=89",h));
+ assert(h.batteryLastPercent==89);
  assert(parseHealth("STAT,BID=1234ABCD,MS=2,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0,BV=0,BOK=0,USB=1",h));
  assert(!h.batteryKnown&&h.usbPower);
  assert(!parseHealth("STAT,BID=1234ABCD,MS=2,FAIL=3,REC=1,TRY=1,TXERR=0,OK=1,MODE=ENV,EOK=1,GOK=0,BV=4090,BOK=1,USB=1",h));

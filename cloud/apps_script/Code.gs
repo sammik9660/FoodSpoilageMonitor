@@ -1,7 +1,8 @@
 // Gas scan v3. Existing SensorData rows and SPREADSHEET_ID are never reset.
 const MAX_BATCH = 32;
 const DASHBOARD_REFRESH_MS = 5000;
-const STALE_MS = 15000;
+const TRANSPORT_STALE_MS = 15000;
+const ENVIRONMENT_STALE_MS = 150000;
 const HEADERS = ['timestamp','temperature','humidity','pressure','gas_resistance',
   'sample_uid','session_id','nrf_seq','nrf_ms','capture_quality','received_at','nrf_boot',
   'sample_schema','scan_seq','heater_step','gas_index','meas_index','sensor_status',
@@ -273,6 +274,8 @@ function healthSnapshot(h, now, ageDelta) {
   ['ble_connected','sensor_ok','spool_error','spool_full'].forEach(k=>{if(typeof h[k]==='boolean')out[k]=h[k];});
   if(typeof h.usb_power==='boolean')out.usb_power=h.usb_power;
   if(typeof h.battery_measurement_valid==='boolean')out.battery_measurement_valid=h.battery_measurement_valid;
+  if(h.usb_power===true&&typeof h.battery_last_percent==='number')
+    out.battery_last_percent=number(h.battery_last_percent,0,100,'last battery percent');
   if(h.battery_measurement_valid===true&&h.usb_power===false&&typeof h.battery_mv==='number')
     out.battery_mv=number(h.battery_mv,2500,5500,'battery mV');
   if(h.battery_measurement_valid===true&&h.usb_power===false&&typeof h.battery_percent==='number')
@@ -323,7 +326,7 @@ function batteryHistoryRow(deviceId, sensorId, h) {
      typeof h.battery_measurement_valid!=='boolean')return null;
   if(!h.usb_power&&!h.battery_measurement_valid)return null;
   if(h.battery_measurement_valid&&typeof h.battery_mv!=='number')return null;
-  const age=typeof h.battery_age_ms==='number'?h.battery_age_ms:0;
+  const age=h.battery_measurement_valid&&typeof h.battery_age_ms==='number'?h.battery_age_ms:0;
   const measured=Math.max(0,h.server_seen_at-age);
   return [new Date(measured).toISOString(),deviceId,sensorId||'',
     typeof h.battery_nrf_boot==='number'?h.battery_nrf_boot:'',
@@ -465,7 +468,7 @@ function getDashboard(requestedDeviceId) {
     const ctx=sheets();recoverTransactions(ctx);return cacheRecording(recordingResult(ctx,deviceId));});
   const recording=cached||(attempt&&attempt.acquired?attempt.value:unknownRecording(deviceId));
   const h=cachedObject(cache,'LIVE_V2:'+deviceId);
-  const now=Date.now(), transportStale=!h||now-h.server_seen_at>STALE_MS;
+  const now=Date.now(), transportStale=!h||now-h.server_seen_at>TRANSPORT_STALE_MS;
   const env=h&&h.environment;
   const age=env?env.age_ms+now-h.server_seen_at:
     h&&(!h.sensor_mode||h.sensor_mode==='LEGACY')&&typeof h.last_valid_age_ms==='number'?
@@ -481,7 +484,7 @@ function getDashboard(requestedDeviceId) {
   else if(h.sensor_mode==='REC')state='SENSOR RECOVERY';
   else if(h.sensor_mode==='ENV'&&h.environment_ok===false)state='ENVIRONMENT SENSOR ERROR';
   else if(h.sensor_ok===false)state='SENSOR ERROR';
-  else if(age===null||age>STALE_MS)state='STALE';
+  else if(age===null||age>ENVIRONMENT_STALE_MS)state='STALE';
   else state='LIVE / ONLINE';
   const integrity_reason=!h?null:h.spool_error?'SPIFFS/spool fault reported by gateway':
     h.spool_full?'Spool capacity exhausted; unacknowledged data is retained':

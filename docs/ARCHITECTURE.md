@@ -45,7 +45,7 @@ flowchart LR
 
 ### 환경 경로
 
-평상시 nRF52840은 히터를 끈 BME688 forced mode에서 약 2초마다 T/H/P를 측정한다. 유효 측정은 즉시 OLED 최신값과 BLE `ENV` frame을 갱신한다. ESP32는 최신값을 health 상태에 보관하지만 2초마다 spool 또는 Sheets 행을 만들지는 않는다.
+평상시 nRF52840은 히터를 끈 BME688 forced mode에서 약 120초마다 T/H/P를 측정한다. 유효 측정은 즉시 OLED 최신값과 BLE `ENV` frame을 갱신한다. ESP32는 최신값을 health 상태에 보관하지만 모든 ENV frame마다 spool 또는 Sheets 행을 만들지는 않는다. 가스 스캔 시각에는 정규 ENV 타이머와 별개로 forced T/H/P를 새로 성공시킨 뒤 HP-354를 시작한다.
 
 클라우드는 다음 두 시간을 분리한다.
 
@@ -79,9 +79,9 @@ MS=<capture-ms>,ST=<status>,PID=354,T=<C>,H=<%>,P=<hPa>,G=<kOhm>
 
 ### 상태 frame
 
-`STAT`은 firmware/sensor/scan 상태와 배터리 확장 필드를 전달하는 진단 frame이다. `BV`는 mV, `BOK`는 battery reading validity, `USB`는 USB 전원 상태, `BP`는 nRF가 계산한 percentage estimate, `BS`는 calibration state, 선택적 `BM`은 마지막 battery observation의 nRF uptime이다. 구버전 sensor처럼 이 필드가 없어도 gateway는 기존 환경/가스 frame을 처리한다.
+`STAT`은 firmware/sensor/scan 상태와 배터리 확장 필드를 전달하는 진단 frame이다. `BV`는 mV, `BOK`는 battery reading validity, `USB`는 USB 전원 상태, `BP`는 nRF가 계산한 현재 percentage estimate, `BS`는 calibration state, 선택적 `BM`은 마지막 battery-only observation의 nRF uptime이다. 선택적 `BLP`는 USB 연결 전 마지막 runtime percentage이며 현재 충전율이 아니다. 구버전 sensor처럼 이 필드가 없어도 gateway는 기존 환경/가스 frame을 처리한다.
 
-Adafruit core의 FreeRTOS tickless idle과 SoftDevice event wait를 그대로 사용하며, firmware는 System ON variable-latency low-power mode를 명시한다. System OFF는 BLE와 주기 측정을 끊고 wake 시 reset되므로 현재 상태 머신에 넣지 않는다. 상세 근거와 계측 절차는 [`NRF52840_LOW_POWER.md`](NRF52840_LOW_POWER.md)에 있다.
+Adafruit core의 FreeRTOS tickless idle과 SoftDevice event wait를 그대로 사용하며, firmware는 System ON variable-latency low-power mode를 명시한다. ENV는 120초, gas scan은 10분이며 scan 직전 forced T/H/P를 새로 얻는다. core Wire가 TWIM event를 무기한 기다리는 경우에도 상위 FreeRTOS software timer가 120초 loop 정지를 감지해 application을 재시작한다. 이 timer는 Legacy DFU bootloader로 이어지지 않는다. System OFF는 BLE와 주기 측정을 끊고 wake 시 reset되므로 현재 상태 머신에 넣지 않는다. 상세 근거와 계측 절차는 [`NRF52840_LOW_POWER.md`](NRF52840_LOW_POWER.md)에 있다.
 
 Boot ID와 sequence는 센서 재부팅과 valid measurement 순서를 구분한다. sequence는 성공한 측정에만 증가한다.
 
