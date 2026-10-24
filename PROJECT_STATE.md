@@ -1,6 +1,14 @@
 # 프로젝트 현재 상태
 
-갱신일: 2026-10-21. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
+갱신일: 2026-10-25. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
+
+## 2026-10-25 nRF System ON 저전력·배터리 이력·무결성 상태 분리 (소스/호스트 검증)
+
+- 대시보드의 과거 `DATA INTEGRITY ERROR`는 gas age가 아니라 active `spool_error`, active `spool_full` 또는 boot 이후 누적 `queue_drops>0` 중 하나였다. `Last valid gas: 1652 s ago`는 별도 표시이며 상태 판정에 사용되지 않았다. 단순 gas 지연을 corruption으로 만들지 않도록 하고, 원인을 각각 `DATA STORAGE ERROR`, `DATA BUFFER FULL`, `DATA LOSS RECORDED`와 설명으로 구분했다. queue drop은 실제 enqueue 거부 기록이므로 숨기거나 정상으로 되돌리지 않는다.
+- nRF 2.0.9는 기존 Adafruit core 1.7.0의 FreeRTOS tickless idle/`sd_app_evt_wait()`를 유지하고 `sd_power_mode_set(NRF_POWER_MODE_LOWPWR)`를 명시한다. loop task idle을 5 ms에서 10 ms로 낮추되 ENV 2초, HP-354 10분/140 ms polling, BLE NUS와 recovery는 바꾸지 않았다. nRF52840 기본값도 low-power이므로 절감률은 아직 확인되지 않았다. BLE connection parameter, DC/DC, OLED/LED, gas profile과 System OFF는 실기/BOM 검증 없이 변경하지 않았다.
+- 배터리 곡선은 3.50--4.20 V의 voltage estimate이며 mAh/SOC meter가 아니다. calibration은 ENV load만 학습하고 최소 8시간, high/low/spread/band/falling 조건을 만족해야 하며 완전 방전이나 과방전을 요구하지 않는다. `/battery-a.bin`과 `/battery-b.bin`의 generation/CRC 교대 저장은 최신 valid slot을 복원한다. 배터리 교체를 자동 판별·초기화하지 않으며 USB/GAS/COOL/REC 값은 학습하지 않는다. 따라서 1000 mAh 배터리의 2일 후 4% 표시는 실제 잔여 용량과 다를 수 있고 heater 부하 sag와 휴지 후 rebound 영향도 실측해야 한다.
+- optional STAT suffix `BM`에 마지막 battery observation의 nRF uptime을 추가했다. ESP 2.0.11/build 2026102501은 구형 STAT도 계속 허용하며 battery boot/sample uptime/age를 health에 넣는다. Apps Script는 기존 sample/spool schema와 분리된 `BatteryHistory`에 장치별 최대 5분마다 measured/server-received time, sensor/BID, mV, 센서 추정 %, USB/valid/calibration 상태를 기록한다. history 실패는 sample journal/ACK를 실패시키지 않는다. dashboard는 24시간/7일/전체 actual points를 전압·추정 % 그래프로 표시하고 15분 이상 공백을 보간하지 않는다.
+- mock Sheets/browser 38개, MSVC battery/sensor/integrity/spool/UI/Wi-Fi/Legacy DFU/package test, fingerprint 5개, OTA partition, DFU web/upload/access와 `git diff --check`가 통과했다. nRF core 1.7.0 `adafruit:nrf52:feather52840` 빌드는 현재 소스에서 ELF/HEX/application-only Legacy DFU ZIP을 생성해 성공했다. ESP core 3.3.12 빌드는 기존 16 MB/custom partition/OPI PSRAM 설정에서 bootloader만 만든 뒤 약 2분 30초 동안 앱 산출물·오류 출력 없이 정체되어 중단했으므로 현재 gateway target compile은 미검증이다. 실제 board current, battery life, BM end-to-end, 운영 Apps Script/Sheets migration와 graph, 장기 flash wear는 미검증이다. 전류 계측과 적용/비적용 이유는 `docs/NRF52840_LOW_POWER.md`에 기록했다.
 
 ## 2026-10-21 OLED sensor-error battery display (소스/호스트 검증)
 

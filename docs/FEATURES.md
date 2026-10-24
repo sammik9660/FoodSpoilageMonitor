@@ -25,6 +25,7 @@
 | OLED | 128×32 OLED에 온도·습도·기압, 동작 상태와 배터리 정보를 표시한다. OLED가 없어도 측정과 BLE는 계속한다. | 기본 표시 실기 검증. 최신 통합 배터리 표시는 현장 재검증 필요 |
 | 배터리 전압 | 내부 VDDH/5 ADC를 14-bit로 읽어 mV 정수로 관리한다. USB 전원 상태에서는 배터리 전압으로 단정하지 않는다. | 독립 진단에서 배터리 단독 VDDH와 멀티미터 일치 실기 검증 |
 | 배터리 잔량 추정 | 4.20–3.50 V 비선형 곡선, 5-sample median과 제한된 자가 보정 상태를 사용한다. `/battery-a.bin`, `/battery-b.bin` 교대 저장에 version, generation, CRC를 둔다. 실제 mAh 측정이나 정밀 SOC가 아니다. | 자동 테스트 통과. 최신 OLED→BLE→클라우드 통합은 실기 미검증 |
+| System ON 저전력 | Adafruit core의 FreeRTOS tickless idle/SoftDevice event wait를 재사용하고 variable-latency low-power mode를 명시한다. loop idle은 10 ms이며 ENV 2초/HP-354 10분 주기는 유지한다. | 소스·호스트 검증. 실제 전류/수명 실측 전 |
 | BLE NUS | Nordic UART Service로 한 줄 프레임을 최대 20-byte chunk로 나누고 newline으로 종료한다. 연결 해제 후 재광고·재연결한다. | 실기 검증 |
 | 펌웨어 식별 | 부팅 로그와 Device Information Service/진단 상태에서 센서 펌웨어 버전을 확인할 수 있다. | 구현 및 DFU 후 버전 확인 경로 존재 |
 
@@ -34,7 +35,7 @@
 
 - 환경 프레임: `ENV,BID=...,SEQ=...,MS=...,T=...,H=...,P=...`
 - 가스 v3 프레임: `V=3,BID=...,SEQ=...,SCAN=...,STEP=...,GI=...,MI=...,MS=...,ST=...,PID=354,T=...,H=...,P=...,G=...`
-- 진단 `STAT` 프레임: 센서 상태와 `BV`, `BOK`, `USB`, `BP`, `BS`, 보정 범위 등을 전달한다.
+- 진단 `STAT` 프레임: 센서 상태와 `BV`, `BOK`, `USB`, `BP`, `BS`, 보정 범위, 선택적 측정 uptime `BM`을 전달한다.
 
 환경 프레임에 가짜 `G=0`이나 `STEP`을 추가하지 않는다. ESP32 parser는 배터리 확장 필드가 없는 구버전 프레임도 허용한다. BLE framing과 v2/v3 호환 규칙은 [`ARCHITECTURE.md`](ARCHITECTURE.md)에 정리되어 있다.
 
@@ -46,7 +47,7 @@
 |---|---|---|
 | BLE 수신 | NUS scan/connect/subscribe, newline 재조립, v2/v3/ENV/STAT parsing, 재연결을 수행한다. 명시적 sensor ID pairing으로 다른 센서 연결을 막을 수 있다. | 단일 장치 실기 검증 |
 | Wi-Fi 자동 복구 | 두 저장 슬롯, 마지막 성공 슬롯 우선, event 기반 연결 종료 후 failover, 제한된 retry/backoff를 사용한다. 연결된 SSID를 불필요하게 끊지 않으며 IP와 `foodmonitor.local`을 제공한다. | 자동 테스트 통과. 실제 네트워크 조건별 장기 검증 일부 미완료 |
-| 최신 상태 heartbeat | 실제 sample이 없을 때 약 5초마다 최신 environment/battery health를 전송한다. data upload를 우선하며 heartbeat는 spool이나 이력 sample을 만들지 않는다. | 호스트·클라우드 테스트 통과. 운영 배포 버전 일치 여부 확인 필요 |
+| 최신 상태 heartbeat | 실제 sample이 없을 때 약 5초마다 최신 environment/battery health를 전송한다. data upload를 우선하며 heartbeat는 spool이나 환경·가스 sample을 만들지 않는다. battery health만 장치별 최대 5분 간격으로 별도 이력화한다. | 호스트·클라우드 테스트 통과. 운영 배포 버전 일치 여부 확인 필요 |
 | HTTPS 업로드 | JSON POST, redirect GET, application ACK parsing과 제한된 retry를 수행한다. UID가 ACK되기 전 sample을 제거하지 않는다. | 운영 ACK·재전송 실기 검증 |
 | PSRAM 메모리 관리 | 직렬화된 큰 HTTP JSON을 exact-size PSRAM buffer로 옮기고 내부 임시 buffer를 TLS 전에 해제한다. 실패 시 내부 RAM fallback을 사용하며 내부/PSRAM heap 진단을 남긴다. BLE queue, RTOS 객체와 TLS 필수 객체는 내부 RAM에 둔다. | 자동 테스트 통과. 현재 최종 빌드의 장시간 TLS 실기 검증 필요 |
 | 로컬 표시 | LCD와 GPIO 48 NeoPixel을 사용한다. green은 정상, yellow는 backlog/실제 data transfer 대기, red는 BLE 단절, purple은 Wi-Fi 단절, blue는 boot/update, rainbow는 검증된 OTA 부팅 완료를 뜻한다. health-only POST는 경고 점멸을 만들지 않는다. | 기본 LED 동작 실기 기록 존재. 최신 정책 재검증 필요 |
@@ -73,10 +74,10 @@
 | 기능 | 구현 내용 | 검증 상태 |
 |---|---|---|
 | ingest API | schema 2 legacy, schema 3 gas step, schema 4 environment와 health payload를 처리한다. | 자동 테스트 및 운영 저장 실기 검증 |
-| Sheets 저장 | `SensorData`, `EnvironmentHistory`, `Unassigned`, `Sessions`, `IngestState`, `DeviceRegistry`를 사용한다. 기존 SensorData 첫 12열과 과거 행을 보존한다. | 운영 실기 검증 |
+| Sheets 저장 | `SensorData`, `EnvironmentHistory`, `BatteryHistory`, `Unassigned`, `Sessions`, `IngestState`, `DeviceRegistry`를 사용한다. 기존 SensorData 첫 12열과 과거 행을 보존한다. BatteryHistory는 장치별 최대 5분 간격이다. | 기존 저장은 운영 실기 검증. BatteryHistory는 mock Sheets 검증, 운영 미배포 |
 | transaction/ACK | ScriptLock과 write-ahead journal recovery 후에 ACK한다. duplicate UID, high-water와 재전송을 처리한다. | 동시성 mock 테스트 통과, 운영 ACK 실기 검증 |
 | 빠른 health 경로 | 빈 `samples` heartbeat에서 무거운 spreadsheet/journal 작업을 피하면서 per-device `LIVE_V2`를 갱신한다. dashboard lock 충돌 시 recording 상태를 추측하지 않는다. | 자동 테스트 통과. 최신 Apps Script 배포 여부는 별도 확인 필요 |
-| 대시보드 | 5초 polling, 장치별 카드, 환경/가스/배터리/연결/recording 상태, 로컬 OTA/DFU 링크를 제공한다. stale이어도 값과 실제 경과시간을 구분한다. | 단일 장치 운영 실기 검증. 최신 battery/UI 변경은 미배포 가능 |
+| 대시보드 | 5초 polling, 장치별 카드, 환경/가스/배터리/연결/recording 상태, 배터리 24시간·7일·전체 그래프, 로컬 OTA/DFU 링크를 제공한다. stale gas와 storage fault/overflow/실제 queue loss를 구분한다. | 단일 장치 운영 실기 검증. 최신 battery/integrity UI는 mock 검증, 운영 미배포 |
 | 실험 세션 | 장치별 START/STOP과 capture-time `[start, stop)` 경계로 sample을 배정한다. 시각이 불명확하면 `Unassigned`에 보존한다. | 운영 실기 검증 |
 | CSV | 최근/현재 session과 장치 전체 데이터를 UTF-8 CSV로 내려받는다. Unicode 실험명은 본문에 유지하고 파일명은 안전한 ASCII fallback을 사용한다. 10,000행 limit과 offset pagination을 유지한다. | 자동 회귀 테스트 통과. 최신 코드 배포 필요 |
 
@@ -125,6 +126,7 @@ ESP32→nRF relay는 사용자 실기 성공이 보고되었다. 전원 차단, 
 - ESP OTA partition/signing/package: `tests/*ota*`
 - gas scan completeness: [`analysis/fingerprints.py`](../analysis/fingerprints.py)와 `tests/fingerprint_test.py`
 - 독립 VDDH 진단 스케치와 절차: [`V1940_BATTERY_ADC_DIAGNOSTIC.md`](V1940_BATTERY_ADC_DIAGNOSTIC.md)
+- System ON/OFF, BLE, heater, DC/DC와 PPK2 절차: [`NRF52840_LOW_POWER.md`](NRF52840_LOW_POWER.md)
 
 호스트 테스트와 compile 성공은 실제 BLE radio, Wi-Fi AP, TLS heap, flash wear, battery discharge 및 cloud deployment 검증을 대신하지 않는다.
 

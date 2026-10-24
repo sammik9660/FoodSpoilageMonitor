@@ -229,6 +229,7 @@ constexpr int16_t OLED_HEIGHT = 32;
 constexpr int8_t OLED_RESET_PIN = -1;
 constexpr uint32_t OLED_REFRESH_INTERVAL_MS = 750;
 constexpr uint32_t ENV_INTERVAL_MS = 2000;
+constexpr uint32_t LOOP_IDLE_MS = 10;
 constexpr uint32_t BATTERY_INTERVAL_MS = 60000;
 constexpr uint32_t USB_POWER_CHECK_INTERVAL_MS = 1000;
 constexpr uint32_t ADC_FULL_SCALE_MV = 3600;
@@ -240,7 +241,7 @@ constexpr uint32_t ENV_CONVERSION_TIMEOUT_MS = 200;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.8";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.9";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 bme68xData lastEnvData={};
@@ -257,6 +258,7 @@ uint32_t envSequence = 0, envFailures = 0, envConsecutiveFailures = 0;
 uint32_t recoveryAttempts = 0, recoveries = 0, txErrors = 0;
 uint32_t nextMeasurement = 0, nextRecovery = 0, lastHealth = 0;
 uint32_t nextBatteryMeasurement = 0, nextUsbPowerCheck = 0, batteryMillivolts = 0;
+uint32_t batteryMeasuredAt = 0;
 battery::Tracker batteryTracker;
 #if !defined(_MSC_VER)
 bool batteryStorageReady = false;
@@ -335,17 +337,20 @@ void measureBatteryVoltage() {
     usbPowerPresent = true;
     batteryMeasurementValid = false;
     batteryMillivolts = 0;
+    batteryMeasuredAt = millis();
     return;
   }
   usbPowerPresent = usb;
   if (usb) {
     batteryMeasurementValid = false;
     batteryMillivolts = 0;
+    batteryMeasuredAt = millis();
     return;
   }
   const uint32_t mv = vddhMillivoltsFromRaw(readVddhRaw());
   batteryMeasurementValid = mv >= 2500 && mv <= 5500;
   batteryMillivolts = batteryMeasurementValid ? mv : 0;
+  batteryMeasuredAt = millis();
 
   // 유효한 배터리 전압을 측정했을 때만 기록
   if (batteryMeasurementValid) {
@@ -409,6 +414,7 @@ void serviceBatteryVoltage(uint32_t now) {
     const bool wasUsb = usbPowerPresent;
     if (!readUsbPowerPresent(usb)) usb = true;
     usbPowerPresent = usb;
+    if (usb != wasUsb) batteryMeasuredAt = now;
     if (usb) {
       batteryMeasurementValid = false;
       batteryMillivolts = 0;
@@ -632,7 +638,7 @@ void sendHealth() {
   char line[224];
   const char* mode=sensorMode==MODE_GAS?"GAS":sensorMode==MODE_COOL?"COOL":
                    sensorMode==MODE_REC?"REC":"ENV";
-  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u,BV=%lu,BOK=%u,USB=%u,BP=%u,BS=%u,MN=%lu,MX=%lu",
+  snprintf(line, sizeof(line), "STAT,BID=%08lX,MS=%lu,FAIL=%lu,REC=%lu,TRY=%lu,TXERR=%lu,OK=%u,MODE=%s,EOK=%u,GOK=%u,BV=%lu,BOK=%u,USB=%u,BP=%u,BS=%u,MN=%lu,MX=%lu,BM=%lu",
            (unsigned long)bootId, (unsigned long)millis(), (unsigned long)failures,
            (unsigned long)recoveries, (unsigned long)recoveryAttempts,
            (unsigned long)txErrors, sensorMode==MODE_ENV ? (envReadOK ? 1 : 0) :
@@ -643,7 +649,8 @@ void sendHealth() {
            batteryMeasurementValid ? batteryTracker.estimatedPercent() : 0,
            (unsigned)batteryTracker.state,
            (unsigned long)(batteryTracker.minMv==UINT32_MAX?0:batteryTracker.minMv),
-           (unsigned long)batteryTracker.maxMv);
+           (unsigned long)batteryTracker.maxMv,
+           (unsigned long)batteryMeasuredAt);
   sendLine(line);
 }
 
@@ -782,6 +789,13 @@ void setup() {
 #endif
   Bluefruit.begin();
 #if !defined(_MSC_VER)
+  // The Adafruit FreeRTOS port already uses tickless idle and sd_app_evt_wait().
+  // Explicitly retain variable-latency System ON low-power mode; do not add a
+  // second WFE loop that could interfere with SoftDevice/BLE scheduling.
+  const uint32_t powerModeResult=sd_power_mode_set(NRF_POWER_MODE_LOWPWR);
+  Serial.print("POWER System ON low-power mode result=");Serial.println(powerModeResult);
+#endif
+#if !defined(_MSC_VER)
   initializeBatteryStorage();
 #endif
   Bluefruit.setTxPower(4);
@@ -892,7 +906,7 @@ void loop() {
 #if !defined(_MSC_VER)
     updateOled(millis());
 #endif
-    delay(10);
+    delay(LOOP_IDLE_MS);
     return;
   }
   if(sensorMode==MODE_COOL) {
@@ -902,14 +916,14 @@ void loop() {
 #if !defined(_MSC_VER)
     updateOled(millis());
 #endif
-    delay(5);return;
+    delay(LOOP_IDLE_MS);return;
   }
   if(sensorMode==MODE_ENV) {
     serviceEnvironment(now);
 #if !defined(_MSC_VER)
     updateOled(millis());
 #endif
-    delay(5);return;
+    delay(LOOP_IDLE_MS);return;
   }
   if((uint32_t)(now-scanStartedAt)>=GAS_SCAN_TIMEOUT_MS) {
     Serial.println("SCAN timeout; incomplete fingerprint retained");
@@ -922,13 +936,13 @@ void loop() {
 #if !defined(_MSC_VER)
     updateOled(millis());
 #endif
-    delay(5);return;
+    delay(LOOP_IDLE_MS);return;
   }
   if ((int32_t)(now - nextMeasurement) < 0) {
 #if !defined(_MSC_VER)
     updateOled(now);
 #endif
-    delay(5);
+    delay(LOOP_IDLE_MS);
     return;
   }
   nextMeasurement = now + gas_scan::POLL_MS;  // Bosch example fetch cadence, no catch-up burst

@@ -25,7 +25,7 @@ struct Frame {
   uint8_t version=2, step=0, gasIndex=0, measIndex=0, status=0;
 };
 struct Health { uint32_t boot, ms, failures, recoveries, attempts, txErrors, ok;
-  uint32_t batteryMillivolts=0, batteryMinMv=0, batteryMaxMv=0;
+  uint32_t batteryMillivolts=0, batteryMinMv=0, batteryMaxMv=0, batteryMeasuredAt=0;
   uint8_t mode=0, envOK=0, gasOK=0, batteryKnown=0, usbPower=0;
   uint8_t batteryPercent=0, batteryState=0, batteryExtended=0;
 }; // mode 0=legacy, 1=ENV, 2=GAS, 3=COOL, 4=REC
@@ -177,10 +177,12 @@ inline bool parseHealth(const char* p, Health& h) {
   if(!literal(p,",BP=")||!integer(p,pct)||pct>100||
      !literal(p,",BS=")||!integer(p,state)||state>4||
      !literal(p,",MN=")||!integer(p,minMv)||minMv>5500||
-     !literal(p,",MX=")||!integer(p,maxMv)||maxMv>5500||*p)return false;
+     !literal(p,",MX=")||!integer(p,maxMv)||maxMv>5500)return false;
   if((minMv&&minMv<2500)||(maxMv&&maxMv<minMv)||(known&&(!minMv||!maxMv))||(!known&&pct))return false;
   h.batteryPercent=(uint8_t)pct;h.batteryState=(uint8_t)state;
-  h.batteryMinMv=minMv;h.batteryMaxMv=maxMv;h.batteryExtended=1;return true;
+  h.batteryMinMv=minMv;h.batteryMaxMv=maxMv;h.batteryExtended=1;
+  if(!*p)return true; // Extended firmware before battery measurement uptime.
+  return literal(p,",BM=")&&integer(p,h.batteryMeasuredAt)&&!*p;
 }
 struct Framer {
   char line[MAX_FRAME+1] = {};

@@ -193,6 +193,8 @@ test('dashboard defines device-scoped panels, polling, controls and paged CSV li
  assert(html.includes('최근 실험 데이터 다운로드 (CSV)'));assert(html.includes('(page-1)*10000'));
  assert(html.includes('h.ota_state===\'UPDATING\''));
  assert(html.includes('ESP32 OTA — gateway firmware'));assert(html.includes('nRF52840 DFU — sensor firmware'));
+ assert(html.includes("loadBatteryHistory(id,'24h')"));assert(html.includes('.getBatteryHistory(id,range)'));
+ assert(html.includes('p.measured_at-current[current.length-1].measured_at>900000'));
  assert(html.includes("espOtaLink.href=local+'/'"));assert(html.includes("nrfDfuLink.href=local+'/nrf-dfu'"));
  assert(html.includes("device='+encodeURIComponent(id)"));assert(html.includes("session='+encodeURIComponent(session)"));
  assert(html.includes('section.device'));assert(html.includes('panels=new Map()'));
@@ -203,11 +205,11 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  const e=environment(),a='111111111111',b='222222222222',elements=new Map();
  e.api.ingest({version:2,device_id:a,samples:[],health:{ble_connected:true}});
  e.api.ingest({version:2,device_id:b,samples:[],health:{ble_connected:false}});
- function element(id){if(!elements.has(id))elements.set(id,{id,value:id.startsWith('label-')?'label-'+id.slice(6):'0',href:'',textContent:'',hidden:false,disabled:false,className:'',remove(){elements.delete(id);}});return elements.get(id);}
+ function element(id){if(!elements.has(id))elements.set(id,{id,value:id.startsWith('label-')?'label-'+id.slice(6):'0',href:'',textContent:'',innerHTML:'',title:'',hidden:false,disabled:false,className:'',remove(){elements.delete(id);}});return elements.get(id);}
  element('loading');const devices=element('devices');devices.insertAdjacentHTML=(_,html)=>{for(const match of html.matchAll(/id="([^"]+)"/g))element(match[1]);};
  let success=null,failure=null,offlineB=false;
  const runner={withSuccessHandler(fn){success=fn;return this;},withFailureHandler(fn){failure=fn;return this;},
-  getDashboardDevices(){success(e.api.getDashboardDevices());},getDashboard(id){if(id===b&&offlineB){failure(Error('unit B offline'));return;}success(e.api.getDashboard(id));},
+  getDashboardDevices(){success(e.api.getDashboardDevices());},getDashboard(id){if(id===b&&offlineB){failure(Error('unit B offline'));return;}success(e.api.getDashboard(id));},getBatteryHistory(id,range){success(e.api.getBatteryHistory(id,range));},
   startRecording(label,id){try{success(e.api.startRecording(label,id));}catch(err){failure(err);}},stopRecording(id){try{success(e.api.stopRecording(id));}catch(err){failure(err);}}};
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
  const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','5000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
@@ -322,6 +324,38 @@ test('battery health remains optional and USB-powered VDDH is not exposed as bat
   battery_measurement_valid:true,usb_power:false}}),/battery mV/);
  assert.throws(()=>e.api.ingest({version:3,device_id:a,samples:[],health:{battery_min_mv:4100,
   battery_max_mv:3600,battery_measurement_valid:false,usb_power:true}}),/battery extrema order/);
+});
+test('battery history is device-scoped, five-minute sampled, and preserves measured versus USB states',()=>{
+ const e=environment(),a='111111111111',b='222222222222',base=e.now();
+ const health={battery_mv:4090,battery_percent:89,battery_calibration_state:'COLLECTING',
+  battery_calibrated:false,battery_min_mv:3600,battery_max_mv:4150,battery_measurement_valid:true,
+  usb_power:false,battery_nrf_boot:0x12345678,battery_sample_ms:60000,battery_age_ms:1200};
+ e.api.ingest({version:3,device_id:a,sensor_id:'a1b2c3d4e5f60708',samples:[],health});
+ const sheet=e.all.get('BatteryHistory');assert.equal(sheet.getLastRow(),2);
+ assert.equal(sheet.rows[1][1],a);assert.equal(sheet.rows[1][2],'a1b2c3d4e5f60708');
+ assert.equal(sheet.rows[1][3],0x12345678);assert.equal(sheet.rows[1][5],4090);assert.equal(sheet.rows[1][6],89);
+ e.setTime(base+60000);e.api.ingest({version:3,device_id:a,samples:[],health});assert.equal(sheet.getLastRow(),2);
+ e.cache.delete('BATTERY_HISTORY_DUE_V1:'+a);e.setTime(base+301000);
+ e.api.ingest({version:3,device_id:a,samples:[],health:{...health,battery_mv:4010,battery_percent:76,battery_sample_ms:360000}});
+ assert.equal(sheet.getLastRow(),3);
+ e.api.ingest({version:3,device_id:b,samples:[],health:{battery_measurement_valid:false,usb_power:true,
+  battery_nrf_boot:99,battery_sample_ms:10,battery_age_ms:50}});
+ assert.equal(sheet.getLastRow(),4);assert.equal(sheet.rows[3][5],'');assert.equal(sheet.rows[3][7],true);
+ e.api.ingest({version:3,device_id:'333333333333',samples:[],health:{battery_measurement_valid:true,usb_power:false}});
+ assert.equal(sheet.getLastRow(),4);
+ const ah=e.api.getBatteryHistory(a,'24h');assert.equal(ah.total,2);assert.equal(ah.points[1].battery_mv,4010);
+ assert.equal(e.api.getBatteryHistory(b,'all').total,1);assert.throws(()=>e.api.getBatteryHistory(a,'month'),/Invalid/);
+});
+test('stale gas age is not data corruption and integrity causes remain explicit',()=>{
+ const e=environment(),a='111111111111',base={sensor_mode:'ENV',environment_ok:true,sensor_ok:true,
+  ble_connected:true,environment:{t:25,h:50,p:1000,age_ms:100},latest:{t:25,h:50,p:1000,g:113.98},last_valid_age_ms:1652000};
+ e.api.ingest({version:3,device_id:a,samples:[],health:base});assert.equal(e.api.getDashboard(a).state,'LIVE / ONLINE');
+ e.api.ingest({version:3,device_id:a,samples:[],health:{...base,queue_drops:2}});
+ let d=e.api.getDashboard(a);assert.equal(d.state,'DATA LOSS RECORDED');assert.match(d.integrity_reason,/2 rejected/);
+ e.api.ingest({version:3,device_id:a,samples:[],health:{...base,spool_full:true}});
+ d=e.api.getDashboard(a);assert.equal(d.state,'DATA BUFFER FULL');
+ e.api.ingest({version:3,device_id:a,samples:[],health:{...base,spool_error:true}});
+ d=e.api.getDashboard(a);assert.equal(d.state,'DATA STORAGE ERROR');
 });
 test('routine heartbeats become lock-free while data and OTA state changes stay serialized',()=>{
  const e=environment(),a='111111111111',heartbeat={version:3,device_id:a,sensor_id:'a1b2c3d4e5f60708',samples:[],

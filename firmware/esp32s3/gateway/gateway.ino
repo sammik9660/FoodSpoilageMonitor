@@ -174,8 +174,8 @@ constexpr uint32_t LCD_REFRESH_MS=750;
 // Hardware CDC/JTAG is the verified console. Mirroring every line to UART0 made
 // combined captures show each event twice; UART0 remains available as an opt-in.
 constexpr bool UART_DIAGNOSTICS=false;
-constexpr char FIRMWARE_VERSION[]="2.0.10";
-constexpr uint64_t OTA_BUILD_NUMBER=2026102102ULL;
+constexpr char FIRMWARE_VERSION[]="2.0.11";
+constexpr uint64_t OTA_BUILD_NUMBER=2026102501ULL;
 
 BLEUUID NUS_SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
 
@@ -1716,6 +1716,11 @@ cJSON* healthJson(uint32_t activeCount,uint32_t stagedCount) {
   if(known&&h.mode){cJSON_AddBoolToObject(o,"environment_ok",h.envOK!=0);
     cJSON_AddBoolToObject(o,"gas_ok",h.gasOK!=0);}
   if(known){
+    addNumber(o,"battery_nrf_boot",h.boot);
+    if(h.batteryMeasuredAt){
+      addNumber(o,"battery_sample_ms",h.batteryMeasuredAt);
+      addNumber(o,"battery_age_ms",(uint32_t)(h.ms-h.batteryMeasuredAt));
+    }
     cJSON_AddBoolToObject(o,"usb_power",h.usbPower!=0);
     cJSON_AddBoolToObject(o,"battery_measurement_valid",h.batteryKnown!=0);
     if(h.batteryKnown)addNumber(o,"battery_mv",h.batteryMillivolts);

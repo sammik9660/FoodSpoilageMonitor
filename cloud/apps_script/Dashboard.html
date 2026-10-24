@@ -4,6 +4,7 @@
 body{font:16px system-ui;background:#f3f5f6;color:#172b36;max-width:850px;margin:32px auto;padding:0 18px}
 section.device{background:white;padding:20px;margin:16px 0;border-radius:12px}button,a{padding:10px;display:inline-block;margin:4px}
 input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{color:#b42318}.values{font-size:22px}
+.battery-chart{width:100%;height:150px;background:#f8fafb;border:1px solid #d8e0e4;border-radius:8px}.muted{color:#526773;font-size:14px}
 [hidden]{display:none!important}
 </style></head><body>
 <h1>Food Spoilage Monitor</h1><p id="loading">Loading devices…</p><div id="devices"></div>
@@ -11,7 +12,8 @@ input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{
 const refreshMs=<?= refreshMs ?>,base='<?= webAppUrl ?>';
 const panels=new Map(),polling=new Set();
 function panelMarkup(id,index){return `<section class="device" id="panel-${id}"><h2>Device ${index+1} · ${id}</h2>
-  <strong id="state-${id}">WAITING / UNKNOWN</strong><p id="measurement-${id}">Measurement mode: unknown</p><p id="age-${id}">No confirmed sample</p><p id="updated-${id}">Last update: unknown</p><div class="values" id="values-${id}">—</div><p id="gas-${id}">No valid gas sample</p><p id="battery-${id}">BAT --</p>
+  <strong id="state-${id}">WAITING / UNKNOWN</strong><p id="integrity-${id}" class="error" hidden></p><p id="measurement-${id}">Measurement mode: unknown</p><p id="age-${id}">No confirmed sample</p><p id="updated-${id}">Last update: unknown</p><div class="values" id="values-${id}">—</div><p id="gas-${id}">No valid gas sample</p><p id="battery-${id}">BAT --</p>
+  <details><summary>배터리 이력</summary><p><button onclick="loadBatteryHistory('${id}','24h')">최근 24시간</button><button onclick="loadBatteryHistory('${id}','7d')">최근 7일</button><button onclick="loadBatteryHistory('${id}','all')">전체</button></p><p id="batteryHistoryStatus-${id}" class="muted">이력 조회 전</p><p>배터리 전압 (실측)</p><svg id="batteryVoltageChart-${id}" class="battery-chart" viewBox="0 0 760 150" role="img" aria-label="배터리 전압 이력"></svg><p>배터리 잔량 (센서 추정)</p><svg id="batteryPercentChart-${id}" class="battery-chart" viewBox="0 0 760 150" role="img" aria-label="배터리 추정 잔량 이력"></svg></details>
 <p>Values are live telemetry, not a food-safety verdict. Stale values remain labeled as stale.</p>
   <h3 id="recording-${id}">실험 상태 확인 중</h3><h2 id="sessionName-${id}">실험 기록 없음</h2><p id="sessionDate-${id}"></p><details id="sessionDetails-${id}" hidden><summary>세션 ID 보기</summary><small id="sessionId-${id}"></small></details>
   <input id="label-${id}" maxlength="120" placeholder="새 실험 이름" aria-label="${id} 장치의 새 실험 이름">
@@ -27,13 +29,27 @@ function csvLinks(id){const page=Math.max(1,Math.floor(Number(el(id,'page').valu
  el(id,'sessionCsv').href=base+'?download=csv&offset='+offset+'&limit=10000&session='+encodeURIComponent(session)+'&device='+encodeURIComponent(id);}
 function deviceError(message){const loading=document.getElementById('loading');loading.textContent=message;loading.className='error';}
 function koreanDateTime(value){if(typeof value!=='number'||!Number.isFinite(value))return '';return new Intl.DateTimeFormat('ko-KR',{year:'numeric',month:'long',day:'numeric',hour:'numeric',minute:'numeric'}).format(new Date(value));}
+function chartSvg(points,key,min,max){
+ const valid=points.filter(p=>Number.isFinite(p[key])&&Number.isFinite(p.measured_at));if(!valid.length)return '<text x="20" y="75" fill="#526773">기록 없음</text>';
+ const first=valid[0].measured_at,last=valid[valid.length-1].measured_at,span=Math.max(1,last-first),segments=[];let current=[];
+ for(const p of valid){if(current.length&&p.measured_at-current[current.length-1].measured_at>900000){segments.push(current);current=[];}current.push(p);}if(current.length)segments.push(current);
+ const lines=segments.map(s=>'<polyline fill="none" stroke="#087f5b" stroke-width="2" points="'+s.map(p=>`${20+720*(p.measured_at-first)/span},${130-110*(Math.max(min,Math.min(max,p[key]))-min)/(max-min)}`).join(' ')+'"/>').join('');
+ return `<text x="4" y="16" fill="#526773">${max}</text><text x="4" y="138" fill="#526773">${min}</text>${lines}`;
+}
+function renderBatteryHistory(id,data){const points=Array.isArray(data.points)?data.points:[];
+ el(id,'batteryVoltageChart').innerHTML=chartSvg(points,'battery_mv',2500,4300);
+ el(id,'batteryPercentChart').innerHTML=chartSvg(points,'battery_percent',0,100);
+ const last=data.last_received_at?new Date(data.last_received_at).toLocaleString():'없음';
+ el(id,'batteryHistoryStatus').textContent=`${data.range} · ${data.total||0}개 기록 · 마지막 수신 ${last}${data.downsampled?' · 표시용 실제 점 일부 선택':''}`;}
+function loadBatteryHistory(id,range){el(id,'batteryHistoryStatus').textContent='배터리 이력 조회 중…';google.script.run.withSuccessHandler(d=>renderBatteryHistory(id,d)).withFailureHandler(e=>{el(id,'batteryHistoryStatus').textContent='배터리 이력 오류: '+String(e.message||e);}).getBatteryHistory(id,range);}
 function renderDevices(list){
  if(!Array.isArray(list)||list.some(x=>!x||typeof x.device_id!=='string'||!/^(legacy|[a-f0-9]{12})$/.test(x.device_id))){deviceError('CLOUD ERROR: Invalid device list response');return;}
  const root=document.getElementById('devices'),ids=list.map(x=>x.device_id);
  for(const id of panels.keys())if(!ids.includes(id)){document.getElementById('panel-'+id)?.remove();panels.delete(id);}
- ids.forEach((id,index)=>{if(!panels.has(id)){root.insertAdjacentHTML('beforeend',panelMarkup(id,index));panels.set(id,{sessionId:null});}pollDevice(id);});
+ ids.forEach((id,index)=>{if(!panels.has(id)){root.insertAdjacentHTML('beforeend',panelMarkup(id,index));panels.set(id,{sessionId:null});loadBatteryHistory(id,'24h');}pollDevice(id);});
  const loading=document.getElementById('loading');loading.textContent=ids.length?'':'No devices registered yet';loading.className='';}
 function show(id,d){el(id,'state').textContent=d.state;const h=d.health||{};
+ const integrity=el(id,'integrity');integrity.hidden=!d.integrity_reason;integrity.textContent=d.integrity_reason||'';
  const modes={ENV:'Environment sampling',GAS:'HP-354 gas scan',COOL:'Cooling / settling',REC:'Sensor recovery',LEGACY:'Legacy gas stream'};
  el(id,'measurement').textContent='Measurement mode: '+(modes[h.sensor_mode]||'unknown');
  el(id,'age').textContent=d.age===null?'Last environment sample: unknown':'Last environment sample: '+(d.age/1000).toFixed(1)+' s ago';

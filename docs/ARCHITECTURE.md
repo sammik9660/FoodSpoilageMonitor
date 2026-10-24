@@ -79,7 +79,9 @@ MS=<capture-ms>,ST=<status>,PID=354,T=<C>,H=<%>,P=<hPa>,G=<kOhm>
 
 ### 상태 frame
 
-`STAT`은 firmware/sensor/scan 상태와 배터리 확장 필드를 전달하는 진단 frame이다. `BV`는 mV, `BOK`는 battery reading validity, `USB`는 USB 전원 상태, `BP`는 nRF가 계산한 percentage estimate, `BS`는 calibration state다. 구버전 sensor처럼 이 필드가 없어도 gateway는 기존 환경/가스 frame을 처리한다.
+`STAT`은 firmware/sensor/scan 상태와 배터리 확장 필드를 전달하는 진단 frame이다. `BV`는 mV, `BOK`는 battery reading validity, `USB`는 USB 전원 상태, `BP`는 nRF가 계산한 percentage estimate, `BS`는 calibration state, 선택적 `BM`은 마지막 battery observation의 nRF uptime이다. 구버전 sensor처럼 이 필드가 없어도 gateway는 기존 환경/가스 frame을 처리한다.
+
+Adafruit core의 FreeRTOS tickless idle과 SoftDevice event wait를 그대로 사용하며, firmware는 System ON variable-latency low-power mode를 명시한다. System OFF는 BLE와 주기 측정을 끊고 wake 시 reset되므로 현재 상태 머신에 넣지 않는다. 상세 근거와 계측 절차는 [`NRF52840_LOW_POWER.md`](NRF52840_LOW_POWER.md)에 있다.
 
 Boot ID와 sequence는 센서 재부팅과 valid measurement 순서를 구분한다. sequence는 성공한 측정에만 증가한다.
 
@@ -139,11 +141,11 @@ Apps Script ingest API는 JSON version 3 envelope 안에서 sample schema를 구
 | 3 | HP-354 gas step | `SensorData`의 확장 열 |
 | 4 | 저빈도 environment history | `EnvironmentHistory` |
 
-`SensorData`의 기존 첫 12열과 기존 행은 보존한다. 필요한 header는 additive migration으로만 추가한다. 장치/세션 metadata는 `DeviceRegistry`, `Sessions`, ingest dedup/high-water는 `IngestState`와 cache를 사용한다.
+`SensorData`의 기존 첫 12열과 기존 행은 보존한다. 필요한 header는 additive migration으로만 추가한다. 장치/세션 metadata는 `DeviceRegistry`, `Sessions`, ingest dedup/high-water는 `IngestState`와 cache를 사용한다. `BatteryHistory`는 health에서 확인한 실제 전압, 센서가 계산한 추정 %, USB/유효성, sensor boot/uptime과 server receive time을 장치별 최대 5분 간격으로 보존한다. 배터리 이력 실패는 sample journal/ACK를 실패시키지 않는다.
 
 실제 data ingest는 ScriptLock 안에서 journal recovery, validation, append/dedup, state update를 수행하고 완료 후 ACK한다. 반환 status는 저장, duplicate, recording 외 sample, 시간 미확정 sample을 구분한다. 빈 heartbeat는 spreadsheet transaction과 전역 lock을 불필요하게 점유하지 않는 fast path를 사용하되 device live state와 recording/OTA policy 응답을 보존한다.
 
-대시보드는 5초마다 per-device live state를 조회한다. lock contention으로 recording 상태를 확정할 수 없으면 추측한 상태 대신 unknown/error 상태를 표시한다. `server_seen_at`과 sensor `age_ms`를 분리해 cloud 도착과 실제 측정 나이를 혼동하지 않는다.
+대시보드는 5초마다 per-device live state를 조회한다. battery graph는 별도 요청으로 최근 24시간, 7일 또는 전체 실제 기록을 조회하며 15분 이상 공백은 선을 끊고 임의 보간하지 않는다. lock contention으로 recording 상태를 확정할 수 없으면 추측한 상태 대신 unknown/error 상태를 표시한다. `server_seen_at`과 sensor `age_ms`를 분리해 cloud 도착과 실제 측정 나이를 혼동하지 않는다.
 
 ## Recording과 CSV
 
