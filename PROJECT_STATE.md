@@ -2,6 +2,13 @@
 
 갱신일: 2026-10-25. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-25 BME688 측정 무결성 강화 (소스/호스트 검증)
+
+- 사용자가 보관한 2026-10-25 실험 CSV의 가스 행 24개를 읽기 전용 분석했다. 08:03:28.679Z 이후 08:43:29.327Z까지 가스 행이 없고, 이후 18행은 T/H/P가 31.61°C/100%/735.47hPa로 동일하지만 gas 값과 meas_index는 각각 변한다. BID는 모든 행에서 같다. CSV에는 모든 ENV 행이 없으므로 공백의 센서 측정 원인은 확인할 수 없고, I²C/결로/히터 상태 이상도 미확정이다. 보고된 당시 펌웨어의 2초 ENV/2분 GAS 주기를 현재 120초/10분 소스와 구분한다.
+- nRF 소스 2.0.12는 기존 범위·상태 비트에 더해 최근 정상 heater-off ENV 대비 2시간 이내 기압 80hPa 초과 급변, 5분 이내 ENV 온도 40°C 초과 급변, T/H/P 세 값의 장기 동일 반복(ENV는 5개 및 5분, GAS는 가스값이 변하는 실측 4개), GAS meas_index 중복을 정상 샘플에서 제외한다. 100% 습도나 히터에 따른 온도 상승만으로는 차단하지 않는다. 강제 ENV의 meas_index 단독 재사용은 기존 Bosch 동작을 고려해 여전히 허용한다. 무효값은 SEQ나 BLE 샘플을 만들지 않고 최소 오류 카운터를 시리얼에 남긴다.
+- 연속 실패는 기존 3회 기준과 backoff를 유지한다. 정상 동작 중 첫 복구는 BME688 soft reset/재설정, 그 다음 실패부터 I²C 재초기화/재설정이다. 시작 시에는 I²C를 초기화한다. 연속 복구 시도 6회 뒤 5분 대기하며, 임의 MCU 재시작은 추가하지 않는다. 기존 loop liveness watchdog은 유지한다. 실제 고착 원인 제거와 복구 효과, 정상 환경에서 오검출 여부는 실기 미검증이다.
+- 실제 센서 소스 기반 MSVC 호스트 테스트(급변·고착·NEW_DATA 누락·중복 인덱스·복구 단계 포함), fingerprint 5개, nRF DFU 웹 5개/업로드 정책 테스트가 통과했다. Adafruit nRF52 core 1.7.0 `adafruit:nrf52:feather52840:softdevice=s140v6` 전체 컴파일 성공(Flash 171,924/815,104 bytes, RAM 16,784/237,568 bytes); 생성된 application-only ZIP에서 내장 2.0.12 버전과 Legacy DFU 구조를 확인했다. 실제 센서·BLE·클라우드 복구 결과는 검증하지 않았다.
+
 ## 2026-10-25 Windows nRF Legacy DFU 패키지 도구 (소스/자동 검증)
 
 - `NRF_DFU_만들기.bat`와 PowerShell 빌드·검증기를 추가했다. Adafruit nRF52 core 1.7.0, Feather nRF52840/S140 6.1.1 설정을 확인한 뒤 현재 센서 소스를 새로 컴파일하며 core의 `dfu genpkg --dev-type 0x0052 --sd-req 0x00B6 --application` ZIP만 사용한다. application-only manifest/BIN/DAT, CRC, 내장 펌웨어 버전을 검사하고 기존 버전 출력 폴더를 덮어쓰지 않는다.

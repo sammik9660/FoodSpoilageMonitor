@@ -10,7 +10,9 @@ static void envCycle(uint32_t at,bool connected=true){
  static uint8_t envIndex=0;
  testBleConnected=connected;testMillis=at;nextEnvMeasurement=at;lastHealth=at;loop();
  assert(envConversionPending&&sensorMode==MODE_ENV);
- testFields.push_back(field(0,++envIndex,0,0x80));
+ bme68xData env=field(0,++envIndex,0,0x80);
+ env.temperature=25.0f+envIndex*0.01f;
+ testFields.push_back(env);
  testMillis=nextMeasurement;lastHealth=testMillis;loop();
  assert(!envConversionPending);
  testBleConnected=true;
@@ -21,7 +23,8 @@ static void gasStep(const bme68xData& d){
 static void dueScan(){
  testMillis=nextGasScan;lastHealth=testMillis;loop();
   assert(envConversionPending&&sensorMode==MODE_ENV); // fresh T/H/P immediately before gas
-  testFields.push_back(field(0,201,0,0x80));
+  bme68xData env=field(0,201,0,0x80);env.temperature=27.01f;
+  testFields.push_back(env);
   testMillis=nextMeasurement;lastHealth=testMillis;loop();
  assert(sensorMode==MODE_GAS && (testGas1&BME68X_RUN_GAS_MSK));
 }
@@ -39,6 +42,22 @@ int main(){
  assert(!isMeasurementValid(true,25,50,100000,0));
  assert(!isMeasurementValid(true,NAN,50,100000,70000));
  assert(!isMeasurementValid(false,25,50,100000,70000));
+ assert(!isMeasurementValid(true,25,50,120000,70000));
+ measurement_guard::Guard guard;
+ guard.acceptEnvironment(3,99,100772,1000);
+ assert(guard.environmentValid(3,100,100770,2000)); // cold and saturated can be real
+ assert(guard.environmentValid(31,100,100770,3000)); // transient heater warming
+ assert(!guard.environmentValid(31.61f,100,73547,4000));
+ assert(!guard.gasValid(31.61f,100,73547,200000,4000));
+ for(int i=0;i<3;++i)assert(guard.gasValid(5,80,100770,100000+i,5000+i));
+ assert(!guard.gasValid(5,80,100770,100003,5008)); // gas changes; T/H/P frozen
+ guard.acceptEnvironment(5,80,100770,6000);
+ assert(guard.gasValid(5,100,100770,100004,6100)); // RH=100 alone is valid
+ for(int i=0;i<3;++i){
+   assert(guard.environmentValid(5,80,100770,120000*(i+1)));
+   guard.acceptEnvironment(5,80,100770,120000*(i+1));
+ }
+ assert(!guard.environmentValid(5,80,100770,480000));
  setup();
  assert(Bluefruit.Periph.minMs==60&&Bluefruit.Periph.maxMs==80);
  assert(Bluefruit.Periph.latency==1&&Bluefruit.Periph.timeoutMs==4000);
@@ -148,5 +167,44 @@ int main(){
  gas_scan::Tracker tracker;assert(tracker.observe(0,254,true));
  assert(tracker.observe(2,255,true));assert(tracker.observe(2,0,true));
  tracker.observe(9,1,true);assert(tracker.complete==0&&tracker.incomplete==1);
+ // A fresh index must accompany each real step. No stale gas step is sent.
+ sensorMode=MODE_ENV;sensorReady=true;recoveryPending=false;
+ measurementGuard.acceptEnvironment(25,50,100000,testMillis);
+ assert(startGasScan());scanTracker.resetForRecovery();
+ const uint32_t beforeIndexSeq=validSequence,beforeIndexErrors=duplicateGasIndexes;
+ gasStep(field(0,10));gasStep(field(1,10));
+ assert(validSequence==beforeIndexSeq+1&&duplicateGasIndexes==beforeIndexErrors+1);
+ // Recovery first resets the BME688, then reinitializes the I2C bus if the
+ // next attempt has still not produced a valid measurement.
+ recoveryAttempts=1;recoveryStage=0;recoveryAttemptsSinceGood=0;
+ testBeginOK=true;recoverSensor();assert(sensorReady&&recoveryStage==1);
+ testBeginOK=false;recoverSensor();assert(!sensorReady&&recoveryStage==2);
+ testBeginOK=true;recoverSensor();assert(sensorReady&&recoveryStage==2);
+ sensorMode=MODE_ENV;measurementGuard.acceptEnvironment(25,50,100000,testMillis);
+ nextGasScan=testMillis+ENV_INTERVAL_MS;envCycle(testMillis+10);
+ assert(recoveryStage==0&&recoveryAttemptsSinceGood==0);
+ const uint32_t envBeforeInvalid=envSequence;
+ testMillis=nextEnvMeasurement;lastHealth=testMillis;loop();assert(envConversionPending);
+ bme68xData pressureJump=field(0,42,0,0x80);pressureJump.pressure=73547;
+ testFields.push_back(pressureJump);testMillis=nextMeasurement;lastHealth=testMillis;loop();
+ assert(!envReadOK&&envSequence==envBeforeInvalid&&envConsecutiveFailures==1);
+ testMillis=nextEnvMeasurement;lastHealth=testMillis;loop();assert(envConversionPending);
+ testFields.push_back(field(0,43,0,0));testMillis=nextMeasurement;lastHealth=testMillis;loop();
+ assert(!envReadOK&&envSequence==envBeforeInvalid&&envConsecutiveFailures==2);
+ sensorReady=true;sensorMode=MODE_ENV;recoveryPending=false;
+ measurementGuard.acceptEnvironment(25,50,100000,testMillis);
+ assert(startGasScan());scanTracker.resetForRecovery();
+ const uint32_t gasBeforeJump=validSequence;
+ for(uint8_t step=0;step<3;++step){
+   bme68xData jump=field(step,step+50,70000+step);
+   jump.pressure=73547;
+   gasStep(jump);
+ }
+ assert(validSequence==gasBeforeJump&&sensorMode!=MODE_GAS);
+ testBeginOK=false;recoveryAttemptsSinceGood=5;
+ recoverSensor();assert(!sensorReady&&nextRecovery-testMillis>=299000);
+ const uint32_t attemptsAtBudget=recoveryAttempts;
+ testMillis+=10000;lastHealth=testMillis;loop();
+ assert(recoveryAttempts==attemptsAtBudget); // no high-speed failed-init loop
  puts("PASS nRF real source: ENV/GAS/COOL, heater-off, 120s/10m schedules, incomplete scan, recovery, liveness and wrap");
 }

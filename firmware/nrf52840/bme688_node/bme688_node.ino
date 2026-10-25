@@ -210,6 +210,7 @@
 #include "src/Bosch-BME68x-Library/src/bme68xLibrary.h"
 #endif
 #include "Scan.h"
+#include "MeasurementGuard.h"
 #include <math.h>
 #if !defined(_MSC_VER)  // Windows host sensor test에는 OLED 하드웨어가 없다.
 #include <Adafruit_GFX.h>
@@ -245,9 +246,10 @@ constexpr uint32_t ENV_FAILURE_RETRY_MS = 5000;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.11";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.12";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
+measurement_guard::Guard measurementGuard;
 bme68xData lastEnvData={};
 #if !defined(_MSC_VER)
 BLEDfu bledfu; // Buttonless entry into the existing Adafruit legacy BLE DFU bootloader.
@@ -262,6 +264,8 @@ Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET_PIN);
 uint32_t bootId, validSequence = 0, failures = 0, consecutiveFailures = 0;
 uint32_t envSequence = 0, envFailures = 0, envConsecutiveFailures = 0;
 uint32_t recoveryAttempts = 0, recoveries = 0, txErrors = 0;
+uint32_t implausibleMeasurements = 0, frozenMeasurements = 0, duplicateGasIndexes = 0;
+uint8_t recoveryStage = 0, recoveryAttemptsSinceGood = 0;
 uint32_t nextMeasurement = 0, nextRecovery = 0, lastHealth = 0;
 uint32_t nextBatteryMeasurement = 0, nextUsbPowerCheck = 0, batteryMillivolts = 0;
 uint32_t batteryMeasuredAt = 0;
@@ -318,8 +322,8 @@ bool isMeasurementValid(bool readOK, double temperature, double humidity,
                         double pressure, double gasResistance) {
   // H=100% or low pressure can be physically real; do not hard-code the old
   // incident signature. G<=0 is the confirmed invalid condition.
-  return readOK && isfinite(temperature) && isfinite(humidity) &&
-         isfinite(pressure) && isfinite(gasResistance) && gasResistance > 0;
+  return readOK && measurement_guard::physical(temperature,humidity,pressure) &&
+         isfinite(gasResistance) && gasResistance > 0;
 }
 
 uint32_t vddhMillivoltsFromRaw(uint32_t raw) {
@@ -755,6 +759,17 @@ bool initializeSensor() {
   return stopGasHeater();
 }
 
+bool softResetBME688();
+bool reconfigureAfterSoftReset() {
+  if (!softResetBME688()) return false;
+  bme.begin(BME_ADDRESS, Wire);
+  if (bme.checkStatus() == BME68X_ERROR) return false;
+  bme.setTPH(BME68X_OS_8X, BME68X_OS_4X, BME68X_OS_2X);
+  if (bme.checkStatus() == BME68X_ERROR) return false;
+  bme.setFilter(BME68X_FILTER_SIZE_3);
+  return bme.checkStatus() != BME68X_ERROR && stopGasHeater();
+}
+
 // ============================================================
 // BME688 강제 소프트 리셋
 // - 이상값(G=0 등)이 지속될 때 센서 내부 상태를 초기화
@@ -786,9 +801,12 @@ void recoverSensor() {
   // reinitialization restored operation. Keep recovery AND backoff, even if
   // ordinary tests pass. A successful begin is not yet a successful recovery.
   const bool wasGas=sensorMode==MODE_GAS || recoveringGas;
+  const bool resetBus=recoveryAttempts==0 || recoveryStage!=0;
   ++recoveryAttempts;
+  ++recoveryAttemptsSinceGood;
   scanTracker.resetForRecovery(); // retain scan counter within this BID
-  sensorReady = initializeSensor();
+  sensorReady = resetBus ? initializeSensor() : reconfigureAfterSoftReset();
+  recoveryStage = resetBus ? 2 : 1; // next failed soft reset escalates to I2C reinit
   if(sensorReady)sensorReadyAt=millis();
   recoveryPending = true;
   lastReadOK = false;consecutiveFailures=0;envConsecutiveFailures=0;
@@ -798,7 +816,13 @@ void recoverSensor() {
   if(wasGas){coolingStartedAt=millis();nextGasScan=coolingStartedAt+GAS_SCAN_INTERVAL_MS;}
   nextRecovery = millis() + recoveryDelay;
   recoveryDelay = min(recoveryDelay * 2, RECOVERY_MAX_MS);
+  if(recoveryAttemptsSinceGood>=6) {
+    nextRecovery=millis()+300000; // bounded attempts, then a quiet retry window
+    recoveryAttemptsSinceGood=0;
+    Serial.println("RECOVERY retry budget exhausted; next attempt in 300 s");
+  }
   Serial.print("RECOVERY init="); Serial.print(sensorReady);
+  Serial.print(" stage=");Serial.print(resetBus?"I2C":"soft");
   Serial.print(" attempts="); Serial.println(recoveryAttempts);
   nextMeasurement = millis();nextEnvMeasurement=millis();
   lastSensorField = millis();
@@ -919,19 +943,29 @@ void serviceEnvironment(uint32_t now) {
   }
   bme68xData data={};bme.getData(data);envConversionPending=false;
   const double hpa=data.pressure/100.0;
+  // A forced conversion may reuse the 8-bit index. Require NEW_DATA from the
+  // conversion started above; do not reject an index match alone.
   if(!(data.status&BME68X_NEW_DATA_MSK) ||
-     //(haveEnvMeasurementIndex && data.meas_index==lastEnvMeasurementIndex) ||
-     !isfinite(data.temperature) ||
-     !isfinite(data.humidity) || !isfinite(data.pressure) ||
-     data.temperature<-40 || data.temperature>85 || data.humidity<0 ||
-     data.humidity>100 || hpa<300 || hpa>1100) {
+     !measurementGuard.environmentValid(data.temperature,data.humidity,
+                                        data.pressure,millis())) {
+    if(data.status&BME68X_NEW_DATA_MSK &&
+       measurementGuard.repeatedEnvironmentFields>=measurement_guard::FROZEN_ENV_FIELDS-1 &&
+       data.temperature==measurementGuard.environmentTemperature &&
+       data.humidity==measurementGuard.environmentHumidity &&
+       data.pressure==measurementGuard.environmentPressure)
+      ++frozenMeasurements;
+    else ++implausibleMeasurements;
+    Serial.print("SENSOR guard counters implausible=");Serial.print(implausibleMeasurements);
+    Serial.print(" frozen=");Serial.println(frozenMeasurements);
     environmentFailure("invalid T/H/P");return;
   }
   if(envSequence==UINT32_MAX){sensorReady=false;sensorMode=MODE_REC;
     Serial.println("ERROR environment SEQ exhausted");return;}
   ++envSequence;lastEnvData=data;envReadOK=true;envConsecutiveFailures=0;
+  measurementGuard.acceptEnvironment(data.temperature,data.humidity,data.pressure,millis());
   lastEnvMeasurementIndex=data.meas_index;haveEnvMeasurementIndex=true;
   recoveryDelay=RECOVERY_MIN_MS;
+  recoveryStage=0;recoveryAttemptsSinceGood=0;
   if(recoveryPending){++recoveries;recoveryPending=false;Serial.println("RECOVERY environment measurement OK");}
   char frame[120];
   const int n=snprintf(frame,sizeof(frame),
@@ -1022,9 +1056,22 @@ void loop() {
       const bool statusValid=(data.status & (BME68X_NEW_DATA_MSK |
         BME68X_GASM_VALID_MSK | BME68X_HEAT_STAB_MSK)) ==
         (BME68X_NEW_DATA_MSK | BME68X_GASM_VALID_MSK | BME68X_HEAT_STAB_MSK);
+      const bool duplicateIndex=data.gas_index!=0 && scanTracker.started &&
+        scanTracker.haveLast && data.meas_index==scanTracker.lastMeasurement;
       const bool valuesValid=isMeasurementValid(true,data.temperature,data.humidity,
                                                 data.pressure,data.gas_resistance);
-      const bool valid=statusValid && valuesValid && data.gas_index<gas_scan::STEPS;
+      const bool plausible=statusValid && valuesValid && !duplicateIndex &&
+        data.gas_index<gas_scan::STEPS && measurementGuard.gasValid(
+        data.temperature,data.humidity,data.pressure,data.gas_resistance,millis());
+      const bool valid=statusValid && plausible && !duplicateIndex &&
+                       data.gas_index<gas_scan::STEPS;
+      if(duplicateIndex)++duplicateGasIndexes;
+      if(statusValid && valuesValid && !duplicateIndex &&
+         data.gas_index<gas_scan::STEPS && !plausible) {
+        if(measurementGuard.repeatedGasFields>=measurement_guard::FROZEN_GAS_FIELDS)
+          ++frozenMeasurements;
+        else ++implausibleMeasurements;
+      }
       if(data.gas_index>=gas_scan::STEPS)scanTracker.invalidate();
       const bool grouped=scanTracker.observe(data.gas_index,data.meas_index,valid);
       if(!valid) {
@@ -1033,15 +1080,22 @@ void loop() {
         ++failures; lastReadOK=false;
         // A real but heater-unstable gas field during warm-up is not yet a
         // persistent fault; later repeated invalid fields use the threshold.
-        if(statusValid ? !valuesValid : (uint32_t)(millis()-sensorReadyAt)>=20000)
+        if(statusValid ? (!plausible || duplicateIndex) :
+           (uint32_t)(millis()-sensorReadyAt)>=20000)
           ++consecutiveFailures;
         Serial.print("SENSOR invalid step GI="); Serial.print(data.gas_index);
         Serial.print(" ST="); Serial.print(data.status,HEX);
-        Serial.print(" G(ohm)="); Serial.println(data.gas_resistance);
+        Serial.print(" G(ohm)=");Serial.print(data.gas_resistance);
+        Serial.print(" T/H/P=");Serial.print(data.temperature);Serial.print('/');
+        Serial.print(data.humidity);Serial.print('/');Serial.println(data.pressure);
+        Serial.print("SENSOR guard counters implausible=");Serial.print(implausibleMeasurements);
+        Serial.print(" frozen=");Serial.print(frozenMeasurements);
+        Serial.print(" duplicateMI=");Serial.println(duplicateGasIndexes);
         continue;
       }
       consecutiveFailures=0; lastReadOK=true;
       recoveryDelay=RECOVERY_MIN_MS;
+      recoveryStage=0;recoveryAttemptsSinceGood=0;
       if(recoveryPending) { ++recoveries; recoveryPending=false; Serial.println("RECOVERY measurement OK"); }
       if(!grouped) { Serial.println("SCAN waiting for step 0"); continue; }
       if(validSequence==UINT32_MAX) { sensorReady=false; Serial.println("ERROR sensor SEQ exhausted"); break; }
