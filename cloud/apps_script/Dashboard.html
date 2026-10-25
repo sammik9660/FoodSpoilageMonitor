@@ -80,7 +80,7 @@ function show(id,d){el(id,'state').textContent=d.state;const h=d.health||{};
  el(id,'firmware').textContent='Version: '+(h.firmware_version||'unknown');
  el(id,'ota').textContent='OTA: '+(h.ota_state||'unknown');
  const espOtaLink=el(id,'espOtaLink'),nrfDfuLink=el(id,'nrfDfuLink');const ip=typeof h.local_ip==='string'&&/^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)\d{1,3}\.\d{1,3}$/.test(h.local_ip);
- espOtaLink.hidden=nrfDfuLink.hidden=!ip;if(ip){const local='http://'+h.local_ip+':8080';espOtaLink.href=local+'/';nrfDfuLink.href=local+'/nrf-dfu';}
+ espOtaLink.hidden=nrfDfuLink.hidden=!ip;if(ip){const local='http:'+'/'+'/'+h.local_ip+':8080';espOtaLink.href=local+'/';nrfDfuLink.href=local+'/nrf-dfu';}
  el(id,'transport').textContent=`Wi-Fi: ${h.wifi_connected_ms?'connected at gateway uptime '+Math.round(h.wifi_connected_ms/1000)+' s':'unknown'} · BLE: ${h.ble_connected===true?'connected':h.ble_connected===false?'disconnected':'unknown'} · cloud ACK age: ${ackAge} · last cloud contact: ${seen}`;
  el(id,'health').textContent=JSON.stringify(h,null,2);}
 function pollDevice(id){if(polling.has(id))return;polling.add(id);google.script.run.withSuccessHandler(d=>{polling.delete(id);if(panels.has(id))show(id,d);}).withFailureHandler(e=>{polling.delete(id);if(panels.has(id)){el(id,'state').textContent='CLOUD/UPLOAD ERROR (dashboard request)';el(id,'message').textContent=String(e.message||e);el(id,'message').className='error';}}).getDashboard(id);}

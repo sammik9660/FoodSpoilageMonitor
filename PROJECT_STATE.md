@@ -1,5 +1,10 @@
 # 프로젝트 현재 상태
 
+## 2026-10-26 Apps Script 대시보드 초기화 오류 (로컬 수정, 배포 미검증)
+
+- 사용자가 제공한 `/exec` 응답의 `userHtml`에서 로컬 업데이트 URL 생성 줄이 `const local='http:`에서 끊겨 JavaScript 구문 오류가 났다. 이 경우 장치 목록 호출 전에 스크립트가 중단되어 `Loading devices…`가 남는다. `Dashboard.html`에서 URL의 두 슬래시를 별도 문자열로 연결해 같은 주소를 만들도록 변경했다. Sheets, `Code.gs`, 펌웨어는 변경하지 않았다.
+- mock Sheets cloud 테스트 39개와 `git diff --check`가 통과했다. 실제 Apps Script 템플릿 평가 결과와 운영 웹앱 정상화는 사용자가 새 버전으로 기존 배포를 갱신한 후 확인해야 한다.
+
 갱신일: 2026-10-25. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
 ## 2026-10-25 BME688 측정 무결성 강화 (소스/호스트 검증)

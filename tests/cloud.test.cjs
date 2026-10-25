@@ -196,6 +196,7 @@ test('dashboard defines device-scoped panels, polling, controls and paged CSV li
  assert(html.includes("loadBatteryHistory(id,'24h')"));assert(html.includes('.getBatteryHistory(id,range)'));
  assert(html.includes('p.measured_at-current[current.length-1].measured_at>900000'));
  assert(html.includes("espOtaLink.href=local+'/'"));assert(html.includes("nrfDfuLink.href=local+'/nrf-dfu'"));
+ assert(html.includes("const local='http:'+'/'+'/'+h.local_ip+':8080'"));
  assert(html.includes("device='+encodeURIComponent(id)"));assert(html.includes("session='+encodeURIComponent(session)"));
  assert(html.includes('section.device'));assert(html.includes('panels=new Map()'));
  const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','5000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
@@ -216,11 +217,13 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  const ctx={document:{getElementById:element},google:{script:{run:runner}},setInterval(){},setTimeout(){},Number,String,JSON,encodeURIComponent,Map,Date};
  vm.createContext(ctx);vm.runInContext(script,ctx);
  assert(element('panel-'+a)&&element('panel-'+b));
- ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_mv:4090,battery_percent:89,battery_calibration_state:'COLLECTING',battery_min_mv:3600,battery_max_mv:4150,battery_measurement_valid:true,usb_power:false},
+ ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_mv:4090,battery_percent:89,battery_calibration_state:'COLLECTING',battery_min_mv:3600,battery_max_mv:4150,battery_measurement_valid:true,usb_power:false,local_ip:'192.168.0.142'},
   recording:{state:'STOPPED',session_id:null,download_session_id:'EXP-recent',download_experiment_label:'바나나껍데기',download_started_at:e.now(),download_kind:'LATEST'}});
  assert.equal(element('state-'+a).textContent,'STALE');
  assert.equal(element('values-'+a).textContent,'24.50 °C · 47.25 % · 1002.50 hPa');
  assert.equal(element('battery-'+a).textContent,'BAT 4.09 V · 89%');
+ assert.equal(element('espOtaLink-'+a).href,'http://192.168.0.142:8080/');
+ assert.equal(element('nrfDfuLink-'+a).href,'http://192.168.0.142:8080/nrf-dfu');
  assert(element('battery-'+a).title.includes('COLLECTING'));
  assert.equal(element('age-'+a).textContent,'Last environment sample: 20.0 s ago');
  assert.equal(element('recording-'+a).textContent,'실험 종료됨');assert.equal(element('sessionName-'+a).textContent,'바나나껍데기');
