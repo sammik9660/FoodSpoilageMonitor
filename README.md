@@ -17,6 +17,10 @@ ESP32-S3 현재 빌드 설정은 **Flash Size 16MB / sketch custom OTA partition
 
 Wi-Fi 설정은 실행 중인 ESP32의 **BOOT(GPIO0)을 놓을 때** 결정된다. 3초 이상 10초 미만이면 기존 네트워크를 보존한 채 설정 AP를 열고, 10초 이상이면 Wi-Fi 자격 증명만 지운 뒤 AP를 연다. 짧게 누르면 기존 LCD 화면 전환이다. 휴대폰에서 AP에 접속한 뒤 자동 설정 창이 뜨지 않으면 `http://192.168.4.1/`을 연다. Android/iOS의 자동 팝업은 보장되지 않는다. BOOT을 누른 채 전원을 켜거나 EN/RESET을 누르면 ESP32의 ROM 다운로드 모드로 들어갈 수 있으므로, 부팅이 끝난 뒤 BOOT만 누른다. 새 네트워크 연결에 실패하면 저장된 네트워크로 자동 복귀한다. 최대 4개를 저장하며 가득 차면 기존 항목을 덮어쓰지 않는다.
 
+설정 포털은 AP의 `http://192.168.4.1/`(80번 포트), 서명된 ESP32 OTA와 nRF DFU 관리 페이지는 STA의 `http://<gateway-ip>:8080/` 및 `http://<gateway-ip>:8080/nrf-dfu`다. 같은 네트워크에서 `http://foodmonitor.local:8080/`도 사용할 수 있다. STA 연결 중 포털을 열면 두 서버가 서로 다른 포트를 사용한다. 새 네트워크를 저장해 연결을 시험하는 동안에는 STA 연결이 일시적으로 바뀔 수 있다.
+
+Windows에서 ESP32 OTA 파일을 준비하려면 Arduino IDE에서 **Export Compiled Binary**로 새 `gateway.ino.bin`을 만든 다음 루트의 `OTA_패키지_만들기.bat`를 더블클릭한다. PowerShell 7과 기존 로컬 서명키가 필요하다. 실행 중인 장치의 `OTA?` 버전·빌드, 내보낸 BIN 경로를 입력하면 도구가 소스/BIN 식별자를 대조하고 기존 서명·검증 스크립트로 `data/ota-<version>-<build>/`에 `.bin`과 `.manifest`를 만든다. 기존 패키지는 덮어쓰지 않는다. 소스 변경 후 이전 BIN을 선택했다면 새로 컴파일·내보내기해야 한다. 패키징만으로 장치가 업데이트되지는 않는다.
+
 ```text
 BME688 -> nRF52840 -> BLE Nordic UART Service -> ESP32-S3
        -> Wi-Fi / smartphone hotspot -> Google Apps Script

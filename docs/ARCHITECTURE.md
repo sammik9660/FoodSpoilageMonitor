@@ -125,7 +125,7 @@ Data batch는 최대 32 samples이고 data upload가 health heartbeat보다 우�
 
 ## Wi-Fi, HTTPS와 메모리
 
-두 NVS credential slot은 기존 형식을 유지한다. last-success slot을 먼저 시도하고 연결 실패/disconnect event 뒤 다음 slot로 전환한다. 두 AP가 모두 없으면 제한된 backoff로 다시 순환하며 정상 연결을 불필요하게 끊지 않는다. mDNS `foodmonitor.local`은 편의 주소이고 실패해도 IP 접속과 cloud upload는 계속한다.
+최대 네 NVS credential slot은 기존 형식을 유지한다. last-success slot을 먼저 시도하고 연결 실패/disconnect event 뒤 다음 slot로 전환한다. 두 AP가 모두 없으면 제한된 backoff로 다시 순환하며 정상 연결을 불필요하게 끊지 않는다. mDNS `foodmonitor.local`은 편의 주소이고 실패해도 IP 접속과 cloud upload는 계속한다.
 
 HTTPS request는 host name을 SNI/HTTP에 유지하면서 이미 해결한 IP를 secure client에 전달하는 경로를 사용한다. 이는 ESP-IDF/lwIP core-lock 문맥 문제를 피하기 위한 현재 구현이다. prototype은 `setInsecure()`를 사용하므로 공개 배포 전 CA 검증이 남은 보안 부채다.
 

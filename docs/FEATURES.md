@@ -47,7 +47,7 @@
 | 기능 | 구현 내용 | 검증 상태 |
 |---|---|---|
 | BLE 수신 | NUS scan/connect/subscribe, newline 재조립, v2/v3/ENV/STAT parsing, 재연결을 수행한다. 명시적 sensor ID pairing으로 다른 센서 연결을 막을 수 있다. | 단일 장치 실기 검증 |
-| Wi-Fi 자동 복구 | 두 저장 슬롯, 마지막 성공 슬롯 우선, event 기반 연결 종료 후 failover, 제한된 retry/backoff를 사용한다. 연결된 SSID를 불필요하게 끊지 않으며 IP와 `foodmonitor.local`을 제공한다. | 자동 테스트 통과. 실제 네트워크 조건별 장기 검증 일부 미완료 |
+| Wi-Fi 자동 복구 | 최대 네 저장 슬롯, 마지막 성공 슬롯 우선, event 기반 연결 종료 후 failover, 제한된 retry/backoff를 사용한다. 연결된 SSID를 불필요하게 끊지 않으며 IP와 `foodmonitor.local`을 제공한다. | 자동 테스트 통과. 실제 네트워크 조건별 장기 검증 일부 미완료 |
 | 최신 상태 heartbeat | 실제 sample이 없을 때 약 5초마다 최신 environment/battery health를 전송한다. data upload를 우선하며 heartbeat는 spool이나 환경·가스 sample을 만들지 않는다. battery health만 장치별 최대 5분 간격으로 별도 이력화한다. | 호스트·클라우드 테스트 통과. 운영 배포 버전 일치 여부 확인 필요 |
 | HTTPS 업로드 | JSON POST, redirect GET, application ACK parsing과 제한된 retry를 수행한다. UID가 ACK되기 전 sample을 제거하지 않는다. | 운영 ACK·재전송 실기 검증 |
 | PSRAM 메모리 관리 | 직렬화된 큰 HTTP JSON을 exact-size PSRAM buffer로 옮기고 내부 임시 buffer를 TLS 전에 해제한다. 실패 시 내부 RAM fallback을 사용하며 내부/PSRAM heap 진단을 남긴다. BLE queue, RTOS 객체와 TLS 필수 객체는 내부 RAM에 둔다. | 자동 테스트 통과. 현재 최종 빌드의 장시간 TLS 실기 검증 필요 |

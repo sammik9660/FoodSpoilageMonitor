@@ -1,5 +1,7 @@
 # ESP32-S3 Wi-Fi OTA — Stage 2
 
+**Current local updater address:** `http://<gateway-ip>:8080/` (or `http://foodmonitor.local:8080/` on a supporting LAN). The Wi-Fi configuration AP keeps `http://192.168.4.1/` on port 80. The local updater and its nRF DFU page retain Basic authentication and signed/package checks. For a new build, Windows users can run the root `OTA_패키지_만들기.bat` after exporting the application BIN; it reuses the signer and package verifier below and refuses a BIN without an embedded source-matched version/build identity.
+
 ## v2.0.7 to v2.0.8 validation
 
 The user reports USB-installed 2.0.7/build 2026101905 with BLE, cloud ACK and spool drain working. Its OTA receiver is still unverified. Version 2.0.8/build 2026101906 changes only the release identifiers; retain the settings and custom partition below.

@@ -343,3 +343,9 @@
 - 기존 WiFiManager 비차단 포털과 DNS를 유지하고 Android/iOS 감지 URL을 AP 루트로 돌린다. Galaxy 자동 팝업은 OS 정책상 보장되지 않으므로 `http://192.168.4.1/` 접속을 지원한다. 포털 동안 로컬 OTA 웹서버의 80번 포트를 비우고, 포털 종료 시 저장된 네트워크 재연결을 재개한다.
 - Wi-Fi 목록은 기존 `fsm-wifi` 구조의 `ap0/ap1`과 같은 형식으로 `ap2/ap3`까지 사용한다. 새 등록이 목록을 채우면 기존 자격 증명을 덮어쓰지 않는다. SPIFFS/spool, 장치 ID, OTA/DFU, 클라우드 설정은 초기화하지 않는다.
 - BOOT 시간 경계·목록 보존 호스트 테스트와 OTA 접근 회귀 테스트 5개가 통과했다. ESP32 Arduino core 3.3.12 전체 빌드(16MB, OPI PSRAM, 기존 sketch 파티션)는 종료 코드 0, 앱 1,566,011/3,145,728 bytes다. 실제 AP/포털/복귀 및 BLE·spool 동시 동작은 아직 실기 미검증이다.
+
+# 2026-10-25 OTA 포트 분리 및 Windows 패키징 (로컬 변경)
+
+- WiFiManager AP 포털은 80번 포트를 유지하고 기존 ESP32 OTA/nRF DFU 관리 WebServer는 8080번 포트로 분리한다. 설치된 WiFiManager는 정상 연결된 STA에 대해 포털 시작 시 disconnect 분기를 건너뛰고 softAP를 시작한다. 새 자격 증명 연결 시험과 포털 종료 모드 복원 중에는 STA가 일시적으로 바뀔 수 있어 실기 확인이 필요하다.
+- 로컬 관리 페이지의 Basic 인증, Host/Origin 검사, OTA 서명·anti-rollback, 클라우드 승인, nRF DFU 안전 조건은 유지한다. Dashboard의 로컬 링크와 mDNS HTTP service 포트도 8080에 맞춘다. 운영 Apps Script 배포는 수행하지 않았다.
+- 새 BIN에 소스 버전/빌드 식별자를 포함해 Windows BAT가 과거 BIN과 불일치를 거부할 수 있게 했다. BAT는 기존 개인키와 서명·검증 스크립트를 사용하며 패키지와 키를 덮어쓰지 않는다. ESP32 core 3.3.12 지정 설정 전체 빌드는 종료 코드 0, 앱 1,567,055/3,145,728 bytes였다. 최종 BIN의 서명·SHA-256·내장 공개키 검증 및 개인키 누락/잘못된 BIN/중복·역행 빌드 거부 테스트는 통과했다. 테스트 패키지는 정리했으며 실제 OTA/DFU 전송과 포털·클라우드 동시 동작은 미검증이다.

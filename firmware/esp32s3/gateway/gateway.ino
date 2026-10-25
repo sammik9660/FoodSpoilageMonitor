@@ -176,8 +176,15 @@ constexpr uint32_t LCD_REFRESH_MS=750;
 // Hardware CDC/JTAG is the verified console. Mirroring every line to UART0 made
 // combined captures show each event twice; UART0 remains available as an opt-in.
 constexpr bool UART_DIAGNOSTICS=false;
-constexpr char FIRMWARE_VERSION[]="2.0.12";
-constexpr uint64_t OTA_BUILD_NUMBER=2026102502ULL;
+#define FSGW_VERSION "2.0.13"
+#define FSGW_BUILD 2026102503
+#define FSGW_STRINGIFY_INNER(value) #value
+#define FSGW_STRINGIFY(value) FSGW_STRINGIFY_INNER(value)
+constexpr char FIRMWARE_VERSION[]=FSGW_VERSION;
+constexpr uint64_t OTA_BUILD_NUMBER=FSGW_BUILD;
+// A package creator can verify both release identifiers in the application BIN.
+constexpr char OTA_BIN_ID[]="FSGWBUILD:" FSGW_VERSION ":" FSGW_STRINGIFY(FSGW_BUILD);
+constexpr uint16_t OTA_WEB_PORT=8080;
 
 BLEUUID NUS_SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
 
@@ -255,7 +262,7 @@ char otaManifestBuffer[512]={};
 size_t otaManifestLength=0;
 mbedtls_sha256_context otaShaContext;
 bool otaShaStarted=false;
-WebServer otaServer(80);
+WebServer otaServer(OTA_WEB_PORT);
 uint64_t otaLastCloudAckAt=0;
 uint32_t otaPendingSamples=0;
 bool otaUploadActive=false;
@@ -642,9 +649,13 @@ bool otaSameOrigin() {
   const String host=otaServer.header("Host");
   const String origin=otaServer.header("Origin");
   const String ip=WiFi.localIP().toString();
-  const bool ipOrigin=host==ip&&origin==String("http://")+ip;
-  const bool mdnsOrigin=host=="foodmonitor.local"&&origin=="http://foodmonitor.local";
-  return ipOrigin||mdnsOrigin;
+  const String ipHost=ip+":"+String(OTA_WEB_PORT);
+  const bool ipOrigin=host==ipHost&&origin==String("http://")+ipHost;
+  const bool mdnsOrigin=host==String("foodmonitor.local:")+String(OTA_WEB_PORT)&&
+    origin==String("http://foodmonitor.local:")+String(OTA_WEB_PORT);
+  const String apHost=WiFi.softAPIP().toString()+":"+String(OTA_WEB_PORT);
+  const bool apOrigin=(WiFi.getMode()&WIFI_AP)&&host==apHost&&origin==String("http://")+apHost;
+  return ipOrigin||mdnsOrigin||apOrigin;
 }
 
 bool nrfPackageUploadSafe() {
@@ -1157,7 +1168,7 @@ void startOtaWebServer() {
   otaServerRoutesRegistered=true;
   }
   otaServer.begin();otaServerReady=true;
-  logEvent("OTA local updater listening at http://%s/",WiFi.localIP().toString().c_str());
+  logEvent("OTA local updater listening at http://%s:%u/",WiFi.localIP().toString().c_str(),(unsigned)OTA_WEB_PORT);
 }
 
 void checkOtaBootValidation(uint64_t now) {
@@ -1206,12 +1217,10 @@ void startWifiPortal() {
   if(!wifiPortalAllowed()){
     logEvent("Wi-Fi portal deferred: firmware update active");return;
   }
-  if(otaServerReady){otaServer.stop();otaServerReady=false;}
   // In nonblocking mode startConfigPortal() returns false even when active.
   wifiManager.startConfigPortal(AP_NAME,AP_PASSWORD);
   if(!wifiManager.getConfigPortalActive()){
     logEvent("ERROR Wi-Fi configuration portal inactive after start");
-    if(WiFi.status()==WL_CONNECTED)startOtaWebServer();
   }
   else {
     wifiPortalStarted=true;
@@ -1242,10 +1251,10 @@ void serviceWifi(uint64_t now) {
       // slot failover while HTTPS work can be active on another task.
       if(!mdnsReady) {
         mdnsReady=MDNS.begin("foodmonitor");
-        if(mdnsReady)MDNS.addService("http","tcp",80);
-        else logEvent("mDNS unavailable; use IP address http://%s/",WiFi.localIP().toString().c_str());
+        if(mdnsReady)MDNS.addService("http","tcp",OTA_WEB_PORT);
+        else logEvent("mDNS unavailable; use IP address http://%s:%u/",WiFi.localIP().toString().c_str(),(unsigned)OTA_WEB_PORT);
       }
-      if(mdnsReady)logEvent("mDNS updater address=http://foodmonitor.local/");
+      if(mdnsReady)logEvent("mDNS updater address=http://foodmonitor.local:%u/",(unsigned)OTA_WEB_PORT);
     }
     return; // Never scan or switch a healthy connection.
   }
@@ -2349,6 +2358,7 @@ void setup() {
   logEvent("FIRMWARE build=%s compiled=%s %s flash_chip=%lu psram=%lu psram_free=%lu",FIRMWARE_VERSION,
     __DATE__,__TIME__,(unsigned long)ESP.getFlashChipSize(),(unsigned long)ESP.getPsramSize(),
     (unsigned long)ESP.getFreePsram());
+  logEvent("OTA package identity=%s",OTA_BIN_ID);
   logHttpsHeapDiagnostic("BOOT");
   loadOtaSettings();
   const esp_partition_t* running=esp_ota_get_running_partition();
@@ -2426,6 +2436,8 @@ void loop() {
   wifiManager.process();uint64_t now=uptimeMs();handlePairingCommand();
   if(wifiPortalStarted&&!wifiManager.getConfigPortalActive()){
     wifiPortalStarted=false;wifiTrying=false;wifiDisconnectPending=false;
+    // WiFiManager restores STA mode on exit; rebind port 8080 to that interface.
+    if(otaServerReady){otaServer.stop();otaServerReady=false;}
     wifiRetryAt=now;wifiNextSlot=wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
     logEvent("Wi-Fi configuration portal closed; saved network recovery resumed");
   }
@@ -2439,7 +2451,7 @@ void loop() {
   }
 
   serviceWifi(now);
-  if(WiFi.status()==WL_CONNECTED&&!wifiManager.getConfigPortalActive())startOtaWebServer();
+  if(WiFi.status()==WL_CONNECTED)startOtaWebServer();
 
   ButtonEvents button=bootButton.update(digitalRead(WIFI_RESET_PIN)==HIGH,now);
 
