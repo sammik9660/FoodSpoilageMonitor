@@ -15,6 +15,8 @@ BME688 기반 음식 상태 측정 프로젝트. 현재 작업 트리는 히터 
 
 ESP32-S3 현재 빌드 설정은 **Flash Size 16MB / sketch custom OTA partition / OPI PSRAM / USB CDC On Boot Enabled / Hardware CDC and JTAG / Erase All Flash Disabled**다. custom table은 기존 SPIFFS `0x310000`/`0xE0000`과 NVS를 유지한다. 파티션 선택을 바꾸면 미전송 spool 접근성이 달라질 수 있으므로 그대로 유지한다.
 
+Wi-Fi 설정은 실행 중인 ESP32의 **BOOT(GPIO0)을 놓을 때** 결정된다. 3초 이상 10초 미만이면 기존 네트워크를 보존한 채 설정 AP를 열고, 10초 이상이면 Wi-Fi 자격 증명만 지운 뒤 AP를 연다. 짧게 누르면 기존 LCD 화면 전환이다. 휴대폰에서 AP에 접속한 뒤 자동 설정 창이 뜨지 않으면 `http://192.168.4.1/`을 연다. Android/iOS의 자동 팝업은 보장되지 않는다. BOOT을 누른 채 전원을 켜거나 EN/RESET을 누르면 ESP32의 ROM 다운로드 모드로 들어갈 수 있으므로, 부팅이 끝난 뒤 BOOT만 누른다. 새 네트워크 연결에 실패하면 저장된 네트워크로 자동 복귀한다. 최대 4개를 저장하며 가득 차면 기존 항목을 덮어쓰지 않는다.
+
 ```text
 BME688 -> nRF52840 -> BLE Nordic UART Service -> ESP32-S3
        -> Wi-Fi / smartphone hotspot -> Google Apps Script

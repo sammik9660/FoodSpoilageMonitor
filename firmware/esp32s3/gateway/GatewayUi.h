@@ -11,6 +11,11 @@ namespace gateway_ui {
 constexpr size_t LCD_COLUMNS = 16;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t BUTTON_LONG_PRESS_MS = 3000;
+constexpr uint32_t BUTTON_RESET_PRESS_MS = 10000;
+
+inline int wifiRegistrationSlot(int existingSlot, uint8_t count, uint8_t capacity) {
+  return existingSlot >= 0 ? existingSlot : count < capacity ? count : -1;
+}
 
 enum LcdMode : uint8_t { LCD_SENSOR, LCD_DEBUG };
 enum CloudState : uint8_t { CLOUD_OFF, CLOUD_WAIT, CLOUD_OK };
@@ -126,7 +131,7 @@ inline bool shouldStartHealthHeartbeat(bool busy, bool updateActive,
          !uploadDataPending(active, staged, spool, queued);
 }
 
-struct ButtonEvents { bool shortPress=false, longPress=false; };
+struct ButtonEvents { bool shortPress=false, longPress=false, resetPress=false; };
 
 class ActiveLowButton {
  public:
@@ -135,18 +140,19 @@ class ActiveLowButton {
     if (pinHigh != rawHigh_) { rawHigh_ = pinHigh; changedAt_ = now; }
     if (rawHigh_ != stableHigh_ && now - changedAt_ >= BUTTON_DEBOUNCE_MS) {
       stableHigh_ = rawHigh_;
-      if (!stableHigh_) { pressedAt_ = now; longHandled_ = false; }
-      else if (!longHandled_) event.shortPress = true;
-    }
-    if (!stableHigh_ && !longHandled_ && now - pressedAt_ >= BUTTON_LONG_PRESS_MS) {
-      longHandled_ = true;
-      event.longPress = true;
+      if (!stableHigh_) pressedAt_ = now;
+      else {
+        const uint64_t heldMs = now - pressedAt_;
+        if (heldMs >= BUTTON_RESET_PRESS_MS) event.resetPress = true;
+        else if (heldMs >= BUTTON_LONG_PRESS_MS) event.longPress = true;
+        else event.shortPress = true;
+      }
     }
     return event;
   }
 
  private:
-  bool rawHigh_=true, stableHigh_=true, longHandled_=false;
+  bool rawHigh_=true, stableHigh_=true;
   uint64_t changedAt_=0, pressedAt_=0;
 };
 

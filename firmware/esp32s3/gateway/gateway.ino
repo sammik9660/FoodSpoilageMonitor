@@ -27,7 +27,8 @@
 
 //설정 페이지 주소 http://192.168.4.1
 
-//ESP32-S3의 BOOT 버튼을 3초 이상 누르면 기존 등록을 보존하고 설정 포털을 실행한다.
+// BOOT(GPIO0): 놓을 때 3~10초면 Wi-Fi 추가, 10초 이상이면 Wi-Fi 등록만 초기화.
+// BOOT을 누른 채 전원을 켜거나 EN/RESET하면 ROM 다운로드 모드로 진입할 수 있다.
 
 // ============================================================
 
@@ -64,6 +65,7 @@
 #include <BLERemoteCharacteristic.h>
 
 #include <esp_random.h>
+#include <esp_wifi.h>
 
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
@@ -221,8 +223,10 @@ Preferences wifiPreferences;
 Preferences pairingPreferences;
 Preferences otaPreferences;
 struct SavedWifi { char ssid[33]; char password[65]; };
-SavedWifi wifiNetworks[2]={};
+constexpr uint8_t WIFI_MAX_NETWORKS=4;
+SavedWifi wifiNetworks[WIFI_MAX_NETWORKS]={};
 bool wifiPreferencesReady=false, wifiTrying=false;
+bool wifiPortalStarted=false, otaServerRoutesRegistered=false;
 bool pairingPreferencesReady=false;
 bool otaPreferencesReady=false;
 char otaPassword[33]={};
@@ -390,10 +394,11 @@ bool saveWifiNetwork(const String& ssid,const String& password) {
   if(ssid.isEmpty()||ssid.length()>32||password.length()>64)return false;
   int slot=-1;
   for(uint8_t i=0;i<wifiNetworkCount;++i)if(ssid==wifiNetworks[i].ssid){slot=i;break;}
-  if(slot<0)slot=wifiNetworkCount<2?wifiNetworkCount:(wifiActiveSlot==0?1:0);
+  slot=wifiRegistrationSlot(slot,wifiNetworkCount,WIFI_MAX_NETWORKS);
+  if(slot<0){logEvent("ERROR Wi-Fi list full; existing registrations preserved");return false;}
   SavedWifi entry={};ssid.toCharArray(entry.ssid,sizeof(entry.ssid));
   password.toCharArray(entry.password,sizeof(entry.password));
-  const char* key=slot==0?"ap0":"ap1";
+  char key[4];snprintf(key,sizeof(key),"ap%d",slot);
   if(!wifiPreferencesReady||wifiPreferences.putBytes(key,&entry,sizeof(entry))!=sizeof(entry)){
     logEvent("ERROR Wi-Fi credential storage failed; previous registration preserved");return false;
   }
@@ -416,8 +421,8 @@ void rememberSuccessfulWifiSlot(uint8_t slot) {
 void loadWifiNetworks() {
   wifiPreferencesReady=wifiPreferences.begin("fsm-wifi",false);
   if(!wifiPreferencesReady)logEvent("ERROR Wi-Fi credential storage unavailable");
-  for(uint8_t i=0;wifiPreferencesReady&&i<2;++i){
-    const char* key=i==0?"ap0":"ap1";
+  for(uint8_t i=0;wifiPreferencesReady&&i<WIFI_MAX_NETWORKS;++i){
+    char key[4];snprintf(key,sizeof(key),"ap%u",(unsigned)i);
     SavedWifi entry={};
     if(wifiPreferences.getBytesLength(key)!=sizeof(entry)||
        wifiPreferences.getBytes(key,&entry,sizeof(entry))!=sizeof(entry)||
@@ -425,20 +430,24 @@ void loadWifiNetworks() {
        !memchr(entry.password,0,sizeof(entry.password))||!entry.ssid[0])break;
     wifiNetworks[wifiNetworkCount++]=entry;
   }
-  // Migrate the one legacy WiFiManager/ESP32 STA credential before any begin().
-  String oldSsid=wifiManager.getWiFiSSID(true);
-  if(!oldSsid.isEmpty()){
-    bool found=false;
-    for(uint8_t i=0;i<wifiNetworkCount;++i)if(oldSsid==wifiNetworks[i].ssid)found=true;
-    if(!found&&wifiNetworkCount<2){
-      String oldPassword=wifiManager.getWiFiPass(true);
-      if(!saveWifiNetwork(oldSsid,oldPassword)&&oldSsid.length()<=32&&oldPassword.length()<=64){
-        SavedWifi entry={};oldSsid.toCharArray(entry.ssid,sizeof(entry.ssid));
-        oldPassword.toCharArray(entry.password,sizeof(entry.password));
-        wifiNetworks[wifiNetworkCount++]=entry;
-        logEvent("Wi-Fi legacy network retained in RAM only; reboot persistence unavailable");
+  // Import the old STA credential once. A failed portal candidate must never
+  // silently become a saved network on a later reboot.
+  if(wifiPreferencesReady&&!wifiPreferences.getBool("legacy",false)){
+    String oldSsid=wifiManager.getWiFiSSID(true);
+    if(!oldSsid.isEmpty()){
+      bool found=false;
+      for(uint8_t i=0;i<wifiNetworkCount;++i)if(oldSsid==wifiNetworks[i].ssid)found=true;
+      if(!found&&wifiNetworkCount<WIFI_MAX_NETWORKS){
+        String oldPassword=wifiManager.getWiFiPass(true);
+        if(!saveWifiNetwork(oldSsid,oldPassword)&&oldSsid.length()<=32&&oldPassword.length()<=64){
+          SavedWifi entry={};oldSsid.toCharArray(entry.ssid,sizeof(entry.ssid));
+          oldPassword.toCharArray(entry.password,sizeof(entry.password));
+          wifiNetworks[wifiNetworkCount++]=entry;
+          logEvent("Wi-Fi legacy network retained in RAM only; reboot persistence unavailable");
+        }
       }
     }
+    if(!wifiPreferences.putBool("legacy",true))logEvent("ERROR Wi-Fi migration marker storage failed");
   }
   wifiPreferredSlot=wifi_recovery::preferredSlot(
     wifiPreferencesReady?wifiPreferences.getUChar("last",0xff):0xff,wifiNetworkCount);
@@ -446,6 +455,37 @@ void loadWifiNetworks() {
   wifiActiveSlot=-1;
   logEvent("Wi-Fi saved networks=%u preferred_slot=%u",
     (unsigned)wifiNetworkCount,(unsigned)wifiPreferredSlot);
+}
+
+bool resetWifiNetworks() {
+  if(!wifiPreferencesReady || !wifiPreferences.putBool("legacy",true)) {
+    logEvent("ERROR Wi-Fi reset unavailable; existing registrations preserved");return false;
+  }
+  bool removed=true;
+  for(uint8_t i=0;i<WIFI_MAX_NETWORKS;++i){
+    char key[4];snprintf(key,sizeof(key),"ap%u",(unsigned)i);
+    if(wifiPreferences.isKey(key)&&!wifiPreferences.remove(key))removed=false;
+  }
+  if(wifiPreferences.isKey("last")&&!wifiPreferences.remove("last"))removed=false;
+  if(!removed){
+    logEvent("ERROR Wi-Fi reset incomplete; no other settings or spool touched");return false;
+  }
+  memset(wifiNetworks,0,sizeof(wifiNetworks));wifiNetworkCount=0;
+  wifiPreferredSlot=0;wifiNextSlot=0;wifiActiveSlot=-1;
+  wifiTrying=false;wifiTried=0;wifiRetryAt=0;
+  // Only the Arduino Wi-Fi STA configuration is cleared. Keep other NVS
+  // namespaces, SPIFFS, OTA/DFU settings and cloud identity untouched.
+  bool legacyErased=WiFi.mode(WIFI_STA);
+  if(legacyErased){
+    wifi_config_t emptySta={};
+    legacyErased=esp_wifi_set_storage(WIFI_STORAGE_FLASH)==ESP_OK;
+    if(legacyErased)legacyErased=esp_wifi_set_config(WIFI_IF_STA,&emptySta)==ESP_OK;
+    if(esp_wifi_set_storage(WIFI_STORAGE_RAM)!=ESP_OK)legacyErased=false;
+    WiFi.disconnect(false,false);
+  }
+  if(!legacyErased)logEvent("ERROR legacy Wi-Fi STA credential erase failed");
+  else logEvent("Wi-Fi registrations cleared; other NVS and SPIFFS preserved");
+  return legacyErased;
 }
 
 void loadSensorPairing() {
@@ -1100,6 +1140,7 @@ void handleOtaUploadProgress() {
 
 void startOtaWebServer() {
   if(otaServerReady)return;
+  if(!otaServerRoutesRegistered){
   const char* headers[]={"Host","Origin"};otaServer.collectHeaders(headers,2);
   otaServer.on("/",HTTP_GET,handleOtaPage);
   otaServer.on("/prepare",HTTP_POST,handleOtaPrepare);
@@ -1113,6 +1154,8 @@ void startOtaWebServer() {
   otaServer.on("/nrf-dfu/start",HTTP_POST,handleNrfDfuStart);
   otaServer.on("/nrf-dfu/cancel",HTTP_POST,handleNrfDfuCancel);
   otaServer.onNotFound([](){otaServer.send(404,"text/plain","Not found");});
+  otaServerRoutesRegistered=true;
+  }
   otaServer.begin();otaServerReady=true;
   logEvent("OTA local updater listening at http://%s/",WiFi.localIP().toString().c_str());
 }
@@ -1134,13 +1177,47 @@ void checkOtaBootValidation(uint64_t now) {
 extern "C" bool verifyRollbackLater() { return true; }
 #endif
 
+void redirectCaptiveProbe() {
+  wifiManager.server->sendHeader("Cache-Control","no-store");
+  wifiManager.server->sendHeader("Location","http://"+WiFi.softAPIP().toString()+"/",true);
+  wifiManager.server->send(302,"text/plain","");
+}
+
+void registerWifiPortalRoutes() {
+  // Android/iOS probe URLs must not return 204/success while AP has no Internet.
+  wifiManager.server->on("/generate_204",HTTP_GET,redirectCaptiveProbe);
+  wifiManager.server->on("/gen_204",HTTP_GET,redirectCaptiveProbe);
+  wifiManager.server->on("/hotspot-detect.html",HTTP_GET,redirectCaptiveProbe);
+  wifiManager.server->on("/library/test/success.html",HTTP_GET,redirectCaptiveProbe);
+  // WiFiManager's generic erase/update routes bypass this project's scoped
+  // reset and signed OTA checks. Its server callback runs before those routes.
+  wifiManager.server->on("/erase",[](){wifiManager.server->send(403,"text/plain","Use BOOT 10s for Wi-Fi reset");});
+  wifiManager.server->on("/update",[](){wifiManager.server->send(403,"text/plain","Use the signed OTA updater");});
+  wifiManager.server->on("/updatedone",[](){wifiManager.server->send(403,"text/plain","Use the signed OTA updater");});
+}
+
+bool wifiPortalAllowed() {
+  return otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&
+         !nrfPackageUploadActive&&!otaUploadActive;
+}
+
 void startWifiPortal() {
   if(wifiManager.getConfigPortalActive())return;
+  if(!wifiPortalAllowed()){
+    logEvent("Wi-Fi portal deferred: firmware update active");return;
+  }
+  if(otaServerReady){otaServer.stop();otaServerReady=false;}
   // In nonblocking mode startConfigPortal() returns false even when active.
   wifiManager.startConfigPortal(AP_NAME,AP_PASSWORD);
-  if(!wifiManager.getConfigPortalActive())logEvent("ERROR Wi-Fi configuration portal inactive after start");
-  else if(!(WiFi.getMode()&WIFI_AP))logEvent("ERROR Wi-Fi portal active without AP mode");
-  else logEvent("Wi-Fi configuration portal active (AP mode)");
+  if(!wifiManager.getConfigPortalActive()){
+    logEvent("ERROR Wi-Fi configuration portal inactive after start");
+    if(WiFi.status()==WL_CONNECTED)startOtaWebServer();
+  }
+  else {
+    wifiPortalStarted=true;
+    if(!(WiFi.getMode()&WIFI_AP))logEvent("ERROR Wi-Fi portal active without AP mode");
+    else logEvent("Wi-Fi configuration portal active (AP mode) at http://%s/",WiFi.softAPIP().toString().c_str());
+  }
 }
 
 void serviceWifi(uint64_t now) {
@@ -2299,12 +2376,21 @@ void setup() {
 
   }
 
-  wifiManager.setConfigPortalBlocking(false);wifiManager.setConfigPortalTimeout(180);wifiManager.setConnectTimeout(20);
+  wifiManager.setConfigPortalBlocking(false);wifiManager.setConfigPortalTimeout(300);wifiManager.setConnectTimeout(20);
+  wifiManager.setSaveConnectTimeout(12);
   wifiManager.setDebugOutput(false); // never expose entered credentials through library diagnostics
+  wifiManager.setCaptivePortalEnable(true);
+  wifiManager.setShowInfoErase(false);wifiManager.setShowInfoUpdate(false);
+  const char* portalMenu[]={"wifi","info","exit"};wifiManager.setMenu(portalMenu,3);
+  wifiManager.setWebServerCallback(registerWifiPortalRoutes);
 
   wifiManager.setSaveConfigCallback([](){
     if(!saveWifiNetwork(wifiManager.getWiFiSSID(true),wifiManager.getWiFiPass(true)))
       logEvent("ERROR Wi-Fi portal registration not retained");
+    else {
+      rememberSuccessfulWifiSlot((uint8_t)wifiActiveSlot);
+      logEvent("Wi-Fi portal connected slot=%d ip=%s",(int)wifiActiveSlot,WiFi.localIP().toString().c_str());
+    }
   });
   loadWifiNetworks();WiFi.persistent(false);WiFi.setAutoReconnect(false);
   serviceWifi(uptimeMs());
@@ -2337,7 +2423,12 @@ void loop() {
 
   static int wifiPrevious=-1;
 
-  uint64_t now=uptimeMs();wifiManager.process();handlePairingCommand();
+  wifiManager.process();uint64_t now=uptimeMs();handlePairingCommand();
+  if(wifiPortalStarted&&!wifiManager.getConfigPortalActive()){
+    wifiPortalStarted=false;wifiTrying=false;wifiDisconnectPending=false;
+    wifiRetryAt=now;wifiNextSlot=wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
+    logEvent("Wi-Fi configuration portal closed; saved network recovery resumed");
+  }
 
   int wifiState=WiFi.status();
 
@@ -2348,7 +2439,7 @@ void loop() {
   }
 
   serviceWifi(now);
-  if(WiFi.status()==WL_CONNECTED)startOtaWebServer();
+  if(WiFi.status()==WL_CONNECTED&&!wifiManager.getConfigPortalActive())startOtaWebServer();
 
   ButtonEvents button=bootButton.update(digitalRead(WIFI_RESET_PIN)==HIGH,now);
 
@@ -2356,10 +2447,15 @@ void loop() {
 
     logEvent(lcdMode==LCD_SENSOR?"LCD MODE SENSOR":"LCD MODE DEBUG");lastLcdRefresh=0;}
 
-  if(button.longPress){logEvent("Wi-Fi registration portal; saved networks and spool preserved");
-    wifiTrying=false;
-
-    startWifiPortal();}
+  if(button.longPress){logEvent("Wi-Fi add portal; saved networks and spool preserved");
+    wifiTrying=false;startWifiPortal();}
+  if(button.resetPress){
+    if(!wifiPortalAllowed())logEvent("Wi-Fi reset deferred: firmware update active");
+    else {
+      if(wifiManager.getConfigPortalActive())wifiManager.stopConfigPortal();
+      resetWifiNetworks();startWifiPortal();
+    }
+  }
 
   UploadResult result;
 

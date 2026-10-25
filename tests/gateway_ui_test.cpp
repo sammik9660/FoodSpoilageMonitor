@@ -72,10 +72,33 @@ int main() {
 
   ActiveLowButton longButton;
   longButton.update(false,0);longButton.update(false,BUTTON_DEBOUNCE_MS);
-  ButtonEvents held=longButton.update(false,BUTTON_DEBOUNCE_MS+BUTTON_LONG_PRESS_MS);
-  assert(held.longPress&&!held.shortPress);assert(!longButton.update(false,4000).longPress);
-  longButton.update(true,4100);ButtonEvents longRelease=longButton.update(true,4130);
-  assert(!longRelease.shortPress&&!longRelease.longPress);
+  assert(!longButton.update(false,BUTTON_LONG_PRESS_MS-1).longPress);
+  longButton.update(true,BUTTON_LONG_PRESS_MS-1);
+  ButtonEvents earlyRelease=longButton.update(true,BUTTON_DEBOUNCE_MS+BUTTON_LONG_PRESS_MS-1);
+  assert(earlyRelease.shortPress&&!earlyRelease.longPress&&!earlyRelease.resetPress);
+
+  ActiveLowButton addButton;
+  addButton.update(false,0);addButton.update(false,BUTTON_DEBOUNCE_MS);
+  addButton.update(true,BUTTON_LONG_PRESS_MS);
+  ButtonEvents addRelease=addButton.update(true,BUTTON_LONG_PRESS_MS+BUTTON_DEBOUNCE_MS);
+  assert(addRelease.longPress&&!addRelease.shortPress&&!addRelease.resetPress);
+
+  ActiveLowButton upperButton;
+  upperButton.update(false,0);upperButton.update(false,BUTTON_DEBOUNCE_MS);
+  upperButton.update(true,BUTTON_RESET_PRESS_MS-1);
+  ButtonEvents upperRelease=upperButton.update(true,BUTTON_RESET_PRESS_MS+BUTTON_DEBOUNCE_MS-1);
+  assert(upperRelease.longPress&&!upperRelease.resetPress);
+
+  ActiveLowButton resetButton;
+  resetButton.update(false,0);resetButton.update(false,BUTTON_DEBOUNCE_MS);
+  assert(!resetButton.update(false,BUTTON_RESET_PRESS_MS-1).resetPress);
+  resetButton.update(true,BUTTON_RESET_PRESS_MS);
+  ButtonEvents resetRelease=resetButton.update(true,BUTTON_RESET_PRESS_MS+BUTTON_DEBOUNCE_MS);
+  assert(resetRelease.resetPress&&!resetRelease.longPress&&!resetRelease.shortPress);
+
+  assert(wifiRegistrationSlot(-1,2,4)==2); // new network does not replace saved slots
+  assert(wifiRegistrationSlot(1,4,4)==1);  // known SSID updates its own slot
+  assert(wifiRegistrationSlot(-1,4,4)==-1); // full list refuses silent overwrite
 
   puts("PASS gateway UI: formatting, pixel priority, data/health scheduling, update blocking, rainbow");
 }
