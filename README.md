@@ -21,6 +21,8 @@ Wi-Fi 설정은 실행 중인 ESP32의 **BOOT(GPIO0)을 놓을 때** 결정된�
 
 Windows에서 ESP32 OTA 파일을 준비하려면 Arduino IDE에서 **Export Compiled Binary**로 새 `gateway.ino.bin`을 만든 다음 루트의 `OTA_패키지_만들기.bat`를 더블클릭한다. PowerShell 7과 기존 로컬 서명키가 필요하다. 실행 중인 장치의 `OTA?` 버전·빌드, 내보낸 BIN 경로를 입력하면 도구가 소스/BIN 식별자를 대조하고 기존 서명·검증 스크립트로 `data/ota-<version>-<build>/`에 `.bin`과 `.manifest`를 만든다. 기존 패키지는 덮어쓰지 않는다. 소스 변경 후 이전 BIN을 선택했다면 새로 컴파일·내보내기해야 한다. 패키징만으로 장치가 업데이트되지는 않는다.
 
+Windows에서 nRF52840 DFU ZIP을 만들려면 루트의 `NRF_DFU_만들기.bat`를 더블클릭한다. PowerShell 7, Arduino CLI 또는 Arduino IDE 2, Adafruit nRF52 core 1.7.0이 필요하다. 도구는 현재 센서 소스를 `adafruit:nrf52:feather52840`/S140 6.1.1로 새로 컴파일하고, Adafruit core가 생성한 application-only Legacy DFU ZIP의 내용과 BIN 버전을 검증하여 `data/nrf-dfu-<version>/`에 저장한다. 같은 버전 폴더가 있으면 덮어쓰지 않고 중단한다. 생성된 ZIP은 ESP32의 `/nrf-dfu` 관리 페이지나 스마트폰 Nordic DFU 앱에서 사용한다. 자세한 절차는 [nRF BLE DFU 문서](docs/NRF52840_BLE_DFU.md)를 따른다.
+
 ```text
 BME688 -> nRF52840 -> BLE Nordic UART Service -> ESP32-S3
        -> Wi-Fi / smartphone hotspot -> Google Apps Script

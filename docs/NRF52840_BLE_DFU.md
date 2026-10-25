@@ -10,6 +10,8 @@ This is **Adafruit/Nordic legacy DFU**, not Nordic Secure DFU. The reported 0.6.
 
 ## Package creation
 
+On Windows, double-click `NRF_DFU_만들기.bat` in the repository root. It requires PowerShell 7 and Arduino CLI (or Arduino IDE 2 with its bundled CLI) with Adafruit nRF52 core 1.7.0 installed. It builds the current sensor source, uses the Adafruit core-generated application-only Legacy DFU ZIP, verifies the manifest/BIN/DAT, CRCs, device type, S140 requirement and embedded source version, then writes `data/nrf-dfu-<version>/bme688-node-<version>-legacy-dfu.zip` and `SHA256SUMS.txt`. It refuses to overwrite an existing version directory. A changed firmware release needs a new `SENSOR_FIRMWARE_VERSION` in the source and a fresh compile; renaming an old ZIP is insufficient. This packaging step does not update hardware.
+
 Compile `firmware/nrf52840/bme688_node` with Adafruit nRF52 core 1.7.0 and board `Adafruit Feather nRF52840 Express`, S140 6.1.1. Arduino CLI equivalent:
 
 ```powershell
@@ -25,7 +27,7 @@ The 2026-10-19 version 2.0.6 build produced `data/nrf-dfu-2.0.6/bme688-node-2.0.
 
 1. Stop the recording and let the ESP gateway acknowledge its existing queue/spool. Temporarily power off the ESP gateway or otherwise disconnect it from the sensor because the current peripheral configuration permits one central connection.
 2. Keep the nRF powered from a stable source and place the generated DFU ZIP on the phone.
-3. On Android, use Nordic Semiconductor's **nRF Device Firmware Update** app, which supports nRF5 SDK legacy and secure DFU ZIPs. Disable **Request high MTU** so the old bootloader uses the default ATT MTU 23, and use PRN 8 or lower. Select `bme688-node-2.0.6-legacy-dfu.zip`, then select the sensor named `BME688-<sensor-id>` and start the update. The user verified the Bootloader enabled, DFU initialized, Firmware uploaded and Completed stages with these low-capacity transport settings. Keep the screen active and remain near the sensor.
+3. On Android, use Nordic Semiconductor's **nRF Device Firmware Update** app, which supports nRF5 SDK legacy and secure DFU ZIPs. Disable **Request high MTU** so the old bootloader uses the default ATT MTU 23, and use PRN 8 or lower. Select the newly generated `bme688-node-<version>-legacy-dfu.zip`, then select the sensor named `BME688-<sensor-id>` and start the update. The user verified the Bootloader enabled, DFU initialized, Firmware uploaded and Completed stages with the 2.0.6 package and these low-capacity transport settings. Keep the screen active and remain near the sensor.
 4. If using Adafruit Bluefruit LE Connect, connect to the sensor, open **Updates**, choose custom firmware and select the generated package when the installed app accepts its format. Phone/app compatibility with this legacy package is not yet verified; the Nordic nRF DFU app is the primary Android path.
 5. After completion, restore the ESP gateway. Confirm the nRF boot message contains the package's expected version. A BLE GATT browser can also read Firmware Revision from Device Information Service characteristic 0x2A26. Then verify ESP BLE reconnection, 120-second ENV frames, fresh T/H/P immediately before each gas scan, the first gas scan after about 10 seconds, and following scans about 600 seconds apart. Check NUS framing and cloud ACK as before.
 

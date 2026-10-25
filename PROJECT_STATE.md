@@ -2,6 +2,11 @@
 
 갱신일: 2026-10-25. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-25 Windows nRF Legacy DFU 패키지 도구 (소스/자동 검증)
+
+- `NRF_DFU_만들기.bat`와 PowerShell 빌드·검증기를 추가했다. Adafruit nRF52 core 1.7.0, Feather nRF52840/S140 6.1.1 설정을 확인한 뒤 현재 센서 소스를 새로 컴파일하며 core의 `dfu genpkg --dev-type 0x0052 --sd-req 0x00B6 --application` ZIP만 사용한다. application-only manifest/BIN/DAT, CRC, 내장 펌웨어 버전을 검사하고 기존 버전 출력 폴더를 덮어쓰지 않는다.
+- 현재 2.0.11 소스의 실제 CLI 빌드가 성공했다(Flash 169,924/815,104 bytes, RAM 16,724/237,568 bytes). `data/nrf-dfu-2.0.11/bme688-node-2.0.11-legacy-dfu.zip`은 170,794 bytes, SHA-256 `1bf1eb6e7fe691ad33f5b6b35218277e8ac14d4f10a5b6b91588679fc7b952a7`이며 검증기와 기존 2.0.6 패키지 회귀 테스트가 통과했다. 이 ZIP의 실제 보드 설치·재부팅·센서 측정은 수행하지 않았다. 기존 2.0.6 성공 ZIP은 변경하지 않았다.
+
 ## 2026-10-25 nRF 7일 목표 저전력 변경 (소스/자동 검증)
 
 - nRF 2.0.11은 120초 heater-off ENV, 가스 직전 새 T/H/P 변환, 600초 HP-354 가스, 60초 battery 및 기존 BLE NUS/DFU/복구를 유지한다. 유휴 loop 대기를 10 ms에서 최대 1초로 늘렸고 ENV 변환 및 가스 polling 중에는 10 ms를 유지한다. OLED 전체 프레임 전송은 750 ms에서 5초로 줄였다. 기존 0% 잔량 곡선 경계에 도달하면 OLED에 `LOW:0%`를 표시하되 새 종료/재부팅 임계값은 추가하지 않았다.
