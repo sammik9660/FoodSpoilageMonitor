@@ -16,9 +16,15 @@
   System ON variable-latency low-power 모드를 고정한다. nRF52840은 원래 이 모드가
   기본값이므로, 이는 다른 코드가 Constant Latency를 선택하지 않았음을 명시하고
   진단하는 방어적 설정이다. 그 자체의 절감량은 아직 측정하지 않았다.
-- 센서 loop의 유휴 delay를 5 ms에서 10 ms로 늘렸다. 120초 ENV 및 140 ms gas
-  polling보다 충분히 짧으며, 불필요한 loop task wakeup을 줄인다. BLE radio와
-  callbacks는 SoftDevice/FreeRTOS가 별도로 처리한다.
+- 평상시 loop의 유휴 delay는 최대 1초다. ENV 변환 대기와 140 ms gas polling 중에는
+  기존 10 ms 대기를 유지한다. 예약 시각의 최대 약 1초 지연은 허용하지만 측정/복구
+  작업을 건너뛰지 않는다. OLED 전체 프레임 전송은 750 ms에서 5초 간격으로 줄였다.
+  화면의 상태 반영도 최대 약 5초 늦을 수 있으며 패널 자체의 소비전류는 그대로다.
+- Adafruit Bluefruit peripheral preferred connection parameters를 60–80 ms,
+  slave latency 1, supervision timeout 4초로 설정했다. 기존 core 기본값은
+  20–30 ms, latency 0, timeout 2초다. 이 값은 ESP32 central이 수락해야 실제로
+  적용된다. `BLE negotiated interval_units` 로그의 interval은 1.25 ms 단위,
+  timeout은 10 ms 단위이며, 실기에서 연결 유지와 NUS 전달을 확인해야 한다.
 - 설치된 Adafruit core는 `configUSE_TICKLESS_IDLE=1`이며 idle에서
   `sd_app_evt_wait()`를 사용한다. 따라서 스케치에 별도의 `WFE`/무한 sleep loop를
   추가하지 않는다. 중복 sleep은 BLE와 RTOS scheduling을 방해할 수 있다.
@@ -44,9 +50,9 @@ System OFF는 core와 대부분의 주변장치를 끄고 진행 중인 BLE 연�
 
 연결 간격이 길고 slave latency가 크면 radio wakeup 횟수를 줄일 수 있지만, 실제 간격은
 central(ESP32)과 협상되며 전송 지연·supervision timeout·재연결에 영향을 준다. 현재
-120초 ENV와 DFU/NUS 호환성을 실기 검증하지 않은 상태에서 연결 파라미터를 바꾸지 않았다.
-향후에는 현재 negotiated interval/latency를 먼저 기록하고 30/50/100 ms 후보를 같은
-RSSI 조건에서 비교한다. Nordic 문서는 100 ms 연결 간격에서 peripheral link 1개와
+현재 설정한 60–80 ms/latency 1은 공격적인 절전값이 아니다. DFU 부트로더 연결은
+별개이며, NUS 재전송/재연결과 central의 협상 수락은 아직 실기 미검증이다.
+4초 timeout은 2 × (1 + latency) × 80 ms보다 길다. Nordic 문서는 100 ms 연결 간격에서 peripheral link 1개와
 양방향 packet 1개인 예의 CPU 가용 시간이 99% 이상이라고 설명하지만, 이는 보드 전체
 전류나 본 프로젝트의 측정값이 아니다.
 
@@ -87,10 +93,18 @@ LiPo 입력 경로가 허용하는 전압을 먼저 확인하고, PPK2 Source Me
 설정한다.
 
 1. 기존 펌웨어와 변경 펌웨어를 같은 보드, 공급 전압, RSSI, ESP32 위치에서 비교한다.
-2. 최소 30분을 기록해 idle, 120초 ENV, 10분 gas scan을 여러 번 포함한다.
-3. 평균/peak/누적 charge와 BLE reconnect 횟수를 함께 저장한다.
-4. OLED/LED를 포함한 실제 사용 상태와 표시를 끈 실험 상태를 별도 기록한다.
-5. gas scan이 포함되지 않은 짧은 구간만으로 하루 수명을 외삽하지 않는다.
+   USB 연결 없이 측정하고, 셀의 실제 보호/충전 사양에 맞는 안전한 공급 전압을 사용한다.
+2. 기능별로 BLE만 연결한 기준 상태, ENV forced 변환을 추가한 상태, 10분 HP-354
+   스캔까지 추가한 상태를 분리해 측정한다. 이 기능별 비교에는 별도 계측용 빌드가
+   필요할 수 있으며 정상 운영 펌웨어의 측정/전송을 임의로 꺼서 비교하지 않는다.
+3. 실제 운영 상태는 최소 30분을 기록해 idle, 120초 ENV, 10분 gas scan을 여러 번
+   포함한다. 평균/peak/누적 charge와 BLE 재연결, 협상된 interval/latency도 저장한다.
+4. OLED/LED와 보드 고정 부하가 포함된 상태를 별도로 측정한다. 1000 mAh/168 h는
+   이상적으로 약 5.95 mA이지만 사용 가능한 용량과 노화/온도/차단 전압을 고려해
+   목표를 5 mA 이하로 둔다. 실제 7일 지속 가능성은 실측 전까지 알 수 없다.
+5. 셀을 2.62 V까지 의도적으로 방전하지 않는다. 현재 3.50 V/0%는 잔량 곡선의
+   경고점이지 검증된 보호 차단 전압이 아니다. 저전압 자동 종료나 재부팅 루프를
+   추가하지 않았으며 하드웨어 보호회로를 소프트웨어가 대신할 수 없다.
 
 PPK2는 500 nA–1 A 범위와 최대 100 kS/s를 제공한다. 자세한 연결과 저장 절차는
 [PPK2 사용자 안내](https://docs.nordicsemi.com/r/bundle/ug_ppk2/page/ug/ppk/ppk_user_guide_intro.html)와
@@ -98,7 +112,7 @@ PPK2는 500 nA–1 A 범위와 최대 100 kS/s를 제공한다. 자세한 연결
 
 ## 향후 안전한 실험
 
-- BLE negotiated parameters를 먼저 계측한 뒤 연결 간격을 한 변수씩 변경한다.
+- BLE 협상 로그와 실제 NUS 수신, 재연결 횟수를 확인한 뒤 선호 연결값을 한 변수씩 비교한다.
 - OLED refresh와 display sleep의 사용자 경험/전류를 분리 비교한다.
 - V1940 schematic/BOM 확인 뒤에만 DC/DC 후보를 시험한다.
 - HP-354 profile 변경은 gas fingerprint 재현성과 분류 성능 검증을 별도로 수행한다.

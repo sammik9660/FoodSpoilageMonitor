@@ -20,5 +20,9 @@ inline std::string transmitted;
 inline bool testBleConnected=true;
 struct BLEUart{void begin(){}bool notifyEnabled(){return true;}size_t write(const uint8_t* p,size_t n){transmitted.append((char*)p,n);return n;}};
 struct AdvertisingStub{void addService(BLEUart&){}void addName(){}void restartOnDisconnect(bool){}void setInterval(int,int){}void setFastTimeout(int){}void start(int){}};
-struct BluefruitStub{AdvertisingStub Advertising,ScanResponse;void begin(){}void setTxPower(int){}void setName(const char*){}void autoConnLed(bool){}bool connected(){return testBleConnected;}};
+struct PeriphStub{uint16_t minMs=0,maxMs=0,latency=0,timeoutMs=0;
+ bool setConnIntervalMS(uint16_t min,uint16_t max){minMs=min;maxMs=max;return true;}
+ bool setConnSlaveLatency(uint16_t value){latency=value;return true;}
+ bool setConnSupervisionTimeoutMS(uint16_t value){timeoutMs=value;return true;}};
+struct BluefruitStub{AdvertisingStub Advertising,ScanResponse;PeriphStub Periph;void begin(){}void setTxPower(int){}void setName(const char*){}void autoConnLed(bool){}bool connected(){return testBleConnected;}};
 inline BluefruitStub Bluefruit;

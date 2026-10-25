@@ -40,6 +40,9 @@ int main(){
  assert(!isMeasurementValid(true,NAN,50,100000,70000));
  assert(!isMeasurementValid(false,25,50,100000,70000));
  setup();
+ assert(Bluefruit.Periph.minMs==60&&Bluefruit.Periph.maxMs==80);
+ assert(Bluefruit.Periph.latency==1&&Bluefruit.Periph.timeoutMs==4000);
+ assert(LOOP_IDLE_MS==1000&&ACTIVE_LOOP_IDLE_MS==10&&OLED_REFRESH_INTERVAL_MS==5000);
  assert(BATTERY_INTERVAL_MS==60000&&vddhMillivoltsFromRaw(3723)>=4085&&vddhMillivoltsFromRaw(3723)<=4095);
  testUsbPowerPresent=false;testVddhRaw=3723;measureBatteryVoltage();
  assert(batteryMeasurementValid&&batteryMillivolts>=4085&&batteryMillivolts<=4095&&!usbPowerPresent);
@@ -59,6 +62,8 @@ int main(){
  assert(std::string(oledLine)=="P:----.- B:USB");
  formatUnavailableSensorOledLine(oledLine,sizeof(oledLine),false,false,0);
  assert(std::string(oledLine)=="P:----.- B:--%");
+ formatUnavailableSensorOledLine(oledLine,sizeof(oledLine),false,true,0);
+ assert(std::string(oledLine)=="P:----.- LOW:0%");
  assert(Wire.sda==21&&Wire.scl==20&&profileCount==0&&sensorMode==MODE_ENV);
  assert((testGas0&BME68X_HCTRL_MSK)&&!(testGas1&BME68X_RUN_GAS_MSK));
  const uint32_t bootAt=testMillis;

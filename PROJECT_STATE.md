@@ -2,6 +2,12 @@
 
 갱신일: 2026-10-25. 아래 reliability v2 기록은 역사적 검증 상태다. 현재 작업 트리는 HP-354 gas-scan v3와 히터 OFF 환경/저빈도 스캔 전환 코드를 포함한다. 아래의 초기 SPIFFS 조사는 읽기 전용이었고, 이어서 사용자가 기존 SPIFFS 데이터 폐기와 장치 업로드를 명시적으로 허용해 제한된 복구를 수행했다. 기존 baseline, 과거 리뷰 및 작업 시작 전의 ESP LCD/NeoPixel 미커밋 변경은 보존했다.
 
+## 2026-10-25 nRF 7일 목표 저전력 변경 (소스/자동 검증)
+
+- nRF 2.0.11은 120초 heater-off ENV, 가스 직전 새 T/H/P 변환, 600초 HP-354 가스, 60초 battery 및 기존 BLE NUS/DFU/복구를 유지한다. 유휴 loop 대기를 10 ms에서 최대 1초로 늘렸고 ENV 변환 및 가스 polling 중에는 10 ms를 유지한다. OLED 전체 프레임 전송은 750 ms에서 5초로 줄였다. 기존 0% 잔량 곡선 경계에 도달하면 OLED에 `LOW:0%`를 표시하되 새 종료/재부팅 임계값은 추가하지 않았다.
+- Adafruit core 1.7.0의 tickless idle/`sd_app_evt_wait()`를 유지한다. Peripheral preferred BLE interval 60–80 ms, latency 1, timeout 4초를 제시하며 ESP32 central이 실제 수락했는지 `BLE negotiated` 로그로 확인해야 한다. Bosch BME688은 forced conversion 후 sleep으로 자동 복귀하며 현재 코드도 gas 종료 시 heater off와 sleep을 확인한다. 실제 5 mA 이하 및 7일 동작은 전류 실측 전까지 미검증이다. 2.62 V 사례를 반복하는 방전 시험은 하지 않는다. 단계별 계측 절차는 `docs/NRF52840_LOW_POWER.md`에 기록했다.
+- nRF core 1.7.0 `adafruit:nrf52:feather52840` 최종 빌드 성공(Flash 169,924/815,104 bytes, RAM 16,724/237,568 bytes). 실제 센서 소스를 포함한 MSVC 테스트, mock cloud 39개, fingerprint 5개, OTA partition 및 DFU web/upload/access 테스트 통과. ESP core 3.3.12 전체 빌드는 기존 16MB/custom partition/OPI 설정에서 bootloader 생성 뒤 앱 산출물·오류 출력 없이 약 2분 30초 정체되어 중단했으므로 성공으로 기록하지 않는다. 보드 전류, BLE 협상/재연결, OLED 표시, 장기 가스 스캔 및 7일 운전은 실기 미검증이다.
+
 ## 2026-10-25 ENV 120초·gas preflight·loop liveness (소스/자동 검증)
 
 - nRF 2.0.10의 heater-off ENV start-to-start 간격을 2초에서 120초로 변경했다. HP-354 시작 간격 600,000 ms, 140 ms poll, 60초 scan timeout/cooling은 유지한다. gas deadline에는 이전 ENV age와 무관하게 forced T/H/P를 새로 성공시킨 다음 scan을 시작하며, ENV 실패는 120초를 기다리지 않고 5초 간격으로 재시도해 기존 3회 recovery로 들어간다.

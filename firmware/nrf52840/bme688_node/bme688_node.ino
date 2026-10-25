@@ -227,9 +227,10 @@ constexpr uint8_t OLED_ADDRESS = 0x3C;
 constexpr int16_t OLED_WIDTH = 128;
 constexpr int16_t OLED_HEIGHT = 32;
 constexpr int8_t OLED_RESET_PIN = -1;
-constexpr uint32_t OLED_REFRESH_INTERVAL_MS = 750;
+constexpr uint32_t OLED_REFRESH_INTERVAL_MS = 5000;
 constexpr uint32_t ENV_INTERVAL_MS = 120000;
-constexpr uint32_t LOOP_IDLE_MS = 10;
+constexpr uint32_t LOOP_IDLE_MS = 1000;
+constexpr uint32_t ACTIVE_LOOP_IDLE_MS = 10;
 constexpr uint32_t LOOP_LIVENESS_CHECK_MS = 30000;
 constexpr uint32_t LOOP_LIVENESS_TIMEOUT_MS = 120000;
 constexpr uint32_t BATTERY_INTERVAL_MS = 60000;
@@ -244,7 +245,7 @@ constexpr uint32_t ENV_FAILURE_RETRY_MS = 5000;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 60000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.10";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.11";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 bme68xData lastEnvData={};
@@ -310,6 +311,7 @@ battery::LoadMode batteryLoadMode() {
 #if !defined(_MSC_VER)
 uint32_t lastOledRefresh = 0;
 bool oledReady = false;
+uint16_t lastBleInterval = 0, lastBleLatency = UINT16_MAX;
 #endif
 
 bool isMeasurementValid(bool readOK, double temperature, double humidity,
@@ -454,7 +456,8 @@ void formatUnavailableSensorOledLine(char* out, size_t outSize,
     else
       snprintf(out, outSize, "P:----.- B:USB");
   } else if (batteryValid) {
-    snprintf(out, outSize, "P:----.- B:%u%%", batteryPercent);
+    snprintf(out, outSize, batteryPercent ? "P:----.- B:%u%%" : "P:----.- LOW:%u%%",
+             batteryPercent);
   } else {
     snprintf(out, outSize, "P:----.- B:--%%");
   }
@@ -540,7 +543,7 @@ void updateOled(uint32_t now) {
 
     } else if (batteryMeasurementValid) {
       snprintf(line, sizeof(line),
-               "hPa:%.1f B:%u%%",
+               batteryTracker.estimatedPercent() ? "hPa:%.1f B:%u%%" : "hPa:%.1f LOW:%u%%",
                lastEnvData.pressure / 100.0,
                batteryTracker.estimatedPercent());
 
@@ -659,6 +662,19 @@ bool sendLine(const char* line) {
 }
 
 void sendHealth() {
+#if !defined(_MSC_VER)
+  if (Bluefruit.connected()) {
+    BLEConnection* connection = Bluefruit.Connection(Bluefruit.connHandle());
+    if (connection && (connection->getConnectionInterval() != lastBleInterval ||
+                       connection->getSlaveLatency() != lastBleLatency)) {
+      lastBleInterval = connection->getConnectionInterval();
+      lastBleLatency = connection->getSlaveLatency();
+      Serial.print("BLE negotiated interval_units=");Serial.print(lastBleInterval);
+      Serial.print(" latency=");Serial.print(lastBleLatency);
+      Serial.print(" timeout_units=");Serial.println(connection->getSupervisionTimeout());
+    }
+  } else { lastBleInterval = 0; lastBleLatency = UINT16_MAX; }
+#endif
   char line[224];
   const char* mode=sensorMode==MODE_GAS?"GAS":sensorMode==MODE_COOL?"COOL":
                    sensorMode==MODE_REC?"REC":"ENV";
@@ -813,6 +829,12 @@ void setup() {
   analogCalibrateOffset();
 #endif
   Bluefruit.begin();
+  // Preferred parameters only: the ESP32 central makes the final choice.
+  // Keep a short supervision-safe latency for NUS frames and reconnection.
+  const bool blePowerParams = Bluefruit.Periph.setConnIntervalMS(60, 80) &&
+    Bluefruit.Periph.setConnSlaveLatency(1) &&
+    Bluefruit.Periph.setConnSupervisionTimeoutMS(4000);
+  Serial.print("BLE low-power preferences result=");Serial.println(blePowerParams);
 #if !defined(_MSC_VER)
   // The Adafruit FreeRTOS port already uses tickless idle and sd_app_evt_wait().
   // Explicitly retain variable-latency System ON low-power mode; do not add a
@@ -958,7 +980,7 @@ void loop() {
 #if !defined(_MSC_VER)
     updateOled(millis());
 #endif
-    delay(LOOP_IDLE_MS);return;
+    delay(envConversionPending ? ACTIVE_LOOP_IDLE_MS : LOOP_IDLE_MS);return;
   }
   if((uint32_t)(now-scanStartedAt)>=GAS_SCAN_TIMEOUT_MS) {
     Serial.println("SCAN timeout; incomplete fingerprint retained");
@@ -977,7 +999,7 @@ void loop() {
 #if !defined(_MSC_VER)
     updateOled(now);
 #endif
-    delay(LOOP_IDLE_MS);
+    delay(ACTIVE_LOOP_IDLE_MS);
     return;
   }
   nextMeasurement = now + gas_scan::POLL_MS;  // Bosch example fetch cadence, no catch-up burst
