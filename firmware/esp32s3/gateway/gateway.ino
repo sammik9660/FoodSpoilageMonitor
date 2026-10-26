@@ -176,8 +176,8 @@ constexpr uint32_t LCD_REFRESH_MS=750;
 // Hardware CDC/JTAG is the verified console. Mirroring every line to UART0 made
 // combined captures show each event twice; UART0 remains available as an opt-in.
 constexpr bool UART_DIAGNOSTICS=false;
-#define FSGW_VERSION "2.0.19"
-#define FSGW_BUILD 2026102704
+#define FSGW_VERSION "2.0.21"
+#define FSGW_BUILD 2026102706
 #define FSGW_STRINGIFY_INNER(value) #value
 #define FSGW_STRINGIFY(value) FSGW_STRINGIFY_INNER(value)
 constexpr char FIRMWARE_VERSION[]=FSGW_VERSION;

@@ -1,15 +1,15 @@
 ## 2026-10-27 ESP32 OTA 다운그레이드 확인 및 승인
 
-- ESP32 OTA 펌웨어 식별자를 2.0.18/build 2026102703으로 증가시켰다. OTA 웹페이지가 현재 FIRMWARE_VERSION/build와 선택한 서명 manifest의 version/build를 비교해 업그레이드/다운그레이드를 표시한다. 다운그레이드 또는 build 역행은 확인창의 명시적 승인 후 `/prepare`에 승인 플래그를 전달한다. 인증·Origin·녹화 STOPPED·큐/spool drain·lease 조건은 유지된다.
+- 기존 서명 패키지 2.0.19/build 2026102704를 보존하고, 다운그레이드 승인 코드를 포함할 다음 소스 식별자를 2.0.20/build 2026102705로 올렸다. OTA 웹페이지가 현재 FIRMWARE_VERSION/build와 선택한 서명 manifest의 version/build를 비교해 업그레이드/다운그레이드를 표시한다. 다운그레이드 또는 build 역행은 확인창의 명시적 승인 후 `/prepare`에 승인 플래그를 전달한다. 인증·Origin·녹화 STOPPED·큐/spool drain·lease 조건은 유지된다.
 - 게이트웨이는 승인 없는 lower semver/build를 거부한다. 명시 승인 시에만 build anti-rollback을 허용하며, 정확한 semver 버전이 같은 이미지는 no-op/거부한다. 서명, SHA-256, 이미지 검사와 부팅 self-check/rollback은 유지된다. OTA 패키지 준비 도구는 현재 소스보다 낮은 version 라벨로 현재 코드를 오인 생성하지 않는다. 실제 다운그레이드는 기존의 호환되는 서명 패키지를 사용한다. 현재 장치 버전/build는 로컬 OTA 페이지에서 확인하며 실제 적용 여부는 장치 확인창과 펌웨어가 판단한다.
-- 확인된 위험: 현재 manifest 정책은 오래된 앱의 데이터/SPIFFS 호환성을 보장하지 않는다. 구버전이 현재 partition/data layout과 부팅 확인 흐름에 맞지 않으면 bootloader rollback 또는 USB 복구가 필요할 수 있다. 이 동작은 실제 보드에서 검증하지 않았다. ESP32-S3 core 3.3.12 지정 FQBN 전체 컴파일은 성공(앱 1,569,475 bytes, RAM 65,704 bytes)했지만 서명 패키지 생성 및 장치 설치는 수행하지 않았다.
+- 확인된 위험: 현재 manifest 정책은 오래된 앱의 데이터/SPIFFS 호환성을 보장하지 않는다. 구버전이 현재 partition/data layout과 부팅 확인 흐름에 맞지 않으면 bootloader rollback 또는 USB 복구가 필요할 수 있다. 이 동작은 실제 보드에서 검증하지 않았다. 기존 2.0.19/build 2026102704 패키지는 1,569,616-byte app-only BIN이고 기존 OTA 슬롯보다 작다. 다운그레이드 승인 변경이 포함된 2.0.20/build 2026102705는 아직 컴파일/서명하지 않았으며 실제 장치 설치도 하지 않았다.
 
 ## 2026-10-27 ESP32 OTA Auto / Manual 패키지 준비 선택
 
 - `OTA_패키지_만들기.bat`의 기존 자동 컴파일을 선택형으로 개선했다. 기본 Auto는 PowerShell에 회전 표시·경과 시간·object 수를 표시하며 기존 Arduino CLI 컴파일/서명/검증 흐름을 쓴다. Manual은 Arduino IDE Verify/Compile 및 Export Compiled Binary를 한·영으로 안내하고 사용자가 완료를 확인한 뒤 BIN을 지정한다.
 - 패키지 생성은 장치의 현재 버전/build 입력 없이 진행하며 로컬 package-test 기준값으로 서명·형식·이미지를 검사한다. 실제 장치의 anti-rollback gate는 업데이트 시 펌웨어가 독립적으로 판단한다. Manual에서 컴파일을 취소/실패해도 선택한 소스 ID는 남으며, 재실행 시 같은 버전을 고르면 아직 발행되지 않은 build 번호를 이어 쓴다. 기존 키, signer, manifest, package test, custom partition, 3MiB 제한은 그대로 사용한다.
 - 패키지 준비 시 설치 중인 장치의 버전/build를 입력받던 질문을 제거했다. 로컬 패키지 서명·형식·BIN 검증은 synthetic baseline으로 수행하며, 실제 장치 anti-rollback은 업로드 시 계속 적용된다. 소스/기존 패키지 기준 build 번호는 자동 증가한다.
-- OTA 코드 확인: manifest build가 현재 build 이하이면 BUILD 단계에서 거부하고, 버전 문자열이 현재와 정확히 같으면 VERSION 단계에서 거부한다. 서로 다른 버전 간 semver 순서 비교는 하지 않는다. 기존의 더 오래된 패키지는 통상 build도 낮아 거부되지만, 서로 다른 이전 버전 문자열에 임의로 더 높은 build를 부여한 이미지는 펌웨어가 semver downgrade로 판정하지 않을 수 있다. 이 제한을 README에 명시했다; 업데이트 manifest gate 자체는 변경하지 않았다.
+- OTA 코드 확인: manifest build가 현재 build 이하이면 BUILD 단계에서 거부하고, 버전 문자열이 현재와 정확히 같으면 VERSION 단계에서 거부한다. 서로 다른 버전 문자열은 major/minor/patch 순서로 비교한다. 구버전 2.0.8 수신기는 기존 build strictly-increasing/version-different 검사만 사용하지만, 2.0.19/2.0.20 대상은 사전 승인된 롤백만 허용한다.
 - **기존 Auto 전체 빌드와 패키지 검증은 2.0.17/build 2026102702에서 이전 turn에 완료**했다. 이번 turn에는 모드 선택 UI와 Manual 경로를 준비했으며 사용자 IDE 동작/최종 BIN은 아직 미검증이다. 이번에는 테스트나 컴파일을 실행하지 않았다.
 
 ## 2026-10-26 Windows ESP32 OTA 자동 빌드 도구
