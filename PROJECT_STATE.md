@@ -1,3 +1,17 @@
+## 2026-10-27 ESP32 OTA 다운그레이드 확인 및 승인
+
+- ESP32 OTA 펌웨어 식별자를 2.0.18/build 2026102703으로 증가시켰다. OTA 웹페이지가 현재 FIRMWARE_VERSION/build와 선택한 서명 manifest의 version/build를 비교해 업그레이드/다운그레이드를 표시한다. 다운그레이드 또는 build 역행은 확인창의 명시적 승인 후 `/prepare`에 승인 플래그를 전달한다. 인증·Origin·녹화 STOPPED·큐/spool drain·lease 조건은 유지된다.
+- 게이트웨이는 승인 없는 lower semver/build를 거부한다. 명시 승인 시에만 build anti-rollback을 허용하며, 정확한 semver 버전이 같은 이미지는 no-op/거부한다. 서명, SHA-256, 이미지 검사와 부팅 self-check/rollback은 유지된다. OTA 패키지 준비 도구는 현재 소스보다 낮은 version 라벨로 현재 코드를 오인 생성하지 않는다. 실제 다운그레이드는 기존의 호환되는 서명 패키지를 사용한다. 현재 장치 버전/build는 로컬 OTA 페이지에서 확인하며 실제 적용 여부는 장치 확인창과 펌웨어가 판단한다.
+- 확인된 위험: 현재 manifest 정책은 오래된 앱의 데이터/SPIFFS 호환성을 보장하지 않는다. 구버전이 현재 partition/data layout과 부팅 확인 흐름에 맞지 않으면 bootloader rollback 또는 USB 복구가 필요할 수 있다. 이 동작은 실제 보드에서 검증하지 않았다. ESP32-S3 core 3.3.12 지정 FQBN 전체 컴파일은 성공(앱 1,569,475 bytes, RAM 65,704 bytes)했지만 서명 패키지 생성 및 장치 설치는 수행하지 않았다.
+
+## 2026-10-27 ESP32 OTA Auto / Manual 패키지 준비 선택
+
+- `OTA_패키지_만들기.bat`의 기존 자동 컴파일을 선택형으로 개선했다. 기본 Auto는 PowerShell에 회전 표시·경과 시간·object 수를 표시하며 기존 Arduino CLI 컴파일/서명/검증 흐름을 쓴다. Manual은 Arduino IDE Verify/Compile 및 Export Compiled Binary를 한·영으로 안내하고 사용자가 완료를 확인한 뒤 BIN을 지정한다.
+- 패키지 생성은 장치의 현재 버전/build 입력 없이 진행하며 로컬 package-test 기준값으로 서명·형식·이미지를 검사한다. 실제 장치의 anti-rollback gate는 업데이트 시 펌웨어가 독립적으로 판단한다. Manual에서 컴파일을 취소/실패해도 선택한 소스 ID는 남으며, 재실행 시 같은 버전을 고르면 아직 발행되지 않은 build 번호를 이어 쓴다. 기존 키, signer, manifest, package test, custom partition, 3MiB 제한은 그대로 사용한다.
+- 패키지 준비 시 설치 중인 장치의 버전/build를 입력받던 질문을 제거했다. 로컬 패키지 서명·형식·BIN 검증은 synthetic baseline으로 수행하며, 실제 장치 anti-rollback은 업로드 시 계속 적용된다. 소스/기존 패키지 기준 build 번호는 자동 증가한다.
+- OTA 코드 확인: manifest build가 현재 build 이하이면 BUILD 단계에서 거부하고, 버전 문자열이 현재와 정확히 같으면 VERSION 단계에서 거부한다. 서로 다른 버전 간 semver 순서 비교는 하지 않는다. 기존의 더 오래된 패키지는 통상 build도 낮아 거부되지만, 서로 다른 이전 버전 문자열에 임의로 더 높은 build를 부여한 이미지는 펌웨어가 semver downgrade로 판정하지 않을 수 있다. 이 제한을 README에 명시했다; 업데이트 manifest gate 자체는 변경하지 않았다.
+- **기존 Auto 전체 빌드와 패키지 검증은 2.0.17/build 2026102702에서 이전 turn에 완료**했다. 이번 turn에는 모드 선택 UI와 Manual 경로를 준비했으며 사용자 IDE 동작/최종 BIN은 아직 미검증이다. 이번에는 테스트나 컴파일을 실행하지 않았다.
+
 ## 2026-10-26 Windows ESP32 OTA 자동 빌드 도구
 
 - 기존 BAT의 exported-BIN 입력 흐름을 `tools/build_esp32_ota_package.ps1`로 연결했다. 기본 patch +1 또는 명시 버전 선택, source/data/dist보다 큰 YYYYMMDDNN build, core 3.3.12 / 16MB custom partition / OPI PSRAM / CDC 빌드, 기존 signer/package test 순서다. 버전·빌드 두 줄 외 펌웨어 동작은 변경하지 않는다. 실패 시 소스를 실행 전 바이트로 복원하되 동시 사용자 편집은 덮어쓰지 않는다.
@@ -408,3 +422,7 @@
 - WiFiManager AP 포털은 80번 포트를 유지하고 기존 ESP32 OTA/nRF DFU 관리 WebServer는 8080번 포트로 분리한다. 설치된 WiFiManager는 정상 연결된 STA에 대해 포털 시작 시 disconnect 분기를 건너뛰고 softAP를 시작한다. 새 자격 증명 연결 시험과 포털 종료 모드 복원 중에는 STA가 일시적으로 바뀔 수 있어 실기 확인이 필요하다.
 - 로컬 관리 페이지의 Basic 인증, Host/Origin 검사, OTA 서명·anti-rollback, 클라우드 승인, nRF DFU 안전 조건은 유지한다. Dashboard의 로컬 링크와 mDNS HTTP service 포트도 8080에 맞춘다. 운영 Apps Script 배포는 수행하지 않았다.
 - 새 BIN에 소스 버전/빌드 식별자를 포함해 Windows BAT가 과거 BIN과 불일치를 거부할 수 있게 했다. BAT는 기존 개인키와 서명·검증 스크립트를 사용하며 패키지와 키를 덮어쓰지 않는다. ESP32 core 3.3.12 지정 설정 전체 빌드는 종료 코드 0, 앱 1,567,055/3,145,728 bytes였다. 최종 BIN의 서명·SHA-256·내장 공개키 검증 및 개인키 누락/잘못된 BIN/중복·역행 빌드 거부 테스트는 통과했다. 테스트 패키지는 정리했으며 실제 OTA/DFU 전송과 포털·클라우드 동시 동작은 미검증이다.
+## 2026-10-27 반응형 대시보드 카드 배치
+
+- Apps Script 대시보드 본문 최대 너비를 1500px로 넓히고 카드 컨테이너를 CSS Grid로 변경했다. 760px 미만은 1열, 760~1199px는 2열, 1200px 이상은 3열로 표시한다. 카드 사이 간격은 grid gap으로 유지하며 기존 카드 내용·데이터 호출은 바꾸지 않았다.
+- CSS만 변경했으며 브라우저 실기/배포는 수행하지 않았다.

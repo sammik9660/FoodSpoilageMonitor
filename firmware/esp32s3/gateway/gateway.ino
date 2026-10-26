@@ -176,8 +176,8 @@ constexpr uint32_t LCD_REFRESH_MS=750;
 // Hardware CDC/JTAG is the verified console. Mirroring every line to UART0 made
 // combined captures show each event twice; UART0 remains available as an opt-in.
 constexpr bool UART_DIAGNOSTICS=false;
-#define FSGW_VERSION "2.0.15"
-#define FSGW_BUILD 2026102617
+#define FSGW_VERSION "2.0.19"
+#define FSGW_BUILD 2026102704
 #define FSGW_STRINGIFY_INNER(value) #value
 #define FSGW_STRINGIFY(value) FSGW_STRINGIFY_INNER(value)
 constexpr char FIRMWARE_VERSION[]=FSGW_VERSION;
@@ -238,6 +238,7 @@ bool pairingPreferencesReady=false;
 bool otaPreferencesReady=false;
 char otaPassword[33]={};
 bool otaServerReady=false,otaManifestReady=false,otaBinaryReady=false,otaUpdateStarted=false;
+bool otaRollbackApproved=false;
 enum OtaMode { OTA_NORMAL, OTA_PREPARE, OTA_ACTIVE };
 OtaMode otaMode=OTA_NORMAL;
 SemaphoreHandle_t otaIngressMutex=nullptr;
@@ -877,6 +878,14 @@ bool otaVersionValid(const char* version) {
   return version&&sscanf(version,"%u.%u.%u%c",&major,&minor,&patch,&tail)==3;
 }
 
+int compareOtaVersions(const char* left,const char* right) {
+  unsigned int l[3]={},r[3]={};
+  if(sscanf(left,"%u.%u.%u",&l[0],&l[1],&l[2])!=3||
+     sscanf(right,"%u.%u.%u",&r[0],&r[1],&r[2])!=3)return 0;
+  for(uint8_t i=0;i<3;++i){if(l[i]<r[i])return -1;if(l[i]>r[i])return 1;}
+  return 0;
+}
+
 bool verifyOtaManifest(char* text) {
   char format[16]={},target[16]={},version[24]={},digest[65]={},signatureText[128]={};
   unsigned long long build=0;
@@ -886,10 +895,15 @@ bool verifyOtaManifest(char* text) {
   if(strcmp(format,"FSGWOTA1")){logEvent("OTA manifest verify failed stage=FORMAT header");return false;}
   if(strcmp(target,"esp32s3")){logEvent("OTA manifest verify failed stage=TARGET");return false;}
   if(!otaVersionValid(version)){logEvent("OTA manifest verify failed stage=VERSION syntax");return false;}
-  if(build<=OTA_BUILD_NUMBER){
-    logEvent("OTA manifest verify failed stage=BUILD incoming=%llu current=%llu",build,(unsigned long long)OTA_BUILD_NUMBER);return false;
+  const int versionOrder=compareOtaVersions(version,FIRMWARE_VERSION);
+  const bool downgrade=versionOrder<0||build<=OTA_BUILD_NUMBER;
+  if(versionOrder==0){logEvent("OTA manifest verify failed stage=VERSION unchanged");return false;}
+  if(downgrade&&!otaRollbackApproved){
+    logEvent("OTA manifest verify failed stage=ROLLBACK incoming_version=%s incoming_build=%llu current_version=%s current_build=%llu approved=0",
+      version,build,FIRMWARE_VERSION,(unsigned long long)OTA_BUILD_NUMBER);return false;
   }
-  if(!strcmp(version,FIRMWARE_VERSION)){logEvent("OTA manifest verify failed stage=VERSION unchanged");return false;}
+  if(downgrade)logEvent("OTA downgrade explicitly approved incoming_version=%s incoming_build=%llu current_version=%s current_build=%llu",
+    version,build,FIRMWARE_VERSION,(unsigned long long)OTA_BUILD_NUMBER);
   size_t decoded=0;
   const int base64Result=mbedtls_base64_decode(otaSignature,sizeof(otaSignature),&decoded,
       (const unsigned char*)signatureText,strlen(signatureText));
@@ -930,6 +944,7 @@ void abortOtaSession() {
   otaMode=OTA_NORMAL;otaDeadlineAt=0;otaGapSamples=0;
   xSemaphoreGive(otaIngressMutex);
   if(missed)logEvent("OTA measurement gap ended; %lu incoming samples not queued",(unsigned long)missed);
+  otaRollbackApproved=false;
   if(otaLeaseHeld){
     otaLeaseHeld=false;otaLeaseReleasePending=true;otaLeaseReleaseDeferredOnce=true;
     logEvent("OTA lease release deferred until HTTP request cleanup");
@@ -946,10 +961,10 @@ void handleOtaPage() {
   if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
   const bool safe=otaSafeToStart();
   const String page=String("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>Gateway OTA</title>")+
-    "<h1>ESP32-S3 firmware update</h1><p>Device " + String(deviceId) + " · " + FIRMWARE_VERSION + "</p><p><a href='/nrf-dfu'>Open nRF52840 sensor update</a></p><p>"+
+    "<h1>ESP32-S3 firmware update</h1><p>Device " + String(deviceId) + " · " + FIRMWARE_VERSION + " build " + String((unsigned long)OTA_BUILD_NUMBER) + "</p><p><a href='/nrf-dfu'>Open nRF52840 sensor update</a></p><p>"+
     (safe?"Ready to reserve a STOPPED recording state and drain stored samples before upload.":"Blocked: check SPIFFS health, Wi-Fi, pending boot verification, and the USB-issued OTA token.")+
-    "</p><p>Choose the signed .manifest and matching .bin from the same release.</p><form id=f><label>Manifest <input id=m type=file accept='.manifest' required></label><br><label>Firmware <input id=b type=file accept='.bin' required></label><br><label><input id=c type=checkbox required> I approve flashing this signed firmware; the gateway will restart.</label><br><button "+
-    (safe?"":"disabled")+">Verify and update</button></form><pre id=o></pre><script>const f=document.getElementById('f'),m=document.getElementById('m'),b=document.getElementById('b'),c=document.getElementById('c'),o=document.getElementById('o');f.onsubmit=async e=>{e.preventDefault();if(!c.checked)return;try{let r=await fetch('/prepare',{method:'POST'});if(!r.ok){o.textContent=await r.text();return;}let ready=false;for(let i=0;i<180;i++){let s=await fetch('/status');if(!s.ok)throw Error(await s.text());let v=await s.json();if(v.mode!='PREPARE')throw Error('OTA preparation stopped');if(v.ready){ready=true;break;}o.textContent='Draining queue '+v.queue+' and spool '+v.spool+'; waiting for HTTP '+v.http;await new Promise(resolve=>setTimeout(resolve,1000));}if(!ready)throw Error('OTA preparation timed out');let d=new FormData();d.append('manifest',m.files[0]);d.append('firmware',b.files[0]);o.textContent='Uploading and verifying…';r=await fetch('/update',{method:'POST',body:d});o.textContent=await r.text();}catch(err){o.textContent=String(err);await fetch('/cancel',{method:'POST'}).catch(()=>{});}}</script>";
+    "</p><p>Choose the signed .manifest and matching .bin from the same release. The page previews version/build direction; the ESP verifies signature and policy.</p><form id=f><label>Manifest <input id=m type=file accept='.manifest' required></label><br><label>Firmware <input id=b type=file accept='.bin' required></label><br><label><input id=c type=checkbox required> I approve flashing this signed firmware; the gateway will restart.</label><br><button "+
+    (safe?"":"disabled")+">Verify and update</button></form><pre id=o></pre><script>const currentVersion='"+String(FIRMWARE_VERSION)+"',currentBuild=Number('"+String((unsigned long)OTA_BUILD_NUMBER)+"'),f=document.getElementById('f'),m=document.getElementById('m'),b=document.getElementById('b'),c=document.getElementById('c'),o=document.getElementById('o');function cmp(a,b){for(let i=0;i<3;i++){let x=Number(a.split('.')[i]),y=Number(b.split('.')[i]);if(x<y)return -1;if(x>y)return 1}return 0}f.onsubmit=async e=>{e.preventDefault();if(!c.checked)return;let allowRollback=false;try{const raw=await m.files[0].text(),match=/^FSGWOTA1\\r?\\ntarget=esp32s3\\r?\\nversion=(\\d+\\.\\d+\\.\\d+)\\r?\\nbuild=(\\d{10})\\r?\\nsha256=[0-9a-f]{64}\\r?\\nsignature=[A-Za-z0-9+/=]+\\r?\\n?$/.exec(raw);if(!match)throw Error('Manifest format is invalid');const incomingVersion=match[1],incomingBuild=Number(match[2]),order=cmp(incomingVersion,currentVersion);o.textContent=`Current: ${currentVersion} build ${currentBuild}\\nSelected: ${incomingVersion} build ${incomingBuild}`;if(order===0){o.textContent+='\\nSame version: the running firmware will be kept. Increase the patch version to install a new release.';return;}allowRollback=order<0||incomingBuild<=currentBuild;if(allowRollback&&!confirm(`DOWNGRADE / 롤백 확인\\nCurrent: ${currentVersion} build ${currentBuild}\\nSelected: ${incomingVersion} build ${incomingBuild}\\n\\nThe signed image will replace the running firmware. The older image must support this partition/data layout and boot self-check; otherwise bootloader rollback or USB recovery may be required. Continue?`))return;if(!allowRollback&&!confirm(`Upgrade / 업그레이드\\nCurrent: ${currentVersion} build ${currentBuild}\\nSelected: ${incomingVersion} build ${incomingBuild}\\nContinue?`))return;let prep=new URLSearchParams({allowRollback:allowRollback?'1':'0'});let r=await fetch('/prepare',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:prep});if(!r.ok){o.textContent=await r.text();return;}let ready=false;for(let i=0;i<180;i++){let s=await fetch('/status');if(!s.ok)throw Error(await s.text());let v=await s.json();if(v.mode!='PREPARE')throw Error('OTA preparation stopped');if(v.ready){ready=true;break;}o.textContent='Draining queue '+v.queue+' and spool '+v.spool+'; waiting for HTTP '+v.http;await new Promise(resolve=>setTimeout(resolve,1000));}if(!ready)throw Error('OTA preparation timed out');let d=new FormData();d.append('manifest',m.files[0]);d.append('firmware',b.files[0]);o.textContent='Uploading and verifying…';r=await fetch('/update',{method:'POST',body:d});o.textContent=await r.text();}catch(err){o.textContent=String(err);await fetch('/cancel',{method:'POST'}).catch(()=>{});}}</script>";
   otaServer.sendHeader("Cache-Control","no-store");otaServer.send(200,"text/html; charset=utf-8",page);
 }
 
@@ -962,11 +977,13 @@ void handleOtaPrepare() {
       (unsigned)(otaPassword[0]!=0),(unsigned)otaPendingVerify);
     return otaServer.send(409,"text/plain","OTA preparation blocked by Wi-Fi, SPIFFS, token, or boot verification");
   }
+  otaRollbackApproved=otaServer.arg("allowRollback")=="1";
   otaUploadFailure=nullptr;
   xSemaphoreTake(otaIngressMutex,portMAX_DELAY);
   otaMode=OTA_PREPARE;otaDeadlineAt=uptimeMs()+OTA_PREPARE_TIMEOUT_MS;otaGapSamples=0;
   xSemaphoreGive(otaIngressMutex);
   logEvent("OTA PREPARE; BLE ingress paused, draining RAM, spool, and HTTP work");
+  if(otaRollbackApproved)logEvent("OTA rollback approval received from authenticated local web confirmation");
   otaServer.send(200,"text/plain","OTA preparation started");
 }
 
@@ -1133,7 +1150,7 @@ void handleOtaUploadProgress() {
       rejectOtaUpload("manifest byte count mismatch",400);return;
     }
     otaManifestBuffer[otaManifestLength]=0;otaManifestReady=verifyOtaManifest(otaManifestBuffer);
-    if(!otaManifestReady)rejectOtaUpload("manifest signature, version, or format invalid",400);
+    if(!otaManifestReady)rejectOtaUpload("manifest signature, image policy, or version invalid",400);
     return;
   }
   if(upload.status==UPLOAD_FILE_END&&upload.filename.endsWith(".bin")&&otaShaStarted&&otaUpdateStarted) {
