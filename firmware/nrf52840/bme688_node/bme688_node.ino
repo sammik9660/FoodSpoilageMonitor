@@ -245,10 +245,16 @@ constexpr uint32_t ENV_CONVERSION_TIMEOUT_MS = 200;
 constexpr uint32_t ENV_FAILURE_RETRY_MS = 5000;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
-constexpr uint32_t RECOVERY_MAX_MS = 60000;
+constexpr uint32_t RECOVERY_MAX_MS = 30000;
 constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.12";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
+gas_scan::Diagnostics gasScanDiagnostics;
+gas_scan::FrameBuffer gasFrames;
+uint32_t nextGasTxAttempt=0, gasTxMaxUs=0, gasTxSerialMaxUs=0;
+constexpr uint32_t GAS_TX_RETRY_MS=5000;
+bool gasHeaterOff=false, haveRejectedGas=false;
+bme68xData firstRejectedGas={};
 measurement_guard::Guard measurementGuard;
 bme68xData lastEnvData={};
 #if !defined(_MSC_VER)
@@ -279,6 +285,8 @@ uint32_t lastSensorField = 0;
 uint32_t sensorReadyAt = 0;
 uint32_t nextEnvMeasurement = 0, envConversionAt = 0, nextGasScan = 0;
 uint32_t scanStartedAt = 0, coolingStartedAt = 0, scanCompleteBefore = 0, scanIncompleteBefore = 0;
+uint32_t firstGasFetchMs = 0, maxGasPollGapMs = 0, lastGasFetchAt = 0;
+bool gasFetchSeen = false;
 uint32_t recoveryDelay = RECOVERY_MIN_MS;
 bool sensorReady = false, recoveryPending = false, lastReadOK = false;
 bool envReadOK = false, envConversionPending = false;
@@ -292,6 +300,14 @@ uint8_t lastEnvMeasurementIndex=0;
 bool recoveringGas = false;
 enum SensorMode : uint8_t { MODE_ENV, MODE_GAS, MODE_COOL, MODE_REC };
 SensorMode sensorMode = MODE_REC;
+
+// Collect timings without printing in the time-critical sensor polling path.
+struct ScanWorkTimer {
+  uint32_t* peak;
+  uint32_t started;
+  explicit ScanWorkTimer(uint32_t& value):peak(gasScanDiagnostics.active?&value:nullptr),started(micros()){}
+  ~ScanWorkTimer(){if(peak){const uint32_t elapsed=micros()-started;if(elapsed>*peak)*peak=elapsed;}}
+};
 
 inline bool loopLivenessExpired(uint32_t now, uint32_t heartbeat) {
   return (uint32_t)(now - heartbeat) >= LOOP_LIVENESS_TIMEOUT_MS;
@@ -345,6 +361,7 @@ bool readUsbPowerPresent(bool& present) {
 }
 
 uint32_t readVddhRaw() {
+  ScanWorkTimer timing(gasScanDiagnostics.adcMaxUs);
 #if defined(_MSC_VER)
   return testVddhRaw;
 #else
@@ -422,6 +439,9 @@ bool writeBatteryState(const char* path, const battery::PersistedState& state) {
 
 void serviceBatteryStorage(uint32_t now) {
   if (!batteryStorageReady || !batteryTracker.shouldPersist(now)) return;
+  // Flash persistence is not time-critical; defer until parallel polling ends.
+  if(sensorMode==MODE_GAS)return;
+  ScanWorkTimer timing(gasScanDiagnostics.storageMaxUs);
   battery::PersistedState state=batteryTracker.snapshot();
   const char* path=(state.generation&1)?BATTERY_STATE_A:BATTERY_STATE_B;
   if(writeBatteryState(path,state)){
@@ -514,6 +534,7 @@ void updateOled(uint32_t now) {
     return;
   }
   lastOledRefresh = now;
+  ScanWorkTimer timing(gasScanDiagnostics.oledMaxUs);
 
   char line[22];  // 기본 6 px 글꼴 기준 128 px에 최대 21자.
   char seqText[6], failText[6], recoveryText[6], txText[6];
@@ -572,7 +593,7 @@ void updateOled(uint32_t now) {
   }
 
   snprintf(line, sizeof(line), "%s:%s F:%s R:%s",
-         !sensorReady ? "REC" : sensorMode == MODE_ENV ? "ENV" : "GAS",
+         !sensorReady || sensorMode == MODE_REC ? "REC" : sensorMode == MODE_ENV ? "ENV" : "GAS",
          seqText, failText, recoveryText);
   oled.println(line);
   oled.display();
@@ -700,6 +721,7 @@ void sendHealth() {
 }
 
 bool stopGasHeater() {
+  gasHeaterOff=false;
   // Bosch set_heatr_conf(enable=0) clears HCTRL and RUN_GAS. The wrapper has
   // no disable method, so perform the equivalent read/modify/write in sleep.
   bme.setOpMode(BME68X_SLEEP_MODE);
@@ -715,27 +737,114 @@ bool stopGasHeater() {
   const uint8_t off0=bme.readReg(BME68X_REG_CTRL_GAS_0);
   if(bme.checkStatus()==BME68X_ERROR)return false;
   const uint8_t off1=bme.readReg(BME68X_REG_CTRL_GAS_1);
-  return bme.checkStatus()!=BME68X_ERROR && (off0&BME68X_HCTRL_MSK) &&
-         !(off1&BME68X_RUN_GAS_MSK);
+  gasHeaterOff=bme.checkStatus()!=BME68X_ERROR && (off0&BME68X_HCTRL_MSK) &&
+               !(off1&BME68X_RUN_GAS_MSK);
+  return gasHeaterOff;
+}
+
+bool serviceGasFrames() {
+  if(sensorMode==MODE_GAS || !gasHeaterOff || !gasFrames.pending() ||
+     (int32_t)(millis()-nextGasTxAttempt)<0 || !Bluefruit.connected() ||
+     !bleuart.notifyEnabled())return false;
+  const char* frame=gasFrames.frame[gasFrames.sent];
+  const uint32_t started=micros();
+  const bool sent=sendLine(frame);
+  const uint32_t elapsed=micros()-started;
+  if(elapsed>gasTxMaxUs)gasTxMaxUs=elapsed;
+  if(!sent) {
+    nextGasTxAttempt=millis()+GAS_TX_RETRY_MS;
+    Serial.println("SCAN TX deferred; same frame retained in RAM");
+    return false;
+  }
+  ++gasFrames.sent;
+  nextGasTxAttempt=millis();
+  const uint32_t serialStarted=micros();
+  Serial.print("TX ");Serial.println(frame);
+  const uint32_t serialElapsed=micros()-serialStarted;
+  if(serialElapsed>gasTxSerialMaxUs)gasTxSerialMaxUs=serialElapsed;
+  if(!gasFrames.pending()) {
+    Serial.print("SCAN TX drained frames=");Serial.print(gasFrames.count);
+    Serial.print(" ble_max_us=");Serial.print(gasTxMaxUs);
+    Serial.print(" serial_after_stop_max_us=");Serial.println(gasTxSerialMaxUs);
+  }
+  return true; // At most one frame per loop; keep the loop liveness heartbeat.
+}
+
+void printGasScanDiagnostics(const char* reason) {
+  if(!gasScanDiagnostics.active)return;
+  gasScanDiagnostics.active=false;
+  Serial.print("SCAN diag end=");Serial.print(reason);
+  Serial.print(" duration_ms=");Serial.print((uint32_t)(millis()-scanStartedAt));
+  Serial.print(" empty=");Serial.print(gasScanDiagnostics.emptyFetches);
+  Serial.print(" first_fetch_ms=");Serial.print(gasFetchSeen?firstGasFetchMs:0);
+  Serial.print(" max_poll_gap_ms=");Serial.print(maxGasPollGapMs);
+  Serial.print(" fetch_error=");Serial.print(gasScanDiagnostics.fetchErrors);
+  Serial.print(" GI_out_of_range=");Serial.println(gasScanDiagnostics.outOfRange);
+  Serial.print("SCAN timing fetch_max_us=");Serial.print(gasScanDiagnostics.fetchMaxUs);
+  Serial.print(" process_max_us=");Serial.print(gasScanDiagnostics.processMaxUs);
+  Serial.print(" oled_max_us=");Serial.print(gasScanDiagnostics.oledMaxUs);
+  Serial.print(" adc_max_us=");Serial.print(gasScanDiagnostics.adcMaxUs);
+  Serial.print(" storage_max_us=");Serial.println(gasScanDiagnostics.storageMaxUs);
+  Serial.print("SCAN status profile_status=");Serial.print((int)gasScanDiagnostics.profileStatus);
+  Serial.print(" mode_status=");Serial.print((int)gasScanDiagnostics.modeStatus);
+  Serial.print(" waiting_zero=");Serial.print(gasScanDiagnostics.waitingForZero);
+  Serial.print(" no_real_gas=");Serial.print(gasScanDiagnostics.noRealGas);
+  Serial.print(" frame_errors=");Serial.print(gasScanDiagnostics.frameErrors);
+  Serial.print(" sequence_exhausted=");Serial.println(gasScanDiagnostics.sequenceExhausted);
+  if(gasScanDiagnostics.bufferFull)
+    Serial.println("ERROR SCAN buffer full; partial scan ended; buffered frames preserved");
+  if(haveRejectedGas) {
+    Serial.print("SENSOR first invalid step GI=");Serial.print(firstRejectedGas.gas_index);
+    Serial.print(" ST=");Serial.print(firstRejectedGas.status,HEX);
+    Serial.print(" G(ohm)=");Serial.print(firstRejectedGas.gas_resistance);
+    Serial.print(" T/H/P=");Serial.print(firstRejectedGas.temperature);Serial.print('/');
+    Serial.print(firstRejectedGas.humidity);Serial.print('/');Serial.println(firstRejectedGas.pressure);
+  }
+  for(uint8_t gi=0;gi<gas_scan::STEPS;++gi) {
+    const gas_scan::Diagnostics::Step& s=gasScanDiagnostics.step[gi];
+    Serial.print("SCAN GI=");Serial.print(gi);
+    Serial.print(" seen=");Serial.print(s.seen);
+    Serial.print(" new=");Serial.print(s.newData);
+    Serial.print(" gas=");Serial.print(s.gasValid);
+    Serial.print(" heat=");Serial.print(s.heatStable);
+    Serial.print(" skipped=");Serial.print(s.skipped);
+    Serial.print(" rejected=");Serial.print(s.rejected);
+    Serial.print(" accepted=");Serial.print(s.accepted);
+    Serial.print(" first_ST/MI=");Serial.print(s.firstStatus,HEX);
+    Serial.print('/');Serial.print(s.firstMeasurement);
+    Serial.print(" last_ST/MI=");Serial.print(s.lastStatus,HEX);
+    Serial.print('/');Serial.println(s.lastMeasurement);
+  }
 }
 
 bool startGasScan() {
+  if(!gasFrames.reset())return false; // Pending data must drain before another scan.
   bme.setOpMode(BME68X_SLEEP_MODE);
   if(bme.checkStatus()==BME68X_ERROR)return false;
   const uint32_t tphMs=bme.getMeasDur(BME68X_PARALLEL_MODE)/1000;
   if(tphMs>=gas_scan::POLL_MS)return false;
   const uint16_t sharedMs=(uint16_t)(gas_scan::POLL_MS-tphMs);
   bme.setHeaterProf(gas_scan::temperature,gas_scan::multiplier,sharedMs,gas_scan::STEPS);
-  if(bme.checkStatus()==BME68X_ERROR)return false;
-  bme.setOpMode(BME68X_PARALLEL_MODE);
-  if(bme.checkStatus()==BME68X_ERROR)return false;
+  const int8_t profileStatus=bme.checkStatus();
+  if(profileStatus==BME68X_ERROR){Serial.println("SCAN heater profile status=ERROR");return false;}
+  // Report the transition before starting parallel conversions: NUS chunk
+  // writes can block long enough to discard the earliest Bosch field slots.
   sensorMode=MODE_GAS;lastReadOK=false;envReadOK=false;
+  sendHealth();lastHealth=millis();
+  Serial.print("HP354 parallel shared heater ms=");Serial.println(sharedMs);
+  Serial.print("SCAN diag begin GI0-9=0 profile_status=");Serial.println((int)profileStatus);
+  gasHeaterOff=false;
+  bme.setOpMode(BME68X_PARALLEL_MODE);
+  const int8_t modeStatus=bme.checkStatus();
+  if(modeStatus==BME68X_ERROR){Serial.println("SCAN parallel mode status=ERROR");return false;}
   scanStartedAt=millis();sensorReadyAt=scanStartedAt;lastSensorField=scanStartedAt;
+  gasFetchSeen=false;firstGasFetchMs=0;maxGasPollGapMs=0;lastGasFetchAt=0;
   scanCompleteBefore=scanTracker.complete;scanIncompleteBefore=scanTracker.incomplete;
   nextMeasurement=scanStartedAt;
   nextGasScan=scanStartedAt+GAS_SCAN_INTERVAL_MS;
-  Serial.print("HP354 parallel shared heater ms=");Serial.println(sharedMs);
-  sendHealth();
+  gasScanDiagnostics.reset();
+  gasScanDiagnostics.profileStatus=profileStatus;gasScanDiagnostics.modeStatus=modeStatus;
+  haveRejectedGas=false;gasTxMaxUs=gasTxSerialMaxUs=0;
   return true;
 }
 
@@ -801,6 +910,7 @@ void recoverSensor() {
   // reinitialization restored operation. Keep recovery AND backoff, even if
   // ordinary tests pass. A successful begin is not yet a successful recovery.
   const bool wasGas=sensorMode==MODE_GAS || recoveringGas;
+  if(wasGas && !gasHeaterOff)stopGasHeater();
   const bool resetBus=recoveryAttempts==0 || recoveryStage!=0;
   ++recoveryAttempts;
   ++recoveryAttemptsSinceGood;
@@ -811,21 +921,22 @@ void recoverSensor() {
   recoveryPending = true;
   lastReadOK = false;consecutiveFailures=0;envConsecutiveFailures=0;
   envReadOK=false;envConversionPending=false;haveEnvMeasurementIndex=false;
-  sensorMode=!sensorReady?MODE_REC:wasGas?MODE_COOL:MODE_ENV;
+  sensorMode=sensorReady&&wasGas?MODE_COOL:MODE_REC;
   if(sensorReady)recoveringGas=false;
   if(wasGas){coolingStartedAt=millis();nextGasScan=coolingStartedAt+GAS_SCAN_INTERVAL_MS;}
   nextRecovery = millis() + recoveryDelay;
   recoveryDelay = min(recoveryDelay * 2, RECOVERY_MAX_MS);
   if(recoveryAttemptsSinceGood>=6) {
-    nextRecovery=millis()+300000; // bounded attempts, then a quiet retry window
     recoveryAttemptsSinceGood=0;
-    Serial.println("RECOVERY retry budget exhausted; next attempt in 300 s");
+    Serial.println("RECOVERY retry budget reached; next attempt within 30 s");
   }
   Serial.print("RECOVERY init="); Serial.print(sensorReady);
   Serial.print(" stage=");Serial.print(resetBus?"I2C":"soft");
   Serial.print(" attempts="); Serial.println(recoveryAttempts);
   nextMeasurement = millis();nextEnvMeasurement=millis();
   lastSensorField = millis();
+  if(wasGas)printGasScanDiagnostics("recovery");
+  if(gasFrames.pending())nextGasTxAttempt=millis();
   sendHealth();
 }
 
@@ -835,11 +946,13 @@ void finishGasScan() {
   if(scanTracker.complete==scanCompleteBefore && scanTracker.incomplete==scanIncompleteBefore)
     ++scanTracker.incomplete;
   const bool complete=scanTracker.complete>scanCompleteBefore;
+  if(!stopGasHeater()) {Serial.println("SENSOR ERROR heater-off transition");recoverSensor();return;}
   Serial.print(complete?"SCAN complete":"SCAN incomplete");
   Serial.print(" total incomplete=");Serial.println(scanTracker.incomplete);
-  if(!stopGasHeater()) {Serial.println("SENSOR ERROR heater-off transition");recoverSensor();return;}
   sensorMode=MODE_COOL;coolingStartedAt=millis();envReadOK=false;lastReadOK=complete;
   envConversionPending=false;nextEnvMeasurement=coolingStartedAt+COOLING_MS;
+  printGasScanDiagnostics("last_step_or_timeout");
+  nextGasTxAttempt=millis();
   sendHealth();
 }
 
@@ -922,7 +1035,7 @@ void environmentFailure(const char* reason) {
 
 void serviceEnvironment(uint32_t now) {
   if(!envConversionPending) {
-    const bool gasDue=!recoveryPending && (int32_t)(now-nextGasScan)>=0;
+    const bool gasDue=!recoveryPending && !gasFrames.pending() && (int32_t)(now-nextGasScan)>=0;
     if(!gasDue && (int32_t)(now-nextEnvMeasurement)<0)return;
     nextEnvMeasurement=now+ENV_INTERVAL_MS; // start-to-start; never catch up in a burst
     bme.setOpMode(BME68X_FORCED_MODE); // heater remains disabled in CTRL_GAS_0/1
@@ -967,6 +1080,7 @@ void serviceEnvironment(uint32_t now) {
   recoveryDelay=RECOVERY_MIN_MS;
   recoveryStage=0;recoveryAttemptsSinceGood=0;
   if(recoveryPending){++recoveries;recoveryPending=false;Serial.println("RECOVERY environment measurement OK");}
+  sensorMode=MODE_ENV;
   char frame[120];
   const int n=snprintf(frame,sizeof(frame),
     "ENV,BID=%08lX,SEQ=%lu,MS=%lu,T=%.2f,H=%.2f,P=%.2f",
@@ -977,7 +1091,7 @@ void serviceEnvironment(uint32_t now) {
   // A gas scan always follows a just-completed heater-off T/H/P conversion.
   // nextGasScan is advanced only by startGasScan(), so a failed pre-scan ENV
   // conversion remains due and is retried through ENV_FAILURE_RETRY_MS.
-  if(!recoveryPending && (int32_t)(millis()-nextGasScan)>=0) {
+  if(!recoveryPending && !gasFrames.pending() && (int32_t)(millis()-nextGasScan)>=0) {
     if(!startGasScan()){Serial.println("SENSOR ERROR start gas scan");recoveringGas=true;recoverSensor();}
   }
 }
@@ -987,11 +1101,13 @@ void loop() {
 #if !defined(_MSC_VER)
   loopHeartbeatAt = now;
 #endif
+  if(serviceGasFrames())return;
   serviceBatteryVoltage(now);
 #if !defined(_MSC_VER)
   serviceBatteryStorage(now);
 #endif
-  if (now - lastHealth >= 10000) { lastHealth = now; sendHealth(); }
+  // Periodic STAT is diagnostic; do not block time-critical parallel polling.
+  if (sensorMode != MODE_GAS && now - lastHealth >= 10000) { lastHealth = now; sendHealth(); }
   if (!sensorReady) {
     if ((int32_t)(now - nextRecovery) >= 0) recoverSensor();
 #if !defined(_MSC_VER)
@@ -1002,22 +1118,21 @@ void loop() {
   }
   if(sensorMode==MODE_COOL) {
     if((uint32_t)(now-coolingStartedAt)>=COOLING_MS) {
-      sensorMode=MODE_ENV;nextEnvMeasurement=now;envReadOK=false;sendHealth();
+      sensorMode=recoveryPending?MODE_REC:MODE_ENV;nextEnvMeasurement=now;envReadOK=false;sendHealth();
     }
 #if !defined(_MSC_VER)
     updateOled(millis());
 #endif
     delay(LOOP_IDLE_MS);return;
   }
-  if(sensorMode==MODE_ENV) {
+  if(sensorMode==MODE_ENV || sensorMode==MODE_REC) {
     serviceEnvironment(now);
 #if !defined(_MSC_VER)
     updateOled(millis());
 #endif
-    delay(envConversionPending ? ACTIVE_LOOP_IDLE_MS : LOOP_IDLE_MS);return;
+    delay(envConversionPending || sensorMode==MODE_GAS ? ACTIVE_LOOP_IDLE_MS : LOOP_IDLE_MS);return;
   }
   if((uint32_t)(now-scanStartedAt)>=GAS_SCAN_TIMEOUT_MS) {
-    Serial.println("SCAN timeout; incomplete fingerprint retained");
     if((uint32_t)(now-lastSensorField)>=20000) {
       ++failures;++consecutiveFailures;lastReadOK=false;recoveringGas=true;
       if(!scanTracker.started && scanTracker.complete==scanCompleteBefore &&
@@ -1037,20 +1152,33 @@ void loop() {
     return;
   }
   nextMeasurement = now + gas_scan::POLL_MS;  // Bosch example fetch cadence, no catch-up burst
-  const uint8_t fields=bme.fetchData();
+  const uint32_t fetchAt=millis();
+  if(!gasFetchSeen) { firstGasFetchMs=fetchAt-scanStartedAt;gasFetchSeen=true; }
+  else if((uint32_t)(fetchAt-lastGasFetchAt)>maxGasPollGapMs)
+    maxGasPollGapMs=fetchAt-lastGasFetchAt;
+  lastGasFetchAt=fetchAt;
+  uint8_t fields;
+  { ScanWorkTimer timing(gasScanDiagnostics.fetchMaxUs);fields=bme.fetchData(); }
   bool sawLastStep=false;
   const bool fetchError=bme.checkStatus() == BME68X_ERROR;
+  {
+  ScanWorkTimer timing(gasScanDiagnostics.processMaxUs);
   if (fetchError) {
+    ++gasScanDiagnostics.fetchErrors;
     ++failures; ++consecutiveFailures; lastReadOK=false;
-    Serial.println("SENSOR ERROR Bosch fetchData");
   } else if (fields) {
     bme68xData data={};
     for(uint8_t i=0;i<fields;++i) {
       bme.getData(data);
+      const uint32_t observedAt=millis();
+      gasScanDiagnostics.observe(data.gas_index,data.meas_index,data.status);
       // Bosch parallel mode intentionally emits dummy TPHG conversions while
       // holding a heater step. GASM_VALID=0 is not an invalid gas reading.
       if(!(data.status&BME68X_NEW_DATA_MSK) ||
-         !(data.status&BME68X_GASM_VALID_MSK)) continue;
+         !(data.status&BME68X_GASM_VALID_MSK)) {
+        if(data.gas_index<gas_scan::STEPS)++gasScanDiagnostics.step[data.gas_index].skipped;
+        continue;
+      }
       if(data.gas_index==gas_scan::STEPS-1)sawLastStep=true;
       lastSensorField=millis();
       const bool statusValid=(data.status & (BME68X_NEW_DATA_MSK |
@@ -1075,6 +1203,7 @@ void loop() {
       if(data.gas_index>=gas_scan::STEPS)scanTracker.invalidate();
       const bool grouped=scanTracker.observe(data.gas_index,data.meas_index,valid);
       if(!valid) {
+        if(data.gas_index<gas_scan::STEPS)++gasScanDiagnostics.step[data.gas_index].rejected;
         // DATA INTEGRITY: a real numeric G=0 lockup recovered after reset.
         // Never transmit this or a stale field as a normal heater step.
         ++failures; lastReadOK=false;
@@ -1083,47 +1212,51 @@ void loop() {
         if(statusValid ? (!plausible || duplicateIndex) :
            (uint32_t)(millis()-sensorReadyAt)>=20000)
           ++consecutiveFailures;
-        Serial.print("SENSOR invalid step GI="); Serial.print(data.gas_index);
-        Serial.print(" ST="); Serial.print(data.status,HEX);
-        Serial.print(" G(ohm)=");Serial.print(data.gas_resistance);
-        Serial.print(" T/H/P=");Serial.print(data.temperature);Serial.print('/');
-        Serial.print(data.humidity);Serial.print('/');Serial.println(data.pressure);
-        Serial.print("SENSOR guard counters implausible=");Serial.print(implausibleMeasurements);
-        Serial.print(" frozen=");Serial.print(frozenMeasurements);
-        Serial.print(" duplicateMI=");Serial.println(duplicateGasIndexes);
+        if(!haveRejectedGas){firstRejectedGas=data;haveRejectedGas=true;}
         continue;
       }
+      if(data.gas_index<gas_scan::STEPS)++gasScanDiagnostics.step[data.gas_index].accepted;
       consecutiveFailures=0; lastReadOK=true;
       recoveryDelay=RECOVERY_MIN_MS;
       recoveryStage=0;recoveryAttemptsSinceGood=0;
-      if(recoveryPending) { ++recoveries; recoveryPending=false; Serial.println("RECOVERY measurement OK"); }
-      if(!grouped) { Serial.println("SCAN waiting for step 0"); continue; }
-      if(validSequence==UINT32_MAX) { sensorReady=false; Serial.println("ERROR sensor SEQ exhausted"); break; }
+      if(recoveryPending) { ++recoveries; recoveryPending=false; }
+      if(!grouped) { ++gasScanDiagnostics.waitingForZero;continue; }
+      if(validSequence==UINT32_MAX) { sensorReady=false;gasScanDiagnostics.sequenceExhausted=true;break; }
+      if(gasFrames.count>=gas_scan::FrameBuffer::CAPACITY) {
+        gasScanDiagnostics.bufferFull=true;scanTracker.invalidate();break;
+      }
       ++validSequence;
-      char frame[180];
-      const int n=snprintf(frame,sizeof(frame),
+      char* frame=gasFrames.frame[gasFrames.count];
+      const int n=snprintf(frame,gas_scan::FrameBuffer::FRAME_BYTES,
         "V=3,BID=%08lX,SEQ=%lu,SCAN=%lu,STEP=%u,GI=%u,MI=%u,MS=%lu,ST=%u,PID=354,T=%.2f,H=%.2f,P=%.2f,G=%.2f",
         (unsigned long)bootId,(unsigned long)validSequence,(unsigned long)scanTracker.scan,
-        data.gas_index,data.gas_index,data.meas_index,(unsigned long)millis(),data.status,
+        data.gas_index,data.gas_index,data.meas_index,(unsigned long)observedAt,data.status,
         data.temperature,data.humidity,data.pressure/100.0,data.gas_resistance/1000.0);
-      if(n<=0 || n>=(int)sizeof(frame)) { ++txErrors; Serial.println("ERROR BLE v3 frame overflow"); continue; }
-      if(sendLine(frame)) { Serial.print("TX "); Serial.println(frame); }
+      if(n<=0 || n>=gas_scan::FrameBuffer::FRAME_BYTES) { ++txErrors;++gasScanDiagnostics.frameErrors;continue; }
+      ++gasFrames.count;
     }
+  } else ++gasScanDiagnostics.emptyFetches;
   }
   const uint32_t watchdogNow = millis(); // sensor processing may update lastSensorField after now
   if (!fetchError && (uint32_t)(watchdogNow-lastSensorField)>=20000) {
     // Dummy conversions can continue during a stuck gas measurement. A real
     // gas field should occur within the ~10.8 s reference scan time.
     ++failures; ++consecutiveFailures; lastReadOK=false; lastSensorField=watchdogNow;
-    Serial.println("SENSOR ERROR no real gas result for 20 s");
+    ++gasScanDiagnostics.noRealGas;
   }
-  if(consecutiveFailures>=FAILURE_THRESHOLD) {
+  if(consecutiveFailures>=FAILURE_THRESHOLD || gasScanDiagnostics.sequenceExhausted) {
     sensorReady=false;
     recoveringGas=true;stopGasHeater();
     if((int32_t)(millis()-nextRecovery)>=0) recoverSensor();
+    else {sensorMode=MODE_REC;printGasScanDiagnostics("recovery_pending");nextGasTxAttempt=millis();}
     sendHealth();
   }
   else if(sawLastStep)finishGasScan();
+  else if(gasFrames.count>=gas_scan::FrameBuffer::CAPACITY || gasScanDiagnostics.bufferFull) {
+    // A missing GI 9 can let the sensor repeat the profile. End this partial
+    // scan before another result could overwrite the bounded RAM buffer.
+    gasScanDiagnostics.bufferFull=true;scanTracker.invalidate();finishGasScan();
+  }
 #if !defined(_MSC_VER)
   updateOled(millis());
 #endif

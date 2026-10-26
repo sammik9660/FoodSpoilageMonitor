@@ -18,7 +18,9 @@ struct FICR{uint32_t DEVICEID[2]={1,2};};inline FICR ficr;inline FICR* NRF_FICR=
 inline int sd_rand_application_vector_get(uint8_t* p,size_t n){memset(p,42,n);return 0;}
 inline std::string transmitted;
 inline bool testBleConnected=true;
-struct BLEUart{void begin(){}bool notifyEnabled(){return true;}size_t write(const uint8_t* p,size_t n){transmitted.append((char*)p,n);return n;}};
+inline uint32_t testBleWriteDelayMs=0;
+inline bool testBleWriteFails=false;
+struct BLEUart{void begin(){}bool notifyEnabled(){return true;}size_t write(const uint8_t* p,size_t n){testMillis+=testBleWriteDelayMs;if(testBleWriteFails)return 0;transmitted.append((char*)p,n);return n;}};
 struct AdvertisingStub{void addService(BLEUart&){}void addName(){}void restartOnDisconnect(bool){}void setInterval(int,int){}void setFastTimeout(int){}void start(int){}};
 struct PeriphStub{uint16_t minMs=0,maxMs=0,latency=0,timeoutMs=0;
  bool setConnIntervalMS(uint16_t min,uint16_t max){minMs=min;maxMs=max;return true;}

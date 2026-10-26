@@ -1,4 +1,39 @@
+## 2026-10-26 HP354 측정 / BLE 송신 분리 (실기 미검증)
+
+- 기존 미커밋 센서 복구·첫 fetch 10ms·GI 진단 변경을 보존하고, 유효 원본 가스 프레임을 고정 RAM 10 × 180 bytes에 저장하도록 변경했다. MS/SEQ/SCAN/GI/MI/ST는 수신한 센서 필드 처리 시 확정하며 히터 OFF 확인 후 기존 sendLine으로 FIFO 송신한다. 부분·타임아웃·복구에서도 버퍼를 보존한다. 실패한 송신은 같은 프레임으로 5초 이후 재시도하며, 미전송 프레임이 있으면 다음 가스 스캔 시작을 보류한다. RAM은 전원 차단을 견디는 저장소가 아니고 NUS write 성공은 ESP 수신 ACK가 아니다.
+- 정상 ENV 120초 / 실패 5초 / GAS 600초 / 복구 최대 30초 및 프로파일·MeasurementGuard·Tracker는 유지했다. 스캔 중 원시/오류 Serial 출력은 종료 요약으로 이동했고, OLED/ADC/fetch/필드 처리 최대 소요시간을 집계한다. 배터리 보정값 쓰기만 스캔 뒤로 미룬다(보정 계산은 그대로).
+- 같은 실제 소스 + 3필드 센서 모델(140ms 변환, notify당 100ms 지연) 비교: 변경 전 첫 스캔 7/10, 최대 polling 공백 862ms, 완전 스캔 0; 변경 후 10/10, 첫 fetch 10ms, 최대 공백 142ms, 덮어쓴 센서 필드 0. 이는 호스트 모델 결과이며 실제 GI 수신 보장이 아니다. 테스트는 FIFO 원문/ESP 파서, 실패 송신 유지, 부분·타임아웃·복구·버퍼 포화도 검증한다. 비교용 원본은 Git 제외 data/hp354-buffer-baseline-20261026에 보존했다.
+- 호스트 sensor_test, sensor_timing_test, ESP Integrity 파서/ACK/CRC 테스트, battery_test 및 fingerprint 5개 테스트 통과. git diff --check 통과.
+- Adafruit nRF52 1.7.0 feather52840:softdevice=s140v6 전체 컴파일 성공: Flash 175604/815104, RAM 18860/237568 bytes. 실제 보드 업로드는 수행하지 않았다.
+- 중요: ESP gateway.ino의 capturedAt은 여전히 BLE 수신 시각이다. 원본 nRF MS는 유지되지만 이번 지연 송신은 CSV 절대 시각/실험 경계를 지연시킬 수 있다. ESP/서버는 변경하지 않았다. 캡처 시각 보정은 별도 승인·검증 작업이며 실험 경계에 걸친 스캔은 특히 주의해야 한다.
+
 # 프로젝트 현재 상태
+
+## 2026-10-26 HP-354 첫 필드 폴링 지연 수정 (로컬 검증)
+
+- 사용자 실기 진단에서 GI 0/1/6이 보이지 않고 첫 measurement index가 10이었다. `7e8f949`의 1000ms idle 대기가 ENV→GAS 전환 직후에도 적용되며, 시작 STAT의 동기식 NUS 전송도 병렬 측정 시작 뒤에 있었다. 주기적 STAT 역시 스캔 중 140ms 폴링을 지연시킬 수 있었다.
+- 병렬 모드 시작 전에 GAS 전환 STAT을 보낸 뒤, 스캔 시작 루프는 10ms active 대기로 전환했다. GAS 중 주기적 STAT만 미루고 스캔 종료·복구 상태 전송은 유지했다. 첫 fetch 지연과 최대 fetch 간격을 스캔 종료 요약에 기록한다. ENV 120초, 실패 5초, 복구 최대 30초, GAS 600초, 히터/검증/BLE 프레임은 유지했다.
+- 실제 nRF 소스 호스트 회귀 테스트 통과. Adafruit nRF52 core 1.7.0 `adafruit:nrf52:feather52840:softdevice=s140v6` 빌드 성공(Flash 173,524/815,104 bytes, RAM 16,988/237,568 bytes). 실제 보드에서 GI 0~9 수신과 유효 GAS 전송은 아직 검증하지 않았다. 업로드하지 않았다.
+
+## 2026-10-26 HP-354 step 0 누락 진단 계측 (로컬 빌드, 실기 미검증)
+
+- 새 가스 데이터가 없는 사용자 로그는 `SCAN waiting for step 0` 반복 후 `SCAN incomplete`다. 현재 코드는 `NEW_DATA`/`GASM_VALID` 필드만 추적기에 넘기고, 추적기는 GI 0을 본 뒤에만 후속 step을 그룹화하므로 이 로그만으로는 GI 0 미수신과 초기 상태 비트 누락을 구분할 수 없었다.
+- nRF `Scan.h`/`bme688_node.ino`에 스캔별 GI 0~9의 Bosch fetch 반환 횟수, NEW_DATA/GASM_VALID/HEAT_STAB 횟수, early skip/유효성 거부/허용 횟수, 첫·마지막 status와 measurement index를 집계했다. 스캔 시작에 히터 프로파일/병렬 모드 설정 상태를 한 줄로, 종료 또는 복구 시 히터 OFF 후 집계 결과를 출력한다. 140 ms polling 중에는 필드당 새 로그를 추가하지 않았다. 주기, 추적기, 유효성 검사, BLE 프레임은 변경하지 않았다.
+- 실제 nRF 소스를 포함한 MSVC 회귀 테스트에 GI 0이 `NEW_DATA=1,GASM_VALID=0`으로 건너뛰어지고 뒤의 유효 GI 1~9가 전송되지 않는 사례를 추가해 통과했다. Arduino CLI Adafruit nRF52 core 1.7.0 `adafruit:nrf52:feather52840:softdevice=s140v6` 최종 빌드 성공(Flash 173,252/815,104 bytes, RAM 16,972/237,568 bytes). `git diff --check` 통과. 실제 보드 업로드와 GI 0 원인 확인은 하지 않았다.
+
+## 2026-10-26 Device 2 SPIFFS 실기 복구 (실험 기록 경로 검증 진행 중)
+
+- 사용자 승인으로 COM8 ESP32-S3의 파티션 테이블과 현재 SPIFFS 영역을 읽기 전용 백업했다. 실제 테이블은 sketch `partitions.csv`와 일치하며 SPIFFS는 `0x310000`/`0xE0000`이다. 기존 영역 917,504바이트는 전부 `0xFF`여서 현재 파티션에는 파일이나 미전송 스풀 흔적이 없었다. 원시 백업은 Git 제외 `data/spiffs-diagnostic-20261026/spiffs-raw.bin`에 보존했다. 2026-10-11 No OTA 테이블의 SPIFFS 시작은 `0x210000`이었으므로 그 과거 영역 전체에 데이터가 남았는지는 이 백업만으로 확정할 수 없다.
+- 별도 사용자 승인 후 현재 SPIFFS 파티션에만 core 설정(4,096-byte block, 256-byte page)의 빈 `mkspiffs` 이미지를 기록했다. `esptool`은 지운 범위를 `0x310000`–`0x3EFFFF`로 보고했고, 기록 후 동일 범위 readback SHA-256이 입력 이미지와 일치했다. NVS, OTA 앱 슬롯, 파티션 테이블은 쓰지 않았다. 정상 재부팅 로그에서 `SPIFFS mount success`, `SPOOL total=836081 budget=501648 pending=0 fault=0`과 BLE/Wi-Fi 연결을 확인했다.
+- 복구 뒤 첫 실제 데이터 업로드는 `samples=1`, application ACK와 `stored=1`을 반환했으나 서버 recording은 `STOPPED`였다. 이는 실험 SensorData/CSV 저장의 증거가 아니다. 사용자가 `codex_here` 시험 실험을 시작한 후 서버 응답에서 `RECORDING`을 확인했지만 관찰 구간은 `samples=0` heartbeat뿐이었다. 센서 metadata의 `ok`가 0/1로 오가며 `fail=15 recover=4`였고 새 가스 프레임은 관찰되지 않았다. 두 Wi-Fi를 끈 2분 시험 중에도 POST 302가 계속되어 실제 오프라인 전환이 되지 않았다. 사용자가 이후 Wi-Fi를 복구했으며 다른 저장 네트워크 존재 여부는 미확인이다. 따라서 오프라인 스풀 쓰기·재부팅 복원·네트워크 복구 replay, 신규 가스 행의 RECORDING 저장 및 웹/Sheets 조회는 실기 미검증이다. 기존 호스트 spool/partition 테스트는 통과했으며 펌웨어 소스는 이 복구에서 수정하지 않았다.
+
+## 2026-10-26 nRF BME688 복구 대기 상한 조정 (로컬 빌드, 실기 미검증)
+
+- 정상 ENV 120초와 실패 ENV 5초 재측정은 유지했다. 초기화 재시도 backoff 상한을 60초에서 30초로 낮추고, 6회 뒤 별도로 적용하던 300초 대기를 제거해 단일 `nextRecovery` 타이머만 사용한다. 초기화에 성공해도 REC를 유지하며 첫 유효 ENV 측정 이후 ENV로 전환한다. 가스 복구의 기존 냉각 구간 이후에도 첫 유효 ENV 측정까지 REC다.
+- 기존 측정 유효성 검사와 가스/환경 프로토콜은 유지했다. 정상 기준 T/H/P가 없는 부팅 직후의 물리 범위 내 이상값은 단일 측정만으로 진위를 가릴 수 없어 별도 필터를 추가하지 않았다. 실제 고장 원인은 미확정이다.
+- 실제 nRF 소스를 포함한 MSVC 센서 회귀 테스트 및 Adafruit nRF52 core 1.7.0 `adafruit:nrf52:feather52840:softdevice=s140v6` 전체 빌드가 통과했다(Flash 171,988/815,104 bytes, RAM 16,784/237,568 bytes). 실제 센서 복구 시간·오검출·BLE 상태 표시와 장기 안정성은 검증하지 않았다.
+- 냉장고 7.4°C/약 90%RH 실험의 실패 원인은 로그만으로 I²C, 배선, 전원, 결로, 센서 내부 상태 중 구분할 수 없다. OLED와 BME688은 동일한 `Wire` 버스를 쓰지만 화면 줄 밀림과 센서 오류가 한 원인이라는 증거는 없다. 부팅 직후 기준 환경값이 없으면 물리 범위 안의 31.61°C/100%RH/735.47hPa 한 건은 진위를 판정할 수 없어 근거 없는 절대 임계값을 추가하지 않았다.
+- 별개의 ESP32 SPIFFS 마운트 `-10025`는 파일시스템을 인식하지 못한 오류다. 로그에 보고된 파티션 `0x310000`/`0xE0000`은 현재 `partitions.csv`와 일치하지만, 실제 영역의 원시 내용 및 과거 미전송 스풀의 존재는 읽지 않아 미확인이다. `SPIFFS.begin(false)`/기존 ACK 후 삭제 정책을 유지했고 자동 포맷·삭제·장치 접근은 하지 않았다. 로컬 파티션 검사와 스풀 재부팅·CRC·ACK 회귀 테스트는 통과했으며 실기 마운트 복구는 미검증이다.
 
 ## 2026-10-26 Apps Script 대시보드 초기화 오류 (로컬 수정, 배포 미검증)
 

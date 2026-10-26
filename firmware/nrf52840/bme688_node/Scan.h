@@ -48,4 +48,52 @@ struct Tracker {
     return true;
   }
 };
+
+// One normal HP-354 scan, with the original wire text frozen at acquisition.
+// Never reset or overwrite a frame that has not completed sendLine().
+struct FrameBuffer {
+  static constexpr uint8_t CAPACITY=STEPS;
+  static constexpr uint16_t FRAME_BYTES=180;
+  char frame[CAPACITY][FRAME_BYTES]={};
+  uint8_t count=0, sent=0;
+  bool pending() const { return sent<count; }
+  bool reset() {
+    if(pending())return false;
+    count=sent=0;return true;
+  }
+};
+
+// Per-scan counters only; never changes which fields Tracker accepts.
+struct Diagnostics {
+  struct Step {
+    uint16_t seen=0, newData=0, gasValid=0, heatStable=0;
+    uint16_t skipped=0, rejected=0, accepted=0;
+    uint8_t firstStatus=0, firstMeasurement=0, lastStatus=0, lastMeasurement=0;
+  } step[STEPS];
+  uint16_t outOfRange=0, emptyFetches=0, fetchErrors=0;
+  uint16_t waitingForZero=0, noRealGas=0, frameErrors=0;
+  bool bufferFull=false, sequenceExhausted=false;
+  uint32_t fetchMaxUs=0, oledMaxUs=0, adcMaxUs=0, storageMaxUs=0, processMaxUs=0;
+  int8_t profileStatus=0, modeStatus=0;
+  bool active=false;
+
+  void reset() {
+    for(uint8_t i=0;i<STEPS;++i)step[i]=Step{};
+    outOfRange=emptyFetches=fetchErrors=0;
+    waitingForZero=noRealGas=frameErrors=0;
+    bufferFull=sequenceExhausted=false;
+    fetchMaxUs=oledMaxUs=adcMaxUs=storageMaxUs=processMaxUs=0;
+    profileStatus=modeStatus=0;
+    active=true;
+  }
+  void observe(uint8_t gi,uint8_t mi,uint8_t status) {
+    if(gi>=STEPS){++outOfRange;return;}
+    Step& s=step[gi];
+    if(!s.seen){s.firstStatus=status;s.firstMeasurement=mi;}
+    ++s.seen;s.lastStatus=status;s.lastMeasurement=mi;
+    if(status&0x80)++s.newData;
+    if(status&0x20)++s.gasValid;
+    if(status&0x10)++s.heatStable;
+  }
+};
 }

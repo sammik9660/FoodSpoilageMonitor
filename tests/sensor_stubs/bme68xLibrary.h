@@ -27,6 +27,9 @@ inline unsigned beginCount=0,profileCount=0;
 inline uint16_t testSharedMs=0;
 inline uint8_t testGas0=0,testGas1=0,testMode=BME68X_SLEEP_MODE;
 inline std::vector<bme68xData> testFields;
+// Timing model: 140 ms conversions, only the latest three unread fields survive.
+inline bool testTimedParallel=false;
+inline uint32_t testParallelStart=0,testConversions=0,testOverwritten=0;
 class Bme68x {
  int status=0; bme68xData current[3]{}; uint8_t n=0,at=0;
  public:
@@ -39,10 +42,23 @@ class Bme68x {
   ++profileCount;testSharedMs=shared;testGas0&=~BME68X_HCTRL_MSK;testGas1|=BME68X_RUN_GAS_MSK;
   status=nSteps==10&&t[0]==320&&t[1]==100&&m[3]==30&&shared==120?0:-1;
  }
- void setOpMode(uint8_t mode){testMode=mode;status=(mode==BME68X_PARALLEL_MODE||mode==BME68X_FORCED_MODE||mode==BME68X_SLEEP_MODE)?0:-1;}
+ void setOpMode(uint8_t mode){if(testTimedParallel&&mode==BME68X_PARALLEL_MODE){testParallelStart=testMillis;testConversions=0;testFields.clear();}testMode=mode;status=(mode==BME68X_PARALLEL_MODE||mode==BME68X_FORCED_MODE||mode==BME68X_SLEEP_MODE)?0:-1;}
  uint8_t readReg(uint8_t addr){status=0;return addr==BME68X_REG_CTRL_GAS_0?testGas0:testGas1;}
  void writeReg(uint8_t addr,uint8_t value){status=0;if(addr==BME68X_REG_CTRL_GAS_0)testGas0=value;else testGas1=value;}
- uint8_t fetchData(){if(testFetchError){status=-1;return 0;}status=0;n=0;at=0;
+ uint8_t fetchData(){
+  if(testTimedParallel&&testMode==BME68X_PARALLEL_MODE){
+   testMillis+=2; // bounded I2C read cost, independent of BLE wait
+   const uint8_t ends[10]={4,6,16,46,51,56,61,66,71,76};
+   while(testConversions<(testMillis-testParallelStart)/140){
+    const uint32_t index=testConversions++;const uint8_t phase=index%77;
+    uint8_t gi=0;while(phase>ends[gi])++gi;
+    bme68xData d;d.gas_index=gi;d.meas_index=index;d.status=phase==ends[gi]?0xb0:0x90;
+    d.temperature=25+index*0.01f;d.gas_resistance=70000+index;
+    if(testFields.size()==3){testFields.erase(testFields.begin());++testOverwritten;}
+    testFields.push_back(d);
+   }
+  }
+  if(testFetchError){status=-1;return 0;}status=0;n=0;at=0;
   while(n<3&&!testFields.empty()){current[n++]=testFields.front();testFields.erase(testFields.begin());}return n;}
  uint8_t getData(bme68xData& d){testMillis+=testGetDataAdvanceMs;d=current[at++];return n-at;}
 };

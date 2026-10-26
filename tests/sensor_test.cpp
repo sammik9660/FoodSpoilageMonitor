@@ -9,7 +9,7 @@ static void pollAt(uint32_t at){testMillis=at;nextMeasurement=at;lastHealth=at;l
 static void envCycle(uint32_t at,bool connected=true){
  static uint8_t envIndex=0;
  testBleConnected=connected;testMillis=at;nextEnvMeasurement=at;lastHealth=at;loop();
- assert(envConversionPending&&sensorMode==MODE_ENV);
+ assert(envConversionPending&&(sensorMode==MODE_ENV||sensorMode==MODE_REC));
  bme68xData env=field(0,++envIndex,0,0x80);
  env.temperature=25.0f+envIndex*0.01f;
  testFields.push_back(env);
@@ -27,10 +27,16 @@ static void dueScan(){
   testFields.push_back(env);
   testMillis=nextMeasurement;lastHealth=testMillis;loop();
  assert(sensorMode==MODE_GAS && (testGas1&BME68X_RUN_GAS_MSK));
+ assert(testMillis-scanStartedAt==ACTIVE_LOOP_IDLE_MS);
+ assert(!gasFetchSeen);
+}
+static void drainGas(){
+ while(gasFrames.pending()){testMillis=nextGasTxAttempt;assert(serviceGasFrames());}
 }
 static void endCooling(){
+ drainGas();
  testMillis=coolingStartedAt+COOLING_MS;lastHealth=testMillis;loop();
- assert(sensorMode==MODE_ENV && !(testGas1&BME68X_RUN_GAS_MSK));
+ assert((sensorMode==MODE_ENV||sensorMode==MODE_REC) && !(testGas1&BME68X_RUN_GAS_MSK));
 }
 int main(){
  assert(ENV_INTERVAL_MS==120000);
@@ -83,7 +89,7 @@ int main(){
  assert(std::string(oledLine)=="P:----.- B:--%");
  formatUnavailableSensorOledLine(oledLine,sizeof(oledLine),false,true,0);
  assert(std::string(oledLine)=="P:----.- LOW:0%");
- assert(Wire.sda==21&&Wire.scl==20&&profileCount==0&&sensorMode==MODE_ENV);
+ assert(Wire.sda==21&&Wire.scl==20&&profileCount==0&&sensorMode==MODE_REC);
  assert((testGas0&BME68X_HCTRL_MSK)&&!(testGas1&BME68X_RUN_GAS_MSK));
  const uint32_t bootAt=testMillis;
  envCycle(bootAt+10);
@@ -106,13 +112,23 @@ int main(){
  assert(envSequence==3&&failures==beforeIdleFailures+1);
  const uint32_t scheduledScan=nextGasScan;
  dueScan();assert(profileCount==1&&testSharedMs==120);
+ transmitted.clear();
+ lastHealth=testMillis-10000; // A periodic STAT would be due during the scan.
+ testMillis=nextMeasurement+ACTIVE_LOOP_IDLE_MS;loop();
+ assert(gasFetchSeen&&firstGasFetchMs==ACTIVE_LOOP_IDLE_MS);
+ assert(transmitted.find("STAT,")==std::string::npos);
+ testMillis=nextMeasurement;loop();
+ assert(maxGasPollGapMs==gas_scan::POLL_MS);
  assert((uint32_t)(scanStartedAt-scheduledScan)<ENV_CONVERSION_TIMEOUT_MS);
  assert(nextGasScan==scanStartedAt+GAS_SCAN_INTERVAL_MS);
  const uint8_t mi[10]={250,252,6,36,41,46,51,56,61,66};
  gasStep(field(5,249,0,0x80));assert(validSequence==0&&failures==beforeIdleFailures+1);
  for(uint8_t i=0;i<10;++i)gasStep(field(i,mi[i]));
  assert(validSequence==10&&scanTracker.complete==1&&sensorMode==MODE_COOL);
+ assert(!gasScanDiagnostics.active&&gasScanDiagnostics.step[0].accepted==1);
+ assert(gasScanDiagnostics.step[0].seen==1&&gasScanDiagnostics.step[9].accepted==1);
  assert((testGas0&BME68X_HCTRL_MSK)&&!(testGas1&BME68X_RUN_GAS_MSK));
+ drainGas();
  assert(transmitted.find("V=3,BID=")!=std::string::npos);
  assert(transmitted.find("SCAN=1,STEP=9,GI=9,MI=66")!=std::string::npos);
  // Cooling neither creates ambient samples nor runs the gas watchdog.
@@ -126,6 +142,16 @@ int main(){
  for(uint8_t i=0;i<10;++i)if(i!=3)gasStep(field(i,i+80));
  assert(sensorMode==MODE_COOL&&scanTracker.incomplete==incompleteBefore+1);
  assert(scanTracker.complete==1&&validSequence==seqBefore+9);
+ endCooling();envCycle(testMillis+10);
+ // GI 0 can be fetched as a dummy; later real fields must remain ungrouped.
+ nextGasScan=testMillis+1000;dueScan();const uint32_t beforeMissingZero=validSequence;
+ gasStep(field(0,90,0,0x80));
+ for(uint8_t i=1;i<10;++i)gasStep(field(i,i+90));
+ assert(sensorMode==MODE_COOL&&validSequence==beforeMissingZero);
+ assert(!gasScanDiagnostics.active&&gasScanDiagnostics.step[0].seen==1);
+ assert(gasScanDiagnostics.step[0].newData==1&&gasScanDiagnostics.step[0].gasValid==0);
+ assert(gasScanDiagnostics.step[0].skipped==1&&gasScanDiagnostics.step[0].firstMeasurement==90);
+ assert(gasScanDiagnostics.step[1].accepted==1&&gasScanDiagnostics.step[9].accepted==1);
  endCooling();envCycle(testMillis+10);
  // Real G=0 fields still enter the existing threshold/recovery path.
  nextGasScan=testMillis+1000;dueScan();const uint32_t gasSeqBefore=validSequence;
@@ -163,7 +189,7 @@ int main(){
  scanStartedAt=testMillis;consecutiveFailures=0;testGetDataAdvanceMs=1;
  const uint32_t beforeFieldFailures=failures;
  gasStep(field(0,140));assert(failures==beforeFieldFailures);
- testGetDataAdvanceMs=0;
+ testGetDataAdvanceMs=0;finishGasScan();drainGas();
  gas_scan::Tracker tracker;assert(tracker.observe(0,254,true));
  assert(tracker.observe(2,255,true));assert(tracker.observe(2,0,true));
  tracker.observe(9,1,true);assert(tracker.complete==0&&tracker.incomplete==1);
@@ -176,13 +202,19 @@ int main(){
  assert(validSequence==beforeIndexSeq+1&&duplicateGasIndexes==beforeIndexErrors+1);
  // Recovery first resets the BME688, then reinitializes the I2C bus if the
  // next attempt has still not produced a valid measurement.
+ finishGasScan();drainGas();
+ sensorMode=MODE_ENV;recoveringGas=false;
  recoveryAttempts=1;recoveryStage=0;recoveryAttemptsSinceGood=0;
- testBeginOK=true;recoverSensor();assert(sensorReady&&recoveryStage==1);
+ testBeginOK=true;recoverSensor();assert(sensorReady&&sensorMode==MODE_REC&&recoveryPending&&recoveryStage==1);
+ transmitted.clear();sendHealth();
+ assert(transmitted.find(",OK=0,MODE=REC,EOK=0")!=std::string::npos);
  testBeginOK=false;recoverSensor();assert(!sensorReady&&recoveryStage==2);
- testBeginOK=true;recoverSensor();assert(sensorReady&&recoveryStage==2);
- sensorMode=MODE_ENV;measurementGuard.acceptEnvironment(25,50,100000,testMillis);
+ testBeginOK=true;recoverSensor();assert(sensorReady&&sensorMode==MODE_REC&&recoveryStage==2);
+ measurementGuard.acceptEnvironment(25,50,100000,testMillis);
  nextGasScan=testMillis+ENV_INTERVAL_MS;envCycle(testMillis+10);
- assert(recoveryStage==0&&recoveryAttemptsSinceGood==0);
+ assert(sensorMode==MODE_ENV&&recoveryStage==0&&recoveryAttemptsSinceGood==0);
+ transmitted.clear();sendHealth();
+ assert(transmitted.find(",OK=1,MODE=ENV,EOK=1")!=std::string::npos);
  const uint32_t envBeforeInvalid=envSequence;
  testMillis=nextEnvMeasurement;lastHealth=testMillis;loop();assert(envConversionPending);
  bme68xData pressureJump=field(0,42,0,0x80);pressureJump.pressure=73547;
@@ -201,10 +233,14 @@ int main(){
    gasStep(jump);
  }
  assert(validSequence==gasBeforeJump&&sensorMode!=MODE_GAS);
- testBeginOK=false;recoveryAttemptsSinceGood=5;
- recoverSensor();assert(!sensorReady&&nextRecovery-testMillis>=299000);
+ testBeginOK=false;recoveryStage=1;recoveryAttemptsSinceGood=5;recoveryDelay=RECOVERY_MAX_MS;
+ recoverSensor();
+ // sendHealth() advances the host clock by 80 ms after nextRecovery is set.
+ assert(!sensorReady&&nextRecovery-testMillis==RECOVERY_MAX_MS-80);
  const uint32_t attemptsAtBudget=recoveryAttempts;
  testMillis+=10000;lastHealth=testMillis;loop();
  assert(recoveryAttempts==attemptsAtBudget); // no high-speed failed-init loop
+ testMillis=nextRecovery;lastHealth=testMillis;loop();
+ assert(recoveryAttempts==attemptsAtBudget+1); // bounded retries continue after 30 s
  puts("PASS nRF real source: ENV/GAS/COOL, heater-off, 120s/10m schedules, incomplete scan, recovery, liveness and wrap");
 }
