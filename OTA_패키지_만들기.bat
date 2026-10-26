@@ -11,7 +11,7 @@ if not exist "secrets\esp32-ota-signing-key.pem" (
   echo Restore the existing local key; this tool will not create a new one.
   goto failed
 )
-pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "tools\create_esp32_ota_package.ps1"
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "tools\build_esp32_ota_package.ps1"
 if errorlevel 1 goto failed
 echo.
 echo Package creation finished. Select the .manifest as Manifest and .bin as Firmware on the gateway OTA page.

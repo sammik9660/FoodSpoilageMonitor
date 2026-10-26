@@ -19,7 +19,11 @@ Wi-Fi 설정은 실행 중인 ESP32의 **BOOT(GPIO0)을 놓을 때** 결정된�
 
 설정 포털은 AP의 `http://192.168.4.1/`(80번 포트), 서명된 ESP32 OTA와 nRF DFU 관리 페이지는 STA의 `http://<gateway-ip>:8080/` 및 `http://<gateway-ip>:8080/nrf-dfu`다. 같은 네트워크에서 `http://foodmonitor.local:8080/`도 사용할 수 있다. STA 연결 중 포털을 열면 두 서버가 서로 다른 포트를 사용한다. 새 네트워크를 저장해 연결을 시험하는 동안에는 STA 연결이 일시적으로 바뀔 수 있다.
 
-Windows에서 ESP32 OTA 파일을 준비하려면 Arduino IDE에서 **Export Compiled Binary**로 새 `gateway.ino.bin`을 만든 다음 루트의 `OTA_패키지_만들기.bat`를 더블클릭한다. PowerShell 7과 기존 로컬 서명키가 필요하다. 실행 중인 장치의 `OTA?` 버전·빌드, 내보낸 BIN 경로를 입력하면 도구가 소스/BIN 식별자를 대조하고 기존 서명·검증 스크립트로 `data/ota-<version>-<build>/`에 `.bin`과 `.manifest`를 만든다. 기존 패키지는 덮어쓰지 않는다. 소스 변경 후 이전 BIN을 선택했다면 새로 컴파일·내보내기해야 한다. 패키징만으로 장치가 업데이트되지는 않는다.
+Windows에서는 루트의 `OTA_패키지_만들기.bat`를 더블클릭하고 버전 질문에서 Enter를 누르면 됩니다. 현재 소스의 패치 버전 +1(원하면 더 높은 버전 입력), 중복 없는 날짜형 build 번호, ESP32 컴파일, BIN 식별자 대조, 기존 키 서명·검증을 자동 수행합니다. Arduino CLI(IDE 내장 경로도 지원), ESP32 core 3.3.12, PowerShell 7과 기존 `secrets/esp32-ota-signing-key.pem`이 필요합니다. 결과는 `dist/ota-<version>-<build>/`의 `gateway.ino.bin`, `gateway.ino.manifest`, `SHA256SUMS.txt`, `RELEASE.txt`입니다. 기존 정상 패키지는 덮어쓰지 않으며 컴파일/검증 실패 시 이번 실행의 버전 변경을 되돌립니다. 빌드 중에는 소스를 편집하지 마세요. 기존 BIN만 서명하려면 이전 `tools/create_esp32_ota_package.ps1`을 직접 사용할 수 있습니다.
+
+같은 LAN에서 대시보드의 ESP32 OTA 링크 또는 `http://<장치 IP>:8080/`를 열고 사용자 `admin`과 기존 OTA 토큰으로 인증한 뒤 Manifest/Firmware에 해당 파일을 각각 선택합니다. 자동화는 장치를 조회하거나 업데이트하지 않습니다. `OTA?`는 활성 여부·현재 버전/build만 출력합니다. **`OTA TOKEN`은 조회가 아니라 기존 토큰을 교체하고 새 값을 시리얼에 한 번 출력합니다.** 기존 토큰을 알고 있다면 실행하지 마세요. 토큰 재발급이 필요할 때만 사용자가 로컬 시리얼에서 실행하고, 로그 저장·화면 공유·Git에 토큰을 남기지 마세요. 자동화는 토큰을 입력받거나 보관하지 않습니다. 실제 장치가 로컬 이력보다 높은 build를 실행 중이면 장치의 anti-rollback 검사가 거부할 수 있으므로 실제 실행 버전은 별도 확인해야 합니다.
+
+무인 실행: `pwsh -NoProfile -File tools/build_esp32_ota_package.ps1 -NonInteractive` (원하는 버전은 `-Version 2.1.0`, CLI 경로는 `-ArduinoCli <경로>`). 빌드 번호는 소스와 `data/`, `dist/`의 기존 manifest보다 크게 생성합니다. 같은 날짜의 99번을 넘거나 PC 시계가 뒤로 갔으면 기존 최대 날짜의 다음 번호/날짜를 사용합니다. 중단된 콘솔은 finally 복구를 보장하지 않으므로 강제 종료 후에는 Git diff로 버전 두 줄을 확인하세요. 빌드 로그는 Git 제외 `data/ota-build-*/compile.log`이며 비밀정보 검토 없이 공유하지 마세요.
 
 Windows에서 nRF52840 DFU ZIP을 만들려면 루트의 `NRF_DFU_만들기.bat`를 더블클릭한다. PowerShell 7, Arduino CLI 또는 Arduino IDE 2, Adafruit nRF52 core 1.7.0이 필요하다. 도구는 현재 센서 소스를 `adafruit:nrf52:feather52840`/S140 6.1.1로 새로 컴파일하고, Adafruit core가 생성한 application-only Legacy DFU ZIP의 내용과 BIN 버전을 검증하여 `data/nrf-dfu-<version>/`에 저장한다. 같은 버전 폴더가 있으면 덮어쓰지 않고 중단한다. 생성된 ZIP은 ESP32의 `/nrf-dfu` 관리 페이지나 스마트폰 Nordic DFU 앱에서 사용한다. 자세한 절차는 [nRF BLE DFU 문서](docs/NRF52840_BLE_DFU.md)를 따른다.
 

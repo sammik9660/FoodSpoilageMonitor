@@ -1,3 +1,10 @@
+## 2026-10-26 Windows ESP32 OTA 자동 빌드 도구
+
+- 기존 BAT의 exported-BIN 입력 흐름을 `tools/build_esp32_ota_package.ps1`로 연결했다. 기본 patch +1 또는 명시 버전 선택, source/data/dist보다 큰 YYYYMMDDNN build, core 3.3.12 / 16MB custom partition / OPI PSRAM / CDC 빌드, 기존 signer/package test 순서다. 버전·빌드 두 줄 외 펌웨어 동작은 변경하지 않는다. 실패 시 소스를 실행 전 바이트로 복원하되 동시 사용자 편집은 덮어쓰지 않는다.
+- 기존 `create_esp32_ota_package.ps1`의 ECDSA P-256, SHA-256, 내장 공개키 검증, BIN 식별자/3MiB 제한, anti-rollback 검사를 그대로 재사용한다. 새 결과는 Git 제외 dist/ota-<version>-<build>에 원자적으로 게시하며 BIN/manifest/SHA256SUMS/보드 정보 RELEASE.txt를 제공한다. 기존 패키지는 보존한다.
+- 자동 버전/번호, 날짜 롤오버, 중복 방지, 키 누락, 컴파일 실패 복원, 동시 편집 보존 테스트와 기존 OTA package-tool/signing/partition 테스트 통과. 실제 자동화 실행도 성공: 기존 사용자 수정 2.0.14/build 2026102616에서 2.0.15/build 2026102617로 갱신, 전체 ESP32 컴파일 및 서명/내장 공개키 검증 통과. dist/ota-2.0.15-2026102617/에 BIN(1,567,200 bytes), manifest, SHA256SUMS.txt, RELEASE.txt 생성. BIN SHA256: 83e5373c38c4cc211be55ac2047ce6ce03133052b4fa739a173237fcb980e9cf. 소스 custom partitions.csv와 빌드 복사본 해시 일치. git diff --check 통과.
+- OTA TOKEN은 기존 토큰 조회가 아니라 재발급 및 시리얼 출력 명령이다. 도구에서 실행하거나 토큰을 수집하지 않으며 README에 로컬 인증 절차를 기록했다. 실제 장치의 build는 조회하지 않았으므로 장치 자체 anti-rollback 판단을 유지한다. 장치 업로드/OTA/커밋/푸시는 수행하지 않는다.
+
 ## 2026-10-26 HP354 측정 / BLE 송신 분리 (실기 미검증)
 
 - 기존 미커밋 센서 복구·첫 fetch 10ms·GI 진단 변경을 보존하고, 유효 원본 가스 프레임을 고정 RAM 10 × 180 bytes에 저장하도록 변경했다. MS/SEQ/SCAN/GI/MI/ST는 수신한 센서 필드 처리 시 확정하며 히터 OFF 확인 후 기존 sendLine으로 FIFO 송신한다. 부분·타임아웃·복구에서도 버퍼를 보존한다. 실패한 송신은 같은 프레임으로 5초 이후 재시도하며, 미전송 프레임이 있으면 다음 가스 스캔 시작을 보류한다. RAM은 전원 차단을 견디는 저장소가 아니고 NUS write 성공은 ESP 수신 ACK가 아니다.

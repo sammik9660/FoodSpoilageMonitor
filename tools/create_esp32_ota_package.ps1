@@ -88,6 +88,11 @@ try {
     [IO.File]::Copy($binPath, $stageBin)
     & $signer -FirmwareBin $stageBin -Version $Version -BuildNumber ([UInt64]$BuildNumber) -PrivateKey $keyPath | Out-Null
     & $tester -FirmwareBin $stageBin -Version $Version -BuildNumber ([UInt64]$BuildNumber) -InstalledBuild ([UInt64]$InstalledBuild) | Write-Output
+    $hashLines = foreach ($artifact in Get-ChildItem -LiteralPath $stagePath -File) {
+      "$((Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($artifact.Name)"
+    }
+    [IO.File]::WriteAllLines((Join-Path $stagePath 'SHA256SUMS.txt'), [string[]]$hashLines)
+    [IO.File]::WriteAllText((Join-Path $stagePath 'RELEASE.txt'), "target=esp32s3`nversion=$Version`nbuild=$BuildNumber`nboard=ESP32-S3 N16R8`nflash=16MB`npsram=OPI`nota_slot_bytes=3145728`nUpload gateway.ino.manifest as Manifest and gateway.ino.bin as Firmware.`nDevice installation and hardware validation have NOT been performed.`n")
     if (Test-Path -LiteralPath $finalPath) { throw 'Release folder appeared during verification; refusing to overwrite it.' }
     [IO.Directory]::Move($stagePath, $finalPath)
   } finally {

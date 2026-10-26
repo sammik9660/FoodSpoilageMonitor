@@ -28,6 +28,12 @@ try {
 
   $valid = New-Object byte[] 128
   $valid[0] = 0xE9
+  $wrongMarker = [Text.Encoding]::ASCII.GetBytes("FSGWBUILD:0.0.0:${build}`0")
+  [Array]::Copy($wrongMarker, 0, $valid, 1, $wrongMarker.Length)
+  [IO.File]::WriteAllBytes($bin, $valid)
+  Expect-Rejection 'BIN version/build differs' $previousBuild @()
+  $valid = New-Object byte[] 128
+  $valid[0] = 0xE9
   $marker = [Text.Encoding]::ASCII.GetBytes("FSGWBUILD:${version}:${build}`0")
   [Array]::Copy($marker, 0, $valid, 1, $marker.Length)
   [IO.File]::WriteAllBytes($bin, $valid)
