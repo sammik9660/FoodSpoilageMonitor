@@ -20,6 +20,19 @@ inline int wifiRegistrationSlot(int existingSlot, uint8_t count, uint8_t capacit
 enum LcdMode : uint8_t { LCD_SENSOR, LCD_DEBUG };
 enum CloudState : uint8_t { CLOUD_OFF, CLOUD_WAIT, CLOUD_OK };
 enum PixelState : uint8_t { PIXEL_BOOT, PIXEL_UPDATE, PIXEL_BLE_OFF, PIXEL_WIFI_OFF, PIXEL_WAIT, PIXEL_OK };
+enum WifiFeedback : uint8_t { WIFI_FEEDBACK_NONE, WIFI_FEEDBACK_CONNECT, WIFI_FEEDBACK_PORTAL,
+                              WIFI_FEEDBACK_SCAN, WIFI_FEEDBACK_SAVE, WIFI_FEEDBACK_SUCCESS,
+                              WIFI_FEEDBACK_ERROR };
+
+inline uint32_t wifiFeedbackColor(WifiFeedback state, uint64_t elapsedMs) {
+  if (state == WIFI_FEEDBACK_SUCCESS) return 0x00ff00;
+  if (state == WIFI_FEEDBACK_CONNECT) return elapsedMs % 1600 < 800 ? 0x0000ff : 0;
+  if (state == WIFI_FEEDBACK_PORTAL) return elapsedMs % 1600 < 800 ? 0xa000ff : 0;
+  if (state == WIFI_FEEDBACK_SCAN) return elapsedMs % 300 < 150 ? 0xa000ff : 0;
+  if (state == WIFI_FEEDBACK_SAVE) return elapsedMs % 400 < 200 ? 0xffa000 : 0;
+  if (state == WIFI_FEEDBACK_ERROR) return elapsedMs % 500 < 250 ? 0xff0000 : 0;
+  return 0;
+}
 
 constexpr uint32_t OTA_RAINBOW_MS = 3000;
 constexpr uint32_t OTA_RAINBOW_FRAME_MS = 30;

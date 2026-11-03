@@ -23,7 +23,7 @@ class GatewayUpdateAccessTest(unittest.TestCase):
         self.assertIn("pixelState(ble,wifi,cloud,backlog,updateActive)", SOURCE)
 
     def test_cloud_dashboard_links_to_real_local_handlers(self):
-        self.assertIn("const local='http://'+h.local_ip+':8080'", DASHBOARD)
+        self.assertIn("const local='http:'+'/'+'/'+h.local_ip+':8080'", DASHBOARD)
         self.assertIn("espOtaLink.href=local+'/'", DASHBOARD)
         self.assertIn("nrfDfuLink.href=local+'/nrf-dfu'", DASHBOARD)
         self.assertIn("constexpr uint16_t OTA_WEB_PORT=8080", SOURCE)

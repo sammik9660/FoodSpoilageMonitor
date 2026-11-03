@@ -159,6 +159,7 @@ function startRecording(label, requestedDeviceId) {
   try {cache.remove(heartbeatStateKey);} catch(_) {}
   return locked(()=>{
     const ctx=sheets();recoverTransactions(ctx);
+    if(typeof remoteReservationActive_==='function'&&remoteReservationActive_(deviceId))throw new Error('Remote firmware update is reserved for this device');
     const device=dataRows(ctx.devices).find(r=>r[0]===deviceId);
     if(device&&(device[5]==='UPDATING'||device[5]==='VERIFYING')) throw new Error('Firmware update is active for this device');
     if(activeSession(sessionsList(ctx.sessions),deviceId)) throw new Error('A session is already active for this device');
@@ -271,7 +272,7 @@ function healthSnapshot(h, now, ageDelta) {
     'last_post_ms','last_redirect_ms','last_ack_ms','backlog_drained_ms',
     'battery_nrf_boot','battery_sample_ms','battery_age_ms'];
   numeric.forEach(k=>{if(typeof h[k]==='number'&&Number.isFinite(h[k])&&h[k]>=0)out[k]=h[k];});
-  ['ble_connected','sensor_ok','spool_error','spool_full'].forEach(k=>{if(typeof h[k]==='boolean')out[k]=h[k];});
+  ['ble_connected','sensor_ok','spool_error','spool_full','remote_capable'].forEach(k=>{if(typeof h[k]==='boolean')out[k]=h[k];});
   if(typeof h.usb_power==='boolean')out.usb_power=h.usb_power;
   if(typeof h.battery_measurement_valid==='boolean')out.battery_measurement_valid=h.battery_measurement_valid;
   if(h.usb_power===true&&typeof h.battery_last_percent==='number')
@@ -449,7 +450,10 @@ function doPost(e) {
 
     const payload=JSON.parse(e.postData.contents);
     if(payload && payload.version===3)requestVersion=3;
-    return json(ingest(payload));
+    const result=ingest(payload);
+    // Remote control failure must never invalidate an already committed sample ACK.
+    if(typeof remoteExchange_==='function'&&payload.remote)try{result.remote=remoteExchange_(payload);}catch(_){result.remote=null;}
+    return json(result);
 
   } catch (error) {
     return json({
@@ -489,7 +493,8 @@ function getDashboard(requestedDeviceId) {
   const integrity_reason=!h?null:h.spool_error?'SPIFFS/spool fault reported by gateway':
     h.spool_full?'Spool capacity exhausted; unacknowledged data is retained':
     h.queue_drops>0?'Gateway reported '+h.queue_drops+' rejected queue item(s) since boot':null;
-  return {device_id:deviceId,state,age,health:h,recording,server_time:now,integrity_reason};
+  return {device_id:deviceId,state,age,health:h,recording,server_time:now,integrity_reason,
+    remote_update:typeof remoteSummary_==='function'?remoteSummary_(deviceId):null};
 }
 function getBatteryHistory(requestedDeviceId, requestedRange) {
   const deviceId=validDeviceId(requestedDeviceId), range=requestedRange||'24h';

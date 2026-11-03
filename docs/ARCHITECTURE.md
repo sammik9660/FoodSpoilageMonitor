@@ -237,3 +237,32 @@ CSV 분석은 complete HP-354 scan을 session과 sensor boot/scan ID로 재구�
 - **미완성:** 검증된 spoilage ML model/inference, food-safety decision, 장기 battery-life/flash-wear 시험.
 
 Compile, host test와 package 검증을 실제 설치·radio·cloud 성공으로 보고하지 않는다. 배포 전에는 해당 commit의 source, binary hash, manifest와 운영 Apps Script version을 함께 기록한다.
+
+## 인터넷 원격 업데이트 제어 경로 (2026-10-29)
+
+```mermaid
+sequenceDiagram
+    participant U as 외부 네트워크 대시보드
+    participant G as Apps Script
+    participant E as ESP32
+    participant S as HTTPS 파일 저장소
+    participant N as 페어링된 nRF
+    U->>G: 장치/패키지 선택 + 관리 인증 + 승인
+    G->>G: STOPPED 확인, 명령/예약 저장
+    E->>G: 기존 업로드 + HMAC 요청 (30초 간격)
+    G-->>E: ACK + 장치별 인증 명령
+    E->>E: nonce/만료/순번 검증, NVS 실행 기록
+    E->>E: 기존 데이터 drain, 유지관리 진입
+    E->>S: 인증서 검증 HTTPS range GET
+    S-->>E: BIN/manifest 또는 Legacy DFU ZIP
+    alt ESP32 OTA
+        E->>E: 기존 서명/해시/이미지 검증, 재부팅/자가 검사
+    else nRF DFU
+        E->>N: 기존 Legacy DFU 전송
+        N-->>E: 재연결 + 버전 + 신규 센서 데이터
+    end
+    E->>G: 인증된 진행/결과 보고
+    G-->>U: 기존 dashboard 응답에 상태 포함
+```
+
+명령은 Script Properties에 장치별로 저장하고 실제 샘플/저널/ACK 저장 형식은 변경하지 않는다. 새 `fsm-remote` NVS namespace는 명령 키·최종 실행 순번·재부팅 후 결과를 보존한다. 파일 다운로드는 BLE 센서 데이터를 잠시 중단하고 기존 큐를 비운 뒤 실행한다. 로컬 WebServer는 복구 경로로 남는다. 프로토콜, 설정, 부하와 남은 검증은 [REMOTE_UPDATES.md](REMOTE_UPDATES.md)를 참조한다.

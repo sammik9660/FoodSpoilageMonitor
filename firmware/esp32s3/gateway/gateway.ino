@@ -94,6 +94,7 @@
 #include "NrfLegacyDfuRelay.h"
 #include "NrfDfuPackagePolicy.h"
 #include "WifiRecoveryPolicy.h"
+#include "RemoteUpdateClient.h"
 
 // Arduino-ESP32 3.3.12 NetworkManager::hostByName() clears lwIP's DNS cache
 // directly when the interface address state changes. With lwIP thread-safety
@@ -176,8 +177,8 @@ constexpr uint32_t LCD_REFRESH_MS=750;
 // Hardware CDC/JTAG is the verified console. Mirroring every line to UART0 made
 // combined captures show each event twice; UART0 remains available as an opt-in.
 constexpr bool UART_DIAGNOSTICS=false;
-#define FSGW_VERSION "2.0.21"
-#define FSGW_BUILD 2026102706
+#define FSGW_VERSION "2.0.25"
+#define FSGW_BUILD 2026110101
 #define FSGW_STRINGIFY_INNER(value) #value
 #define FSGW_STRINGIFY(value) FSGW_STRINGIFY_INNER(value)
 constexpr char FIRMWARE_VERSION[]=FSGW_VERSION;
@@ -233,12 +234,25 @@ struct SavedWifi { char ssid[33]; char password[65]; };
 constexpr uint8_t WIFI_MAX_NETWORKS=4;
 SavedWifi wifiNetworks[WIFI_MAX_NETWORKS]={};
 bool wifiPreferencesReady=false, wifiTrying=false;
-bool wifiPortalStarted=false, otaServerRoutesRegistered=false;
+bool wifiPortalStarted=false, wifiPortalPending=false, wifiPortalScanActive=false,wifiPortalScanReady=false;
+bool otaServerRoutesRegistered=false;
+uint64_t wifiPortalExitAt=0,wifiPortalOpenedAt=0,wifiPortalScanAt=0;
+uint64_t wifiPixelSaveAt=0,wifiPixelErrorAt=0,wifiPixelSuccessAt=0;
+int8_t wifiPortalCandidateSlot=-1;
 bool pairingPreferencesReady=false;
 bool otaPreferencesReady=false;
 char otaPassword[33]={};
 bool otaServerReady=false,otaManifestReady=false,otaBinaryReady=false,otaUpdateStarted=false;
 bool otaRollbackApproved=false;
+RemoteUpdateClient remoteClient;
+bool remoteOwnsUpdate=false;
+void remoteAttach(cJSON* root,char nonce[33]);
+void serviceRemoteUpdate();
+void beginRemoteUpdate();
+void handleRemoteConfig();
+void handleRemoteConfigSave();
+void configureCloudTls(GatewaySecureClient& client);
+bool remoteGoogleRedirect(const String& url);
 enum OtaMode { OTA_NORMAL, OTA_PREPARE, OTA_ACTIVE };
 OtaMode otaMode=OTA_NORMAL;
 SemaphoreHandle_t otaIngressMutex=nullptr;
@@ -297,6 +311,18 @@ uint64_t wifiDisconnectAt=0;
 volatile bool wifiDisconnectEventPending=false;
 volatile uint8_t wifiLastDisconnectReason=0;
 
+// Diagnostics only: never log or call Wi-Fi APIs from the network event task.
+struct WifiDiagnosticEvent {
+  WiFiEvent_t event;
+  uint64_t at;
+  uint8_t mac[6]={},aid=0;
+  uint16_t reason=0,scanCount=0;
+  uint32_t ip=0,scanStatus=0;
+  bool hasMac=false,hasReason=false;
+};
+QueueHandle_t wifiDiagnosticQueue=nullptr;
+uint32_t wifiDiagnosticDrops=0;
+
 LiquidCrystal_I2C lcd(LCD_ADDRESS,16,2);
 
 Adafruit_NeoPixel gatewayPixel(1,NEOPIXEL_PIN,NEO_GRB+NEO_KHZ800);
@@ -308,6 +334,8 @@ LcdMode lcdMode=LCD_DEBUG;
 ActiveLowButton bootButton;
 
 PixelState shownPixel=PIXEL_BOOT;
+bool wifiPixelOverlayActive=false;
+uint32_t wifiPixelShownColor=0;
 bool otaRainbowActive=false;
 uint64_t otaRainbowStartedAt=0,otaRainbowLastFrameAt=0;
 
@@ -325,7 +353,7 @@ int64_t lastCloudUpload=0;
 // the ACK. Keeping another full Sample[32] alive during the TLS handshake costs
 // about 3.8 KiB of the same contiguous internal heap used by mbedTLS.
 struct AckIdentity { char boot[32]; uint32_t rx; };
-struct UploadJob { AckIdentity acks[BATCH_SIZE]; uint32_t count; bool heartbeat; bool jsonInPsram; char* json; };
+struct UploadJob { AckIdentity acks[BATCH_SIZE]; uint32_t count; bool heartbeat; bool jsonInPsram; char* json; char remoteNonce[33]={}; };
 
 struct UploadResult { bool ok; bool heartbeat; int http; uint32_t unassigned; char recording[16]; char session[64]; };
 uint64_t wifiConnectedAt=0, bleConnectedAt=0, firstFrameAt=0;
@@ -351,6 +379,101 @@ void logEvent(const char* format,...) {
 
   if(logMutex)xSemaphoreGive(logMutex);
 
+}
+
+const char* wifiDiagnosticModeName(wifi_mode_t mode) {
+  return mode==WIFI_MODE_APSTA?"AP+STA":mode==WIFI_MODE_AP?"AP":mode==WIFI_MODE_STA?"STA":"OFF";
+}
+
+void captureWifiDiagnosticEvent(WiFiEvent_t event,WiFiEventInfo_t info) {
+  if(!wifiDiagnosticQueue)return;
+  WifiDiagnosticEvent item={};item.event=event;item.at=uptimeMs();
+  switch(event) {
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+      memcpy(item.mac,info.wifi_ap_staconnected.mac,6);item.hasMac=true;item.aid=info.wifi_ap_staconnected.aid;break;
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+      memcpy(item.mac,info.wifi_ap_stadisconnected.mac,6);item.hasMac=true;item.aid=info.wifi_ap_stadisconnected.aid;
+      item.reason=info.wifi_ap_stadisconnected.reason;item.hasReason=true;break;
+    case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+      memcpy(item.mac,info.wifi_ap_staipassigned.mac,6);item.hasMac=true;item.ip=info.wifi_ap_staipassigned.ip.addr;break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      item.reason=info.wifi_sta_disconnected.reason;item.hasReason=true;break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      item.ip=info.got_ip.ip_info.ip.addr;break;
+    case ARDUINO_EVENT_WIFI_SCAN_DONE:
+      item.scanStatus=info.wifi_scan_done.status;item.scanCount=info.wifi_scan_done.number;break;
+    case ARDUINO_EVENT_WIFI_AP_START:case ARDUINO_EVENT_WIFI_AP_STOP:
+    case ARDUINO_EVENT_WIFI_STA_START:case ARDUINO_EVENT_WIFI_STA_STOP:
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:case ARDUINO_EVENT_WIFI_STA_LOST_IP:break;
+    default:return; // Do not log every probe request or received packet.
+  }
+  if(xQueueSend(wifiDiagnosticQueue,&item,0)!=pdTRUE) {
+    portENTER_CRITICAL(&stateMux);++wifiDiagnosticDrops;portEXIT_CRITICAL(&stateMux);
+  }
+}
+
+const char* wifiDiagnosticEventName(WiFiEvent_t event) {
+  switch(event) {
+    case ARDUINO_EVENT_WIFI_AP_START:return "AP_START";
+    case ARDUINO_EVENT_WIFI_AP_STOP:return "AP_STOP";
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:return "AP_CLIENT_CONNECTED";
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:return "AP_CLIENT_DISCONNECTED";
+    case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:return "AP_CLIENT_IP_ASSIGNED";
+    case ARDUINO_EVENT_WIFI_STA_START:return "STA_START";
+    case ARDUINO_EVENT_WIFI_STA_STOP:return "STA_STOP";
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:return "STA_CONNECTED";
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:return "STA_DISCONNECTED";
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:return "STA_GOT_IP";
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:return "STA_LOST_IP";
+    case ARDUINO_EVENT_WIFI_SCAN_DONE:return "SCAN_DONE";
+    default:return "OTHER";
+  }
+}
+
+// Read-only driver state; callable by the main/network task, never by the event callback.
+void logWifiDiagnosticContext(const char* phase) {
+  const wifi_mode_t mode=WiFi.getMode();
+  uint8_t channel=0;wifi_second_chan_t secondary=WIFI_SECOND_CHAN_NONE;
+  const esp_err_t channelResult=esp_wifi_get_channel(&channel,&secondary);
+  const unsigned clients=(mode&WIFI_MODE_AP)?WiFi.softAPgetStationNum():0;
+  logEvent("WIFI_CTX %s at=%llu mode=%s sta=%d ap_clients=%u channel=%u channel_rc=%d heap=%lu",
+    phase,(unsigned long long)uptimeMs(),wifiDiagnosticModeName(mode),(int)WiFi.status(),clients,
+    (unsigned)channel,(int)channelResult,(unsigned long)ESP.getFreeHeap());
+}
+
+void serviceWifiDiagnostics() {
+  static uint64_t nextModeCheck=0;
+  static int previousMode=-1;
+  static uint32_t starts=0;
+  const uint64_t now=uptimeMs();
+  if(now>=nextModeCheck) {
+    nextModeCheck=now+100;
+    const wifi_mode_t mode=WiFi.getMode();
+    if((int)mode!=previousMode) {
+      logEvent("WIFI_MODE observed at=%llu from=%s to=%s portal=%u",
+        (unsigned long long)now,previousMode<0?"UNKNOWN":wifiDiagnosticModeName((wifi_mode_t)previousMode),
+        wifiDiagnosticModeName(mode),(unsigned)wifiManager.getConfigPortalActive());
+      previousMode=mode;
+    }
+  }
+  uint32_t dropped;
+  portENTER_CRITICAL(&stateMux);dropped=wifiDiagnosticDrops;wifiDiagnosticDrops=0;portEXIT_CRITICAL(&stateMux);
+  if(dropped)logEvent("WIFI_DIAG events_dropped=%lu; event trace is incomplete",(unsigned long)dropped);
+  WifiDiagnosticEvent item;
+  for(uint8_t n=0;wifiDiagnosticQueue&&n<4&&xQueueReceive(wifiDiagnosticQueue,&item,0)==pdTRUE;++n) {
+    char mac[18]="-",reason[12]="n/a";
+    if(item.hasMac)snprintf(mac,sizeof(mac),"%02x:%02x:%02x:%02x:%02x:%02x",item.mac[0],item.mac[1],item.mac[2],item.mac[3],item.mac[4],item.mac[5]);
+    if(item.hasReason)snprintf(reason,sizeof(reason),"%u",(unsigned)item.reason);
+    const wifi_mode_t mode=WiFi.getMode();uint8_t channel=0;wifi_second_chan_t secondary=WIFI_SECOND_CHAN_NONE;
+    esp_wifi_get_channel(&channel,&secondary);
+    logEvent("WIFI_EVT %s at=%llu lag=%llu mac=%s aid=%u reason=%s mode_now=%s sta_now=%d clients_now=%u ch_now=%u portal_now=%u http=%u",
+      wifiDiagnosticEventName(item.event),(unsigned long long)item.at,(unsigned long long)(uptimeMs()-item.at),mac,(unsigned)item.aid,reason,
+      wifiDiagnosticModeName(mode),(int)WiFi.status(),(unsigned)((mode&WIFI_MODE_AP)?WiFi.softAPgetStationNum():0),
+      (unsigned)channel,(unsigned)wifiManager.getConfigPortalActive(),(unsigned)otaHttpBusy);
+    if(item.event==ARDUINO_EVENT_WIFI_AP_START){++starts;logEvent("WIFI_AP_CYCLE start=%lu restart=%u bssid=%s at=%llu",(unsigned long)starts,(unsigned)(starts>1),WiFi.softAPmacAddress().c_str(),(unsigned long long)item.at);}
+    if(item.ip)logEvent("WIFI_IP event=%s mac=%s ip=%s at=%llu",wifiDiagnosticEventName(item.event),mac,IPAddress(item.ip).toString().c_str(),(unsigned long long)item.at);
+    if(item.event==ARDUINO_EVENT_WIFI_SCAN_DONE)logEvent("WIFI_SCAN_DONE status=%lu found=%u at=%llu",(unsigned long)item.scanStatus,(unsigned)item.scanCount,(unsigned long long)item.at);
+  }
 }
 
 void logHttpsConnectDiagnostic(const char* phase,WiFiClientSecure& client) {
@@ -483,7 +606,9 @@ bool resetWifiNetworks() {
   wifiTrying=false;wifiTried=0;wifiRetryAt=0;
   // Only the Arduino Wi-Fi STA configuration is cleared. Keep other NVS
   // namespaces, SPIFFS, OTA/DFU settings and cloud identity untouched.
+  logWifiDiagnosticContext("MODE_REQUEST_STA_WIFI_RESET");
   bool legacyErased=WiFi.mode(WIFI_STA);
+  logWifiDiagnosticContext("MODE_RESULT_WIFI_RESET");
   if(legacyErased){
     wifi_config_t emptySta={};
     legacyErased=esp_wifi_set_storage(WIFI_STORAGE_FLASH)==ESP_OK;
@@ -527,7 +652,7 @@ bool setPairedSensor(const char* sensorId,char* error,size_t errorSize) {
     snprintf(error,errorSize,"connected sensor ID is invalid");return false;
   }
   if(!pairingPreferencesReady) {snprintf(error,errorSize,"pairing storage is unavailable");return false;}
-  if(nrfDfuMode!=NRF_DFU_NORMAL||otaMode!=OTA_NORMAL) {snprintf(error,errorSize,"an update is active");return false;}
+  if(remoteOwnsUpdate||nrfDfuMode!=NRF_DFU_NORMAL||otaMode!=OTA_NORMAL) {snprintf(error,errorSize,"an update is active");return false;}
   if(!bleConnected||strcmp(sensorId,connectedSensorId)) {snprintf(error,errorSize,"sensor connection changed; refresh and approve again");return false;}
   if(pairingPreferences.putString("target",sensorId)!=16||pairingPreferences.getString("target","")!=sensorId) {
     snprintf(error,errorSize,"pairing target was not retained");return false;
@@ -537,7 +662,8 @@ bool setPairedSensor(const char* sensorId,char* error,size_t errorSize) {
   return true;
 }
 
-bool requestNrfDfuStart(char* error,size_t errorSize) {
+bool requestNrfDfuStart(char* error,size_t errorSize,bool remote=false) {
+  if(remoteOwnsUpdate&&!remote){snprintf(error,errorSize,"remote update is active");return false;}
   char connected[17],wanted[17];
   portENTER_CRITICAL(&stateMux);memcpy(connected,connectedSensorId,sizeof(connected));memcpy(wanted,targetSensorId,sizeof(wanted));portEXIT_CRITICAL(&stateMux);
   if(nrfDfuMode!=NRF_DFU_NORMAL||otaMode!=OTA_NORMAL||nrfPackageUploadActive) {snprintf(error,errorSize,"another update is active");return false;}
@@ -633,7 +759,8 @@ bool otaSafeState() {
 }
 
 bool otaSafeToStart() {
-  return otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&!nrfPackageUploadActive&&otaPassword[0]&&spool.mounted&&!spool.fault&&
+  return !wifiPortalPending&&!wifiManager.getConfigPortalActive()&&!remoteOwnsUpdate&&
+    otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&!nrfPackageUploadActive&&otaPassword[0]&&spool.mounted&&!spool.fault&&
     !otaPendingVerify&&!otaLeaseReleasePending&&WiFi.status()==WL_CONNECTED;
 }
 
@@ -660,7 +787,7 @@ bool otaSameOrigin() {
 }
 
 bool nrfPackageUploadSafe() {
-  return otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&otaPassword[0]&&
+  return !remoteOwnsUpdate&&otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&otaPassword[0]&&
     spool.mounted&&!spool.fault&&!spool.count&&cloudRecordingKnown&&!cloudRecording&&
     !otaActiveSamples&&!otaStagedSamples&&!otaHttpBusy&&!otaHttpFailed&&
     !otaUploadActive&&!otaLeaseReleasePending&&!uxQueueMessagesWaiting(samplesQueue)&&
@@ -758,6 +885,7 @@ void handleNrfPackagePage() {
 }
 
 void handleNrfPackageUploadComplete() {
+  if(remoteOwnsUpdate)return otaServer.send(409,"text/plain","Remote update owns this session");
   if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
   if(nrfPackageUploadFailed) {
     const int status=nrfPackageUploadStatus;const String message=nrfPackageUploadError;
@@ -785,7 +913,7 @@ void handleNrfDfuStatus() {
   NrfLegacyDfuRelay::PackageInfo package;char packageError[128]={};
   const bool packageValid=SPIFFS.exists(NRF_DFU_PACKAGE_PATH)&&validateNrfPackageAt(NRF_DFU_PACKAGE_PATH,package,packageError,sizeof(packageError));
   const bool pairedConnected=paired[0]&&connected[0]&&!strcmp(paired,connected)&&bleConnected;
-  const bool canPair=mode==NRF_DFU_NORMAL&&otaMode==OTA_NORMAL&&bleConnected&&connected[0];
+  const bool canPair=!remoteOwnsUpdate&&mode==NRF_DFU_NORMAL&&otaMode==OTA_NORMAL&&bleConnected&&connected[0];
   const bool canStart=mode==NRF_DFU_NORMAL&&otaMode==OTA_NORMAL&&!nrfPackageUploadActive&&pairedConnected&&
     cloudRecordingKnown&&!cloudRecording&&spool.mounted&&!spool.fault&&packageValid;
   const uint32_t sent=nrfDfuBytesSent,total=nrfDfuBytesTotal;
@@ -824,6 +952,7 @@ void handleNrfDfuCancel() {
 }
 
 void handleNrfPackageUploadProgress() {
+  if(remoteOwnsUpdate)return; // Never remove the remotely owned temporary package.
   HTTPUpload& upload=otaServer.upload();
   if(upload.status==UPLOAD_FILE_START) {
     nrfPackageUploadFailed=false;nrfPackageUploadError[0]=0;nrfPackageUploadBytes=0;nrfPackageUploadLimit=0;
@@ -961,7 +1090,7 @@ void handleOtaPage() {
   if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
   const bool safe=otaSafeToStart();
   const String page=String("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>Gateway OTA</title>")+
-    "<h1>ESP32-S3 firmware update</h1><p>Device " + String(deviceId) + " · " + FIRMWARE_VERSION + " build " + String((unsigned long)OTA_BUILD_NUMBER) + "</p><p><a href='/nrf-dfu'>Open nRF52840 sensor update</a></p><p>"+
+    "<h1>ESP32-S3 firmware update</h1><p>Device " + String(deviceId) + " · " + FIRMWARE_VERSION + " build " + String((unsigned long)OTA_BUILD_NUMBER) + "</p><p><a href='/nrf-dfu'>Open nRF52840 sensor update</a> · <a href='/remote-config'>Remote update provisioning</a></p><p>"+
     (safe?"Ready to reserve a STOPPED recording state and drain stored samples before upload.":"Blocked: check SPIFFS health, Wi-Fi, pending boot verification, and the USB-issued OTA token.")+
     "</p><p>Choose the signed .manifest and matching .bin from the same release. The page previews version/build direction; the ESP verifies signature and policy.</p><form id=f><label>Manifest <input id=m type=file accept='.manifest' required></label><br><label>Firmware <input id=b type=file accept='.bin' required></label><br><label><input id=c type=checkbox required> I approve flashing this signed firmware; the gateway will restart.</label><br><button "+
     (safe?"":"disabled")+">Verify and update</button></form><pre id=o></pre><script>const currentVersion='"+String(FIRMWARE_VERSION)+"',currentBuild=Number('"+String((unsigned long)OTA_BUILD_NUMBER)+"'),f=document.getElementById('f'),m=document.getElementById('m'),b=document.getElementById('b'),c=document.getElementById('c'),o=document.getElementById('o');function cmp(a,b){for(let i=0;i<3;i++){let x=Number(a.split('.')[i]),y=Number(b.split('.')[i]);if(x<y)return -1;if(x>y)return 1}return 0}f.onsubmit=async e=>{e.preventDefault();if(!c.checked)return;let allowRollback=false;try{const raw=await m.files[0].text(),match=/^FSGWOTA1\\r?\\ntarget=esp32s3\\r?\\nversion=(\\d+\\.\\d+\\.\\d+)\\r?\\nbuild=(\\d{10})\\r?\\nsha256=[0-9a-f]{64}\\r?\\nsignature=[A-Za-z0-9+/=]+\\r?\\n?$/.exec(raw);if(!match)throw Error('Manifest format is invalid');const incomingVersion=match[1],incomingBuild=Number(match[2]),order=cmp(incomingVersion,currentVersion);o.textContent=`Current: ${currentVersion} build ${currentBuild}\\nSelected: ${incomingVersion} build ${incomingBuild}`;if(order===0){o.textContent+='\\nSame version: the running firmware will be kept. Increase the patch version to install a new release.';return;}allowRollback=order<0||incomingBuild<=currentBuild;if(allowRollback&&!confirm(`DOWNGRADE / 롤백 확인\\nCurrent: ${currentVersion} build ${currentBuild}\\nSelected: ${incomingVersion} build ${incomingBuild}\\n\\nThe signed image will replace the running firmware. The older image must support this partition/data layout and boot self-check; otherwise bootloader rollback or USB recovery may be required. Continue?`))return;if(!allowRollback&&!confirm(`Upgrade / 업그레이드\\nCurrent: ${currentVersion} build ${currentBuild}\\nSelected: ${incomingVersion} build ${incomingBuild}\\nContinue?`))return;let prep=new URLSearchParams({allowRollback:allowRollback?'1':'0'});let r=await fetch('/prepare',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:prep});if(!r.ok){o.textContent=await r.text();return;}let ready=false;for(let i=0;i<180;i++){let s=await fetch('/status');if(!s.ok)throw Error(await s.text());let v=await s.json();if(v.mode!='PREPARE')throw Error('OTA preparation stopped');if(v.ready){ready=true;break;}o.textContent='Draining queue '+v.queue+' and spool '+v.spool+'; waiting for HTTP '+v.http;await new Promise(resolve=>setTimeout(resolve,1000));}if(!ready)throw Error('OTA preparation timed out');let d=new FormData();d.append('manifest',m.files[0]);d.append('firmware',b.files[0]);o.textContent='Uploading and verifying…';r=await fetch('/update',{method:'POST',body:d});o.textContent=await r.text();}catch(err){o.textContent=String(err);await fetch('/cancel',{method:'POST'}).catch(()=>{});}}</script>";
@@ -1000,11 +1129,53 @@ void handleOtaStatus() {
 void handleOtaCancel() {
   if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
   if(!otaSameOrigin())return otaServer.send(400,"text/plain","OTA origin mismatch");
+  if(remoteOwnsUpdate)return otaServer.send(409,"text/plain","Remote update owns this session");
   if(otaMode!=OTA_NORMAL){logEvent("OTA cancelled by user");abortOtaSession();}
   otaServer.send(200,"text/plain","OTA cancelled; normal collection resumed");
 }
 
+const char* otaEngineError="OTA engine error";
+bool beginOtaImage() {
+  if(!Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH)){logEvent("OTA Update.begin failed code=%u",(unsigned)Update.getError());otaEngineError="Update.begin failed";return false;}
+  otaUpdateStarted=true;mbedtls_sha256_init(&otaShaContext);
+  otaShaStarted=mbedtls_sha256_starts(&otaShaContext,0)==0;
+  if(!otaShaStarted){mbedtls_sha256_free(&otaShaContext);otaEngineError="SHA-256 initialization failed";return false;}
+  otaReceivedBytes=0;return true;
+}
+bool writeOtaImage(const uint8_t* bytes,size_t size) {
+  if(!otaShaStarted||!otaUpdateStarted){otaEngineError="image writer not started";return false;}
+  if(mbedtls_sha256_update(&otaShaContext,bytes,size)){otaEngineError="SHA-256 update failed";return false;}
+  const size_t written=Update.write(const_cast<uint8_t*>(bytes),size);
+  if(written!=size){logEvent("OTA Update.write failed code=%u written=%lu expected=%lu",(unsigned)Update.getError(),(unsigned long)written,(unsigned long)size);otaEngineError="Update.write incomplete";return false;}
+  otaReceivedBytes+=size;otaDeadlineAt=uptimeMs()+OTA_ACTIVE_TIMEOUT_MS;return true;
+}
+bool sealOtaImage() {
+  uint8_t digest[32];
+  if(!otaShaStarted||mbedtls_sha256_finish(&otaShaContext,digest)){otaEngineError="SHA-256 finish failed";return false;}
+  memcpy(otaSignature,digest,sizeof(digest));mbedtls_sha256_free(&otaShaContext);otaShaStarted=false;otaBinaryReady=true;return true;
+}
+bool commitOtaImage() {
+  if(!otaManifestReady||!otaBinaryReady||!otaUpdateStarted){otaEngineError="image not verified";return false;}
+  if(!otaReceivedBytes||Update.hasError()) {
+    logEvent("OTA image write error code=%u bytes=%lu",(unsigned)Update.getError(),(unsigned long)otaReceivedBytes);
+    otaEngineError="image write incomplete";return false;
+  }
+  uint8_t digest[32];char actualHex[65];
+  memcpy(digest,otaSignature,sizeof(digest));
+  for(uint8_t i=0;i<32;++i)snprintf(actualHex+i*2,3,"%02x",digest[i]);actualHex[64]=0;
+  if(strcmp(actualHex,otaIncomingDigest)) {
+    otaEngineError="signed image SHA-256 mismatch";return false;
+  }
+  if(!Update.end(true)||Update.hasError()) {
+    logEvent("OTA ESP image validation failed code=%u bytes=%lu",(unsigned)Update.getError(),(unsigned long)otaReceivedBytes);
+    otaEngineError="ESP image validation failed";return false;
+  }
+  logEvent("OTA verified signed image bytes=%lu",(unsigned long)otaReceivedBytes);
+  otaUpdateStarted=false;otaUploadActive=false;return true;
+}
+
 void handleOtaUpload() {
+  if(remoteOwnsUpdate)return otaServer.send(409,"text/plain","Remote update owns this session");
   if(!otaServer.authenticate("admin",otaPassword))return otaServer.requestAuthentication();
   if(otaUploadFailure) return otaServer.send(otaUploadFailureCode,"text/plain",String(otaUploadFailure)+"; running firmware remains selected.");
   if(otaMode!=OTA_ACTIVE||!otaUpdateStarted||!otaManifestReady||!otaBinaryReady||
@@ -1012,36 +1183,20 @@ void handleOtaUpload() {
     rejectOtaUpload("OTA state, origin, or drain safety check failed",409);
     return otaServer.send(409,"text/plain","OTA blocked; running firmware remains selected.");
   }
-  if(!otaReceivedBytes||Update.hasError()) {
-    logEvent("OTA image write error code=%u bytes=%lu",(unsigned)Update.getError(),(unsigned long)otaReceivedBytes);
-    rejectOtaUpload("image write incomplete",400);
-    return otaServer.send(400,"text/plain","OTA image write incomplete; running firmware remains selected.");
-  }
-  uint8_t digest[32];char actualHex[65];
-  memcpy(digest,otaSignature,sizeof(digest));
-  for(uint8_t i=0;i<32;++i)snprintf(actualHex+i*2,3,"%02x",digest[i]);actualHex[64]=0;
-  if(strcmp(actualHex,otaIncomingDigest)) {
-    rejectOtaUpload("signed image SHA-256 mismatch",400);
-    return otaServer.send(400,"text/plain","Image SHA-256 mismatch; running firmware remains selected.");
-  }
-  if(!Update.end(true)||Update.hasError()) {
-    logEvent("OTA ESP image validation failed code=%u bytes=%lu",(unsigned)Update.getError(),(unsigned long)otaReceivedBytes);
-    rejectOtaUpload("ESP image validation failed",400);
-    return otaServer.send(400,"text/plain","ESP image validation failed; running firmware remains selected.");
-  }
-  logEvent("OTA verified signed image bytes=%lu",(unsigned long)otaReceivedBytes);
-  otaUpdateStarted=false;otaUploadActive=false;otaServer.send(200,"text/plain","Signed image verified. Gateway restarting into OTA slot.");
+  if(!commitOtaImage()){const char* reason=otaEngineError;rejectOtaUpload(reason,400);return otaServer.send(400,"text/plain",String(reason)+"; running firmware remains selected.");}
+  otaServer.send(200,"text/plain","Signed image verified. Gateway restarting into OTA slot.");
   logEvent("OTA accepted version=%s build=%llu; restarting",otaIncomingVersion,(unsigned long long)otaIncomingBuild);
   delay(500);ESP.restart();
 }
 
-bool otaLeaseResponse(const String& body) {
+bool otaLeaseResponse(const String& body,const char* remoteNonce) {
   cJSON* root=cJSON_Parse(body.c_str());if(!root)return false;
   const bool success=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root,"success"));
   cJSON* recording=cJSON_GetObjectItemCaseSensitive(root,"recording");
   cJSON* state=cJSON_GetObjectItemCaseSensitive(recording,"state");
   const bool hasState=cJSON_IsString(state);
   const bool stopped=hasState&&!strcmp(state->valuestring,"STOPPED");
+  if(success)remoteClient.receive(root,remoteNonce);
   cJSON_Delete(root);
   otaLastCloudAckAt=success?uptimeMs():0;
   return success&&stopped;
@@ -1053,10 +1208,11 @@ bool syncOtaLease(const char* state) {
   portENTER_CRITICAL(&stateMux);memcpy(sensorId,connectedSensorId,sizeof(sensorId));portEXIT_CRITICAL(&stateMux);
   cJSON_AddStringToObject(root,"sensor_id",sensorId);cJSON_AddArrayToObject(root,"samples");
   cJSON* health=healthJson(0,0);cJSON_AddStringToObject(health,"ota_state",state);cJSON_AddItemToObject(root,"health",health);
+  char remoteNonce[33];remoteAttach(root,remoteNonce);
   bool payloadInPsram=false;char* payload=serializeHttpJson(root,payloadInPsram);cJSON_Delete(root);if(!payload)return false;
   String redirect,response;int postCode=0;
   {
-    GatewaySecureClient client;client.setInsecure();HTTPClient post;
+    GatewaySecureClient client;configureCloudTls(client);HTTPClient post;
     post.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);post.setConnectTimeout(5000);post.setTimeout(15000);post.setReuse(false);
     if(post.begin(client,GOOGLE_SCRIPT_URL)) {
       post.addHeader("Content-Type","application/json");postCode=post.POST((uint8_t*)payload,strlen(payload));
@@ -1067,13 +1223,13 @@ bool syncOtaLease(const char* state) {
     client.stop();
   }
   releaseHttpJson(payload,payloadInPsram);
-  if(redirect.length()) {
-    delay(100);GatewaySecureClient client;client.setInsecure();HTTPClient get;
+  if(redirect.length()&&(!remoteClient.requiresCloudTls()||remoteGoogleRedirect(redirect))) {
+    delay(100);GatewaySecureClient client;configureCloudTls(client);HTTPClient get;
     get.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);get.setConnectTimeout(10000);get.setTimeout(15000);get.setReuse(false);
     if(get.begin(client,redirect)) {const int code=get.GET();if(code>=200&&code<300&&get.getSize()<=16000)response=get.getString();get.end();}
     client.stop();
   }
-  return response.length()&&otaLeaseResponse(response);
+  return response.length()&&otaLeaseResponse(response,remoteNonce);
 }
 
 bool serviceDeferredOtaLeaseRelease() {
@@ -1090,6 +1246,7 @@ bool serviceDeferredOtaLeaseRelease() {
 }
 
 void handleOtaUploadProgress() {
+  if(remoteOwnsUpdate)return; // Local multipart requests cannot replace a remote command.
   HTTPUpload& upload=otaServer.upload();
   if(upload.status==UPLOAD_FILE_ABORTED) {
     if(otaMode!=OTA_NORMAL)rejectOtaUpload("client upload aborted",400);
@@ -1108,14 +1265,8 @@ void handleOtaUploadProgress() {
       return;
     }
     if(upload.filename.endsWith(".bin")&&otaMode==OTA_ACTIVE&&otaManifestReady&&otaUploadActive&&otaSafeState()) {
-      if(!Update.begin(UPDATE_SIZE_UNKNOWN,U_FLASH)) {
-        logEvent("OTA Update.begin failed code=%u",(unsigned)Update.getError());
-        rejectOtaUpload("Update.begin failed",400);return;
-      }
-      otaUpdateStarted=true;mbedtls_sha256_init(&otaShaContext);
-      otaShaStarted=mbedtls_sha256_starts(&otaShaContext,0)==0;
-      if(!otaShaStarted){mbedtls_sha256_free(&otaShaContext);rejectOtaUpload("SHA-256 initialization failed",400);return;}
-      otaReceivedBytes=0;return;
+      if(!beginOtaImage()){rejectOtaUpload(otaEngineError,400);return;}
+      return;
     }
     rejectOtaUpload("unexpected file or unsafe BIN start",400);return;
   }
@@ -1129,16 +1280,7 @@ void handleOtaUploadProgress() {
       return;
     }
     if(upload.filename.endsWith(".bin")&&otaMode==OTA_ACTIVE&&otaUpdateStarted&&otaShaStarted) {
-      if(mbedtls_sha256_update(&otaShaContext,upload.buf,upload.currentSize)!=0) {
-        rejectOtaUpload("SHA-256 update failed",400);return;
-      }
-      const size_t written=Update.write(upload.buf,upload.currentSize);
-      if(written!=upload.currentSize) {
-        logEvent("OTA Update.write failed code=%u written=%lu expected=%lu",(unsigned)Update.getError(),
-          (unsigned long)written,(unsigned long)upload.currentSize);
-        rejectOtaUpload("Update.write incomplete",400);return;
-      }
-      otaReceivedBytes+=written;otaDeadlineAt=uptimeMs()+OTA_ACTIVE_TIMEOUT_MS;
+      if(!writeOtaImage(upload.buf,upload.currentSize)){rejectOtaUpload(otaEngineError,400);return;}
       return;
     }
     rejectOtaUpload("unexpected upload chunk",400);return;
@@ -1158,9 +1300,7 @@ void handleOtaUploadProgress() {
       logEvent("OTA BIN size mismatch received=%lu reported=%lu",(unsigned long)otaReceivedBytes,(unsigned long)upload.totalSize);
       rejectOtaUpload("BIN byte count mismatch",400);return;
     }
-    uint8_t digest[32];
-    if(mbedtls_sha256_finish(&otaShaContext,digest)!=0){rejectOtaUpload("SHA-256 finish failed",400);return;}
-    memcpy(otaSignature,digest,sizeof(digest));mbedtls_sha256_free(&otaShaContext);otaShaStarted=false;otaBinaryReady=true;
+    if(!sealOtaImage()){rejectOtaUpload(otaEngineError,400);return;}
     return;
   }
   rejectOtaUpload("unexpected upload completion",400);
@@ -1171,6 +1311,8 @@ void startOtaWebServer() {
   if(!otaServerRoutesRegistered){
   const char* headers[]={"Host","Origin"};otaServer.collectHeaders(headers,2);
   otaServer.on("/",HTTP_GET,handleOtaPage);
+    otaServer.on("/remote-config",HTTP_GET,handleRemoteConfig);
+    otaServer.on("/remote-config",HTTP_POST,handleRemoteConfigSave);
   otaServer.on("/prepare",HTTP_POST,handleOtaPrepare);
   otaServer.on("/status",HTTP_GET,handleOtaStatus);
   otaServer.on("/cancel",HTTP_POST,handleOtaCancel);
@@ -1211,7 +1353,64 @@ void redirectCaptiveProbe() {
   wifiManager.server->send(302,"text/plain","");
 }
 
+void handleWifiPortalSave() {
+  wifiPixelSaveAt=uptimeMs();
+  const String ssid=wifiManager.server->arg("s");
+  const String password=wifiManager.server->arg("p");
+  bool valid=!ssid.isEmpty()&&ssid.length()<=32&&password.length()<=64;
+  for(uint8_t i=0;valid&&i<wifiNetworkCount;++i)
+    if(ssid==wifiNetworks[i].ssid)valid=false; // Never overwrite a working slot with unverified credentials.
+  if(!valid||!saveWifiNetwork(ssid,password)) {
+    wifiPixelErrorAt=uptimeMs();
+    logEvent("ERROR WIFI_PORTAL registration rejected; existing networks preserved");
+    wifiManager.server->send(400,"text/html",
+      "<h2>Wi-Fi was not stored</h2><p>Check SSID/password and the four-slot limit. Existing networks are unchanged.</p><a href='/0wifi'>Try again</a>");
+    return;
+  }
+  wifiPortalCandidateSlot=wifiActiveSlot;
+  wifiPortalExitAt=uptimeMs()+3000;
+  logEvent("WIFI_PORTAL credentials stored in NVS slot=%d; STA connection not yet verified",(int)wifiPortalCandidateSlot);
+  wifiManager.server->send(200,"text/html",WiFi.status()==WL_CONNECTED?
+    "<h2>Wi-Fi stored</h2><p>The current connection will remain active. The new network is saved for future connection attempts; it has not been verified. The portal will close shortly.</p>":
+    "<h2>Wi-Fi stored</h2><p>The portal will close and try the new network. Storage is confirmed; connection is not yet confirmed. Green means connected, red flashes mean a connection error. Existing networks remain available.</p>");
+}
+
+void handleWifiPortalScan() {
+  // WiFi.scanNetworks() enables STA. Scanning from AP-only mode can drop the
+  // phone, so keep manual entry available until an AP+STA link already exists.
+  if(!(WiFi.getMode()&WIFI_STA)) {
+    wifiManager.server->send(200,"text/html",
+      "<h2>Wi-Fi scan unavailable while AP-only</h2><p>Enter the SSID manually to keep this phone connected.</p><a href='/0wifi'>Configure Wi-Fi</a>");
+    return;
+  }
+  if(!wifiPortalScanActive) {
+    WiFi.scanDelete();
+    wifiPortalScanActive=WiFi.scanNetworks(true)==WIFI_SCAN_RUNNING;
+    wifiPortalScanReady=false;
+    wifiPortalScanAt=uptimeMs();
+    if(wifiPortalScanActive)logEvent("WIFI_PORTAL asynchronous Wi-Fi scan started");
+  }
+  wifiManager.server->send(200,"text/html",
+    "<h2>Nearby Wi-Fi</h2><pre id='scan'>Scanning...</pre><a href='/0wifi'>Enter SSID manually</a><script>let t=setInterval(async()=>{let r=await fetch('/wifi-scan-result');let s=await r.text();document.getElementById('scan').textContent=s;if(s!='Scanning...')clearInterval(t)},500)</script>");
+}
+
+void handleWifiPortalScanResult() {
+  if(!wifiPortalScanActive&&!wifiPortalScanReady){wifiManager.server->send(200,"text/plain","Scan unavailable; enter SSID manually.");return;}
+  const int count=WiFi.scanComplete();
+  if(count==WIFI_SCAN_RUNNING){wifiManager.server->send(200,"text/plain","Scanning...");return;}
+  String body=count<0?"Scan failed; enter SSID manually.":count==0?"No networks found; enter SSID manually.":"Nearby SSIDs (enter one manually):\n";
+  for(int i=0;i<count&&i<20;++i){String name=WiFi.SSID(i);name.replace('\n',' ');name.replace('\r',' ');body+=name+'\n';}
+  WiFi.scanDelete();wifiPortalScanActive=false;wifiPortalScanReady=false;
+  wifiManager.server->send(200,"text/plain",body);
+}
+
 void registerWifiPortalRoutes() {
+  // WiFiManager calls this callback before registering its own /wifi and
+  // /wifisave routes, so these quick handlers win without changing the library.
+  wifiManager.server->on("/wifi",HTTP_GET,handleWifiPortalScan);
+  wifiManager.server->on("/wifi",HTTP_POST,handleWifiPortalScan);
+  wifiManager.server->on("/wifi-scan-result",HTTP_GET,handleWifiPortalScanResult);
+  wifiManager.server->on("/wifisave",HTTP_POST,handleWifiPortalSave);
   // Android/iOS probe URLs must not return 204/success while AP has no Internet.
   wifiManager.server->on("/generate_204",HTTP_GET,redirectCaptiveProbe);
   wifiManager.server->on("/gen_204",HTTP_GET,redirectCaptiveProbe);
@@ -1225,7 +1424,10 @@ void registerWifiPortalRoutes() {
 }
 
 bool wifiPortalAllowed() {
-  return otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&
+  // After a remote ESP boot, Wi-Fi setup may be needed to finish its existing
+  // cloud-ACK self-check. No image/DFU transfer runs in this VERIFYING state.
+  return (!remoteOwnsUpdate||!strcmp(remoteClient.record.state,"VERIFYING"))&&
+         otaMode==OTA_NORMAL&&nrfDfuMode==NRF_DFU_NORMAL&&
          !nrfPackageUploadActive&&!otaUploadActive;
 }
 
@@ -1235,15 +1437,28 @@ void startWifiPortal() {
     logEvent("Wi-Fi portal deferred: firmware update active");return;
   }
   // In nonblocking mode startConfigPortal() returns false even when active.
+  logWifiDiagnosticContext("PORTAL_START_REQUEST");
   wifiManager.startConfigPortal(AP_NAME,AP_PASSWORD);
+  logWifiDiagnosticContext("PORTAL_START_RETURN");
   if(!wifiManager.getConfigPortalActive()){
     logEvent("ERROR Wi-Fi configuration portal inactive after start");
   }
   else {
     wifiPortalStarted=true;
+    wifiPortalOpenedAt=uptimeMs();
     if(!(WiFi.getMode()&WIFI_AP))logEvent("ERROR Wi-Fi portal active without AP mode");
     else logEvent("Wi-Fi configuration portal active (AP mode) at http://%s/",WiFi.softAPIP().toString().c_str());
   }
+}
+
+void requestWifiPortal() {
+  if(wifiPortalPending||wifiManager.getConfigPortalActive())return;
+  if(!wifiPortalAllowed()){
+    logEvent("Wi-Fi portal deferred: firmware update active");return;
+  }
+  wifiPortalPending=true;
+  wifiPortalOpenedAt=uptimeMs();
+  logEvent("WIFI_PORTAL entry requested; waiting for current HTTPS job to finish");
 }
 
 void serviceWifi(uint64_t now) {
@@ -1261,6 +1476,8 @@ void serviceWifi(uint64_t now) {
     wifiActiveSlot=-1;
     for(uint8_t i=0;i<wifiNetworkCount;++i)if(WiFi.SSID()==wifiNetworks[i].ssid)wifiActiveSlot=i;
     if(newlyConnected) {
+      wifiPixelSuccessAt=now;
+      wifiPortalCandidateSlot=-1;
       if(wifiActiveSlot>=0)rememberSuccessfulWifiSlot((uint8_t)wifiActiveSlot);
       logEvent("Wi-Fi connected slot=%d ssid=%s ip=%s",(int)wifiActiveSlot,WiFi.SSID().c_str(),WiFi.localIP().toString().c_str());
       // mDNS follows ESP-NETIF link events internally. Keep one responder for
@@ -1285,7 +1502,7 @@ void serviceWifi(uint64_t now) {
   if(disconnectEvent) {
     logEvent("Wi-Fi disconnect event reason=%u status=%d",(unsigned)disconnectReason,(int)WiFi.status());
   }
-  if(wifiManager.getConfigPortalActive())return; // Portal owns STA while configuring.
+  if(wifiPortalPending||wifiManager.getConfigPortalActive())return; // No STA retry while entering or using the portal.
   if(wifiDisconnectPending) {
     if(!wifi_recovery::disconnectComplete(disconnectEvent,(uint32_t)(now-wifiDisconnectAt)))return;
     if(!disconnectEvent)logEvent("Wi-Fi disconnect event timeout; continuing failover after bounded fallback");
@@ -1299,18 +1516,28 @@ void serviceWifi(uint64_t now) {
     wifiNextSlot=wifi_recovery::nextSlot(wifiNextSlot,wifiNetworkCount);
     logEvent("Wi-Fi connect failed slot=%u reason=%u; next slot=%u",
       (unsigned)failedSlot,(unsigned)disconnectReason,(unsigned)wifiNextSlot);
+    wifiPixelErrorAt=now;
+    if(failedSlot==wifiPortalCandidateSlot)wifiPortalCandidateSlot=-1;
+    // A disconnect event can arrive while the STA driver is still completing
+    // its prior attempt. Cancel it before WiFi.begin() changes credentials.
+    logWifiDiagnosticContext("STA_CANCEL_FAILED_ATTEMPT");
+    WiFi.disconnect(false,false);wifiDisconnectPending=true;wifiDisconnectAt=now;
     if(wifi_recovery::cycleComplete(wifiTried,wifiNetworkCount)){
       wifiRetryAt=now+WIFI_RETRY_MS;wifiTried=0;
       wifiNextSlot=wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
       logEvent("Wi-Fi networks unavailable; retrying preferred slot=%u in %lu ms",
         (unsigned)wifiNextSlot,(unsigned long)WIFI_RETRY_MS);
     } else wifiRetryAt=now+wifi_recovery::SLOT_SETTLE_MS;
+    return;
   }
   if(wifiTrying){
     if(now-wifiAttemptAt<WIFI_CONNECT_MS)return;
     const uint8_t timedOutSlot=wifiNextSlot;
     logEvent("Wi-Fi connect timeout slot=%u ssid=%s; cancelling STA attempt before failover",
       (unsigned)timedOutSlot,wifiNetworks[timedOutSlot].ssid);
+    wifiPixelErrorAt=now;
+    if(timedOutSlot==wifiPortalCandidateSlot)wifiPortalCandidateSlot=-1;
+    logWifiDiagnosticContext("STA_CANCEL_CONNECT_TIMEOUT");
     WiFi.disconnect(false,false);wifiDisconnectPending=true;wifiDisconnectAt=now;
     wifiTrying=false;++wifiTried;
     wifiNextSlot=wifi_recovery::nextSlot(wifiNextSlot,wifiNetworkCount);
@@ -1326,12 +1553,13 @@ void serviceWifi(uint64_t now) {
   }
   if(!wifiNetworkCount){
     if(now>=wifiRetryAt){
-      startWifiPortal();
+      requestWifiPortal();
       wifiRetryAt=now+WIFI_RETRY_MS;
     }
     return;
   }
   if(now<wifiRetryAt)return;
+  logWifiDiagnosticContext("STA_BEGIN_REQUEST");
   WiFi.begin(wifiNetworks[wifiNextSlot].ssid,wifiNetworks[wifiNextSlot].password);
   wifiAttemptAt=now;wifiTrying=true;
   logEvent("Wi-Fi connect attempt slot=%u ssid=%s",(unsigned)wifiNextSlot,wifiNetworks[wifiNextSlot].ssid);
@@ -1423,7 +1651,29 @@ void updateGatewayUi(uint64_t now,bool wifi,CloudState cloud,uint32_t queueDepth
       }
     } else {otaRainbowActive=false;shownPixel=PIXEL_BOOT;}
   }
-  if(!otaRainbowActive)setGatewayPixel(pixelState(ble,wifi,cloud,backlog,updateActive));
+  if(!otaRainbowActive) {
+    // Firmware updates and rollback confirmation retain their existing pixel
+    // priority. Wi-Fi setup feedback is temporary; the normal sensor/cloud
+    // indication returns as soon as the feedback expires.
+    WifiFeedback feedback=WIFI_FEEDBACK_NONE;
+    uint64_t feedbackAt=now;
+    if(!updateActive) {
+      if(wifiPixelErrorAt&&now-wifiPixelErrorAt<1500){feedback=WIFI_FEEDBACK_ERROR;feedbackAt=wifiPixelErrorAt;}
+      else if(wifiPixelSaveAt&&now-wifiPixelSaveAt<1200){feedback=WIFI_FEEDBACK_SAVE;feedbackAt=wifiPixelSaveAt;}
+      else if(wifiPortalScanActive){feedback=WIFI_FEEDBACK_SCAN;feedbackAt=wifiPortalScanAt;}
+      else if(wifiPixelSuccessAt&&now-wifiPixelSuccessAt<2000){feedback=WIFI_FEEDBACK_SUCCESS;feedbackAt=wifiPixelSuccessAt;}
+      else if(wifiPortalPending||wifiManager.getConfigPortalActive()){feedback=WIFI_FEEDBACK_PORTAL;feedbackAt=wifiPortalOpenedAt;}
+      else if(!wifi&&wifiTrying){feedback=WIFI_FEEDBACK_CONNECT;feedbackAt=wifiAttemptAt;}
+    }
+    if(feedback!=WIFI_FEEDBACK_NONE) {
+      const uint32_t color=wifiFeedbackColor(feedback,now-feedbackAt);
+      if(!wifiPixelOverlayActive||color!=wifiPixelShownColor){gatewayPixel.setPixelColor(0,color);gatewayPixel.show();wifiPixelShownColor=color;}
+      wifiPixelOverlayActive=true;
+    } else {
+      if(wifiPixelOverlayActive){wifiPixelOverlayActive=false;shownPixel=PIXEL_BOOT;}
+      setGatewayPixel(pixelState(ble,wifi,cloud,backlog,updateActive));
+    }
+  }
 
   if(!lcdReady||now-lastLcdRefresh<LCD_REFRESH_MS)return;
 
@@ -1804,6 +2054,7 @@ cJSON* healthJson(uint32_t activeCount,uint32_t stagedCount) {
   char sensorIdSnapshot[17];portENTER_CRITICAL(&stateMux);memcpy(sensorIdSnapshot,connectedSensorId,sizeof(sensorIdSnapshot));portEXIT_CRITICAL(&stateMux);
   cJSON_AddStringToObject(o,"sensor_id",sensorIdSnapshot);
   cJSON_AddStringToObject(o,"firmware_version",FIRMWARE_VERSION);
+  cJSON_AddBoolToObject(o,"remote_capable",remoteClient.enabled());
   cJSON_AddStringToObject(o,"ota_state",otaPendingVerify?"VERIFYING":otaMode!=OTA_NORMAL?"UPDATING":"IDLE");
   if(WiFi.status()==WL_CONNECTED)cJSON_AddStringToObject(o,"local_ip",WiFi.localIP().toString().c_str());
 
@@ -1909,6 +2160,7 @@ bool validAck(const char* response,const UploadJob& job,UploadResult& result) {
 
   if(cJSON_IsString(session))snprintf(result.session,sizeof(result.session),"%s",session->valuestring);
 
+  if(ok&&job.remoteNonce[0])remoteClient.receive(root,job.remoteNonce);
   cJSON_Delete(root);return ok;
 
 }
@@ -1932,10 +2184,13 @@ void networkTask(void*) {
     result.heartbeat = job->heartbeat;
 
     result.http = -1;
+    bool attemptedHttp=false;
 
 
 
     if (WiFi.status() == WL_CONNECTED) {
+      attemptedHttp=true;
+      if(WiFi.getMode()&WIFI_MODE_AP)logWifiDiagnosticContext("HTTP_BEGIN_WITH_AP");
 
 
 
@@ -1963,7 +2218,7 @@ void networkTask(void*) {
 
         GatewaySecureClient postClient;
 
-        postClient.setInsecure();
+        configureCloudTls(postClient);
 
 
 
@@ -2148,7 +2403,7 @@ void networkTask(void*) {
 
            postCode == HTTP_CODE_SEE_OTHER) &&
 
-          redirectUrl.length()) {
+          redirectUrl.length()&&(!remoteClient.requiresCloudTls()||remoteGoogleRedirect(redirectUrl))) {
 
         lastRedirectAt=uptimeMs();
 
@@ -2172,7 +2427,7 @@ void networkTask(void*) {
 
           GatewaySecureClient getClient;
 
-          getClient.setInsecure();
+          configureCloudTls(getClient);
 
 
 
@@ -2303,6 +2558,10 @@ void networkTask(void*) {
 
 
 
+    // No POST was made when the original connected-state guard was false.
+    if(!attemptedHttp)logWifiDiagnosticContext("HTTP_SKIPPED_STA_OFFLINE");
+    else if(WiFi.getMode()&WIFI_MODE_AP)logWifiDiagnosticContext("HTTP_END_WITH_AP");
+
     logEvent(
 
       "HTTP %d application ACK=%u samples=%lu",
@@ -2345,6 +2604,8 @@ uint32_t drain(Sample* dest) {
 
 }
 
+#include "RemoteUpdateRuntime.h"
+
 void setup() {
 
   Serial.begin(115200);if(UART_DIAGNOSTICS)Serial0.begin(115200);
@@ -2356,7 +2617,13 @@ void setup() {
 
   if(!logMutex||!samplesQueue||!jobsQueue||!resultsQueue){Serial0.println("FATAL allocation failed");while(true)delay(1000);}
 
-  pinMode(WIFI_RESET_PIN,INPUT_PULLUP);WiFi.mode(WIFI_STA);
+  wifiDiagnosticQueue=xQueueCreate(16,sizeof(WifiDiagnosticEvent));
+  if(wifiDiagnosticQueue)WiFi.onEvent(captureWifiDiagnosticEvent);
+  else logEvent("WIFI_DIAG queue allocation failed; original Wi-Fi handling continues");
+  logEvent("WIFI_DIAG boot reset_reason=%d",(int)esp_reset_reason());
+  pinMode(WIFI_RESET_PIN,INPUT_PULLUP);
+  logWifiDiagnosticContext("MODE_REQUEST_STA_SETUP");WiFi.mode(WIFI_STA);
+  logWifiDiagnosticContext("MODE_RESULT_SETUP");
   WiFi.onEvent([](WiFiEvent_t,WiFiEventInfo_t info){
     portENTER_CRITICAL(&stateMux);
     wifiLastDisconnectReason=info.wifi_sta_disconnected.reason;wifiDisconnectEventPending=true;
@@ -2408,21 +2675,17 @@ void setup() {
   wifiManager.setDebugOutput(false); // never expose entered credentials through library diagnostics
   wifiManager.setCaptivePortalEnable(true);
   wifiManager.setShowInfoErase(false);wifiManager.setShowInfoUpdate(false);
-  const char* portalMenu[]={"wifi","info","exit"};wifiManager.setMenu(portalMenu,3);
+  // The normal "wifi" page blocks in scanNetworks() and can switch AP to
+  // AP+STA while a phone is connected. Manual entry avoids that on Configure.
+  const char* portalMenu[]={"wifinoscan","info","exit"};wifiManager.setMenu(portalMenu,3);
   wifiManager.setWebServerCallback(registerWifiPortalRoutes);
-
-  wifiManager.setSaveConfigCallback([](){
-    if(!saveWifiNetwork(wifiManager.getWiFiSSID(true),wifiManager.getWiFiPass(true)))
-      logEvent("ERROR Wi-Fi portal registration not retained");
-    else {
-      rememberSuccessfulWifiSlot((uint8_t)wifiActiveSlot);
-      logEvent("Wi-Fi portal connected slot=%d ip=%s",(int)wifiActiveSlot,WiFi.localIP().toString().c_str());
-    }
-  });
+  // This WiFiManager callback covers both timeout and user exit, not timeout alone.
+  wifiManager.setConfigPortalTimeoutCallback([](){logWifiDiagnosticContext("PORTAL_TIMEOUT_OR_EXIT");});
   loadWifiNetworks();WiFi.persistent(false);WiFi.setAutoReconnect(false);
   serviceWifi(uptimeMs());
 
   configTime(0,0,"pool.ntp.org","time.google.com");
+  beginRemoteUpdate();
 
 }
 
@@ -2450,12 +2713,40 @@ void loop() {
 
   static int wifiPrevious=-1;
 
-  wifiManager.process();uint64_t now=uptimeMs();handlePairingCommand();
+  static uint64_t lastPortalProcessDone=0;
+  const uint64_t portalProcessAt=uptimeMs();
+  const bool portalWasActive=wifiManager.getConfigPortalActive();
+  wifiManager.process();uint64_t now=uptimeMs();
+  if(wifiPortalScanActive&&WiFi.scanComplete()!=WIFI_SCAN_RUNNING) {
+    wifiPortalScanActive=false;wifiPortalScanReady=true;
+    logEvent("WIFI_PORTAL asynchronous Wi-Fi scan complete");
+  }
+  if(wifiPortalExitAt&&now>=wifiPortalExitAt&&wifiManager.getConfigPortalActive()) {
+    logWifiDiagnosticContext("PORTAL_CLOSE_AFTER_SAVE");
+    wifiManager.stopConfigPortal();wifiPortalExitAt=0;
+  }
+  if((portalWasActive||wifiManager.getConfigPortalActive())&&
+     (now-portalProcessAt>=250||(lastPortalProcessDone&&portalProcessAt-lastPortalProcessDone>=1000)))
+    logEvent("WIFI_PORTAL_PROCESS at=%llu work_ms=%llu gap_ms=%llu portal=%u",
+      (unsigned long long)portalProcessAt,(unsigned long long)(now-portalProcessAt),
+      (unsigned long long)(lastPortalProcessDone?portalProcessAt-lastPortalProcessDone:0),(unsigned)wifiManager.getConfigPortalActive());
+  lastPortalProcessDone=now;
+  serviceWifiDiagnostics();handlePairingCommand();
   if(wifiPortalStarted&&!wifiManager.getConfigPortalActive()){
+    logWifiDiagnosticContext("PORTAL_CLOSED_OBSERVED");
     wifiPortalStarted=false;wifiTrying=false;wifiDisconnectPending=false;
+    wifiPortalExitAt=0;wifiPortalScanActive=false;wifiPortalScanReady=false;WiFi.scanDelete();
     // WiFiManager restores STA mode on exit; rebind port 8080 to that interface.
     if(otaServerReady){otaServer.stop();otaServerReady=false;}
-    wifiRetryAt=now;wifiNextSlot=wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
+    wifiRetryAt=now;
+    wifiNextSlot=wifiPortalCandidateSlot>=0&&WiFi.status()!=WL_CONNECTED?
+      (uint8_t)wifiPortalCandidateSlot:wifi_recovery::preferredSlot(wifiPreferredSlot,wifiNetworkCount);
+    // WiFiManager may reconnect its previous STA configuration while closing
+    // the AP. Settle that attempt before applying the newly saved slot.
+    if(WiFi.status()!=WL_CONNECTED&&wifiNetworkCount) {
+      logWifiDiagnosticContext("STA_CANCEL_PORTAL_EXIT");
+      WiFi.disconnect(false,false);wifiDisconnectPending=true;wifiDisconnectAt=now;
+    }
     logEvent("Wi-Fi configuration portal closed; saved network recovery resumed");
   }
 
@@ -2477,12 +2768,12 @@ void loop() {
     logEvent(lcdMode==LCD_SENSOR?"LCD MODE SENSOR":"LCD MODE DEBUG");lastLcdRefresh=0;}
 
   if(button.longPress){logEvent("Wi-Fi add portal; saved networks and spool preserved");
-    wifiTrying=false;startWifiPortal();}
+    wifiTrying=false;requestWifiPortal();}
   if(button.resetPress){
     if(!wifiPortalAllowed())logEvent("Wi-Fi reset deferred: firmware update active");
     else {
-      if(wifiManager.getConfigPortalActive())wifiManager.stopConfigPortal();
-      resetWifiNetworks();startWifiPortal();
+      if(wifiManager.getConfigPortalActive()){logWifiDiagnosticContext("PORTAL_STOP_REQUEST_WIFI_RESET");wifiManager.stopConfigPortal();}
+      resetWifiNetworks();requestWifiPortal();
     }
   }
 
@@ -2550,6 +2841,23 @@ void loop() {
 
   }
 
+  // A requested portal starts only after the worker's last result is handled.
+  // Never cancel an in-flight POST: its original UIDs still need an exact ACK.
+  if(wifiPortalPending&&!busy&&!uxQueueMessagesWaiting(jobsQueue)&&!uxQueueMessagesWaiting(resultsQueue)) {
+    wifiPortalPending=false;
+    logEvent("WIFI_PORTAL current HTTPS job finished; opening configuration AP");
+    startWifiPortal();
+  }
+  const bool portalUploadPaused=wifiPortalPending||wifiManager.getConfigPortalActive();
+  static bool portalUploadWasPaused=false;
+  if(portalUploadPaused!=portalUploadWasPaused) {
+    logEvent(portalUploadPaused?
+      "WIFI_PORTAL cloud uploads paused pending=%u queue=%lu spool=%lu":
+      "WIFI_PORTAL cloud uploads resumed pending=%u queue=%lu spool=%lu",
+      (unsigned)wifiPortalPending,(unsigned long)uxQueueMessagesWaiting(samplesQueue),(unsigned long)spool.count);
+    portalUploadWasPaused=portalUploadPaused;
+  }
+
   // Persist a slow in-flight request as well as failed uploads, without racing
 
   // the worker: it owns a separate immutable copy of the batch.
@@ -2560,7 +2868,7 @@ void loop() {
 
   }
 
-  bool outage=failed||spool.count||WiFi.status()!=WL_CONNECTED;
+  bool outage=portalUploadPaused||failed||spool.count||WiFi.status()!=WL_CONNECTED;
 
   if(!stagedCount&&outage&&(now-lastSpill>=OUTAGE_FLUSH_MS||uxQueueMessagesWaiting(samplesQueue)>=96)) {
 
@@ -2586,7 +2894,7 @@ void loop() {
   if(otaServerReady)otaServer.handleClient(); // OTA request wins before another data job starts.
   if(nrfPackageUploadActive&&uptimeMs()-nrfPackageUploadLastAt>60000ULL)
     failNrfPackageUpload("upload timed out",408);
-  const bool otaMaintenanceNetworkBusy=serviceDeferredOtaLeaseRelease();
+  const bool otaMaintenanceNetworkBusy=portalUploadPaused?false:serviceDeferredOtaLeaseRelease();
 
   if(nrfDfuMode==NRF_DFU_PREPARE) {
     if(now>nrfDfuDeadlineAt||!cloudRecordingKnown||cloudRecording||spool.fault) {
@@ -2622,8 +2930,9 @@ void loop() {
     }
   }
 
+  if(!portalUploadPaused)serviceRemoteUpdate();
   const uint32_t queuedForUpload=uxQueueMessagesWaiting(samplesQueue);
-  if(shouldStartDataUpload(busy,nrfPackageUploadActive||otaMode==OTA_ACTIVE||nrfDfuMode==NRF_DFU_ACTIVE||nrfDfuMode==NRF_DFU_RECONNECT,otaMaintenanceNetworkBusy||otaLeaseReleasePending,now,due,
+  if(!portalUploadPaused&&shouldStartDataUpload(busy,nrfPackageUploadActive||otaMode==OTA_ACTIVE||nrfDfuMode==NRF_DFU_ACTIVE||nrfDfuMode==NRF_DFU_RECONNECT,otaMaintenanceNetworkBusy||otaLeaseReleasePending,now,due,
        activeCount,stagedCount,spool.count,queuedForUpload)) {
 
     // Preserve unreadable disk contents; current-boot RAM samples may still upload with stable UIDs.
@@ -2653,7 +2962,7 @@ void loop() {
 
       for(uint32_t i=0;i<activeCount;++i)cJSON_AddItemToArray(arr,sampleJson(active[i]));
 
-      cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=serializeHttpJson(root,job->jsonInPsram);cJSON_Delete(root);
+      cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));remoteAttach(root,job->remoteNonce);job->json=serializeHttpJson(root,job->jsonInPsram);cJSON_Delete(root);
 
       if(job->json&&xQueueSend(jobsQueue,&job,0)==pdTRUE){busy=true;activeJobHeartbeat=false;logEvent("Batch upload start n=%lu spool=%lu uptime=%llu ms",(unsigned long)activeCount,(unsigned long)spool.count,(unsigned long long)now);}
 
@@ -2664,7 +2973,7 @@ void loop() {
 
   const bool updateActive=nrfPackageUploadActive||otaMode!=OTA_NORMAL||nrfDfuMode!=NRF_DFU_NORMAL;
   const uint32_t heartbeatQueued=uxQueueMessagesWaiting(samplesQueue);
-  if(shouldStartHealthHeartbeat(busy||failed,updateActive,
+  if(!portalUploadPaused&&shouldStartHealthHeartbeat(busy||failed,updateActive,
        otaMaintenanceNetworkBusy||otaLeaseReleasePending,wifiState==WL_CONNECTED,
        now,healthHeartbeatDue,activeCount,stagedCount,spool.count,heartbeatQueued)) {
     UploadJob* job=new UploadJob();job->count=0;job->heartbeat=true;job->jsonInPsram=false;job->json=nullptr;
@@ -2672,7 +2981,7 @@ void loop() {
     char sensorIdSnapshot[17];portENTER_CRITICAL(&stateMux);memcpy(sensorIdSnapshot,connectedSensorId,sizeof(sensorIdSnapshot));portEXIT_CRITICAL(&stateMux);
     cJSON_AddStringToObject(root,"device_id",deviceId);cJSON_AddStringToObject(root,"sensor_id",sensorIdSnapshot);
     cJSON_AddArrayToObject(root,"samples");
-    cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));job->json=serializeHttpJson(root,job->jsonInPsram);cJSON_Delete(root);
+    cJSON_AddItemToObject(root,"health",healthJson(activeCount,stagedCount));remoteAttach(root,job->remoteNonce);job->json=serializeHttpJson(root,job->jsonInPsram);cJSON_Delete(root);
     if(job->json&&xQueueSend(jobsQueue,&job,0)==pdTRUE) {
       busy=true;activeJobHeartbeat=true;
       const uint64_t interval=lastHealthHeartbeatStart?now-lastHealthHeartbeatStart:0;

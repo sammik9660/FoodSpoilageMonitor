@@ -143,3 +143,11 @@ ESP32→nRF relay는 사용자 실기 성공이 보고되었다. 전원 차단, 
 2. Apps Script 변경은 새 deployment version으로 반영해야 하며 local source 변경만으로 운영 dashboard가 바뀌지 않는다.
 3. OTA/DFU 전에 recording STOPPED, queue/spool/HTTP 상태와 대상 device/sensor pairing을 확인한다.
 4. 측정값과 추정 배터리 잔량을 식품 섭취 안전이나 정밀 배터리 용량 판정으로 사용하지 않는다.
+
+## 인터넷 원격 업데이트 (2026-10-29)
+
+- 소스: `RemoteUpdateProtocol.h`, `RemoteUpdateClient.h`, `RemoteUpdateRuntime.h`, `RemoteUpdates.gs`, 기존 `Dashboard.html`의 원격 관리 영역.
+- 장치별 HMAC 명령·nonce·만료·NVS 순번으로 인증/재실행 방지, 승인된 HTTPS range 다운로드, 기존 ESP 서명 OTA/Legacy DFU 엔진 재사용, 클라우드 결과/최근 이력 표시를 구현했다.
+- 기존 로컬 업데이트는 유지한다. 외부 저장소와 인증 정보는 사용자가 설정해야 하며 구버전 장치에는 최초 1회 원격 지원 펌웨어 설치가 필요하다.
+- 호스트 명령/상태/장치 분리/오류 복구 테스트 및 ESP32 빌드 결과는 PROJECT_STATE에 기록한다. 실제 인터넷 OTA/DFU·스토리지 TLS·전원 차단은 실기 미검증이다.
+- 설정, 호스팅 선택, 보호 조건과 한계: [REMOTE_UPDATES.md](REMOTE_UPDATES.md).

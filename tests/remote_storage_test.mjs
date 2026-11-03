@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import worker from '../tools/remote_storage_worker.mjs';
+const token='a'.repeat(64),data=new Uint8Array(200000).map((_,i)=>i%251);let changed=false;
+const env={DOWNLOAD_TOKEN:token,RELEASES:{async head(key){return key==='releases/v22/gateway.ino.bin'?{size:data.length,httpEtag:'"fixed"'}:null;},async get(key,options){return {httpEtag:changed?'"changed"':'"fixed"',body:options.range?data.slice(options.range.offset,options.range.offset+options.range.length):data};}}};
+const request=(range,authorization='Bearer '+token,path='releases/v22/gateway.ino.bin')=>new Request('https://updates.example.invalid/'+path,{headers:{Authorization:authorization,...(range?{Range:range}:{})}});
+assert.equal((await worker.fetch(request('bytes=0-131071','wrong'),env)).status,401);
+let reply=await worker.fetch(request('bytes=0-131071'),env);assert.equal(reply.status,206);assert.equal(reply.headers.get('content-range'),'bytes 0-131071/200000');assert.equal((await reply.arrayBuffer()).byteLength,131072);
+reply=await worker.fetch(request('bytes=131072-199999'),env);assert.equal(reply.status,206);assert.equal(reply.headers.get('content-length'),'68928');
+assert.equal((await worker.fetch(request('bytes=0-999999'),env)).status,416);
+assert.equal((await worker.fetch(request('bytes=0-131072'),env)).status,416);
+assert.equal((await worker.fetch(request('bytes=0-1',undefined,'not-allowed/file'),env)).status,400);
+changed=true;assert.equal((await worker.fetch(request('bytes=0-9'),env)).status,409);
+console.log('PASS private storage adapter: auth, exact ranges, size bounds, path restriction, immutable object check');
