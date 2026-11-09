@@ -1,0 +1,5 @@
+DO NOT PUBLISH OR INSTALL DURING THE ACTIVE EXPERIMENT.
+This signed candidate keeps small mbedTLS allocations internal and directs large
+allocations to PSRAM first, with an internal fallback.
+Build and host tests passed; live TLS, BLE and spool behavior remain unverified.
+Review pending spool and recovery before any user-approved installation.

@@ -1,0 +1,4 @@
+DO NOT PUBLISH OR INSTALL WITHOUT REVIEW.
+This candidate moves large mbedTLS allocations to PSRAM to address TLS -32512.
+Build, signature and host tests passed; live TLS, BLE and spool behavior are unverified.
+The active experiment and unacknowledged spool data must be protected.

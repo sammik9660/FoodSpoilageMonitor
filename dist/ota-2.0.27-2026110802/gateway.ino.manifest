@@ -1,0 +1,6 @@
+FSGWOTA1
+target=esp32s3
+version=2.0.27
+build=2026110802
+sha256=4335742fe470f2dd6f4caf4593f467df9fd2e0a10f2a9fdcd9649b27cb94bef9
+signature=MEQCIBwlLGKPGHsjc5mr8uumkpjzDEbQjoyRYc/wKaB9jOdeAiBM5/Ep4bXqwsZRj00e9D3hgDWkPgCtpyIPFTb6KUFMFw==

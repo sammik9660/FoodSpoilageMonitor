@@ -1,0 +1,2 @@
+9ab1bbe43e51c9b9eec5e04387c9245abccf9a6d9e91d6d6d8c8f8f3bf4a2ce0  gateway.ino.bin
+dfee21da3567487f113e20a18b8e813b21b00682a63c8c19c07dfbab0b5818fc  gateway.ino.manifest

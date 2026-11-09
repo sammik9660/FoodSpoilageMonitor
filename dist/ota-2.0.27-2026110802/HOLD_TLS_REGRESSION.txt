@@ -1,0 +1,4 @@
+DO NOT PUBLISH OR INSTALL.
+Device 1 running 2.0.26 has repeated TLS -32512 allocation failures after BLE connects.
+This 2.0.27 package changes only the version/build from 2.0.26 and does not fix TLS.
+Keep the signed BIN and manifest for audit; prepare a new build after the cause is verified.

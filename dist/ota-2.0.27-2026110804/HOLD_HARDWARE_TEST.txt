@@ -1,0 +1,4 @@
+DO NOT PUBLISH OR INSTALL DURING THE ACTIVE EXPERIMENT.
+This signed candidate directs large mbedTLS allocations to PSRAM first.
+Host tests and ESP32 build passed, but TLS/ACK, BLE and spool behavior are not verified on hardware.
+Review the experiment and pending spool before any user-approved installation.
