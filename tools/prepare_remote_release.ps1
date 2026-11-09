@@ -12,7 +12,7 @@ if($PSVersionTable.PSVersion.Major -lt 7){throw 'PowerShell 7 is required.'}
 if($ReleaseId -notmatch '^[a-zA-Z0-9_-]{1,48}$'){throw 'Invalid release ID.'}
 $root=Split-Path $PSScriptRoot -Parent
 $BaseUrl=$BaseUrl.TrimEnd('/')
-if($BaseUrl -notmatch '^https://[a-z0-9.-]+(?:/[A-Za-z0-9/_-]+)?$' -or $BaseUrl.Contains('..')){throw 'Use an immutable HTTPS directory URL without redirects, credentials or query strings.'}
+if($BaseUrl -notmatch '^https://[a-z0-9.-]+(?:/[A-Za-z0-9/_.-]+)?$' -or $BaseUrl.Contains('..')){throw 'Use an immutable HTTPS directory URL without credentials or query strings.'}
 $entry=[ordered]@{id=$ReleaseId;kind=$Kind}
 if($Kind -eq 'esp32'){
   $bin=Join-Path $PackagePath 'gateway.ino.bin';$manifest=Join-Path $PackagePath 'gateway.ino.manifest'
@@ -38,4 +38,4 @@ if(Test-Path -LiteralPath $OutputFile){throw 'Output already exists; it will not
 $json=$entry|ConvertTo-Json -Depth 5
 [IO.File]::WriteAllText([IO.Path]::GetFullPath($OutputFile),$json)
 Write-Output "Catalog entry: $([IO.Path]::GetFullPath($OutputFile))"
-Write-Output 'No upload/deployment performed. Upload the original artifacts to the chosen HTTPS store; register this entry in REMOTE_UPDATE_CATALOG. The store must support Range/206 and Content-Length, with no redirect or compression.'
+Write-Output 'No upload/deployment performed. Upload the original artifacts to the chosen HTTPS store; register this entry in REMOTE_UPDATE_CATALOG. The store must support Range/206 and Content-Length. GitHub Release URLs require the gateway GitHub redirect-capable build.'

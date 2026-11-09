@@ -6,9 +6,15 @@
 #include <string.h>
 #include <math.h>
 
+#ifndef ENABLE_I2C_LCD
+#define ENABLE_I2C_LCD 0
+#endif
+
 namespace gateway_ui {
 
+#if ENABLE_I2C_LCD
 constexpr size_t LCD_COLUMNS = 16;
+#endif
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 30;
 constexpr uint32_t BUTTON_LONG_PRESS_MS = 3000;
 constexpr uint32_t BUTTON_RESET_PRESS_MS = 10000;
@@ -17,7 +23,9 @@ inline int wifiRegistrationSlot(int existingSlot, uint8_t count, uint8_t capacit
   return existingSlot >= 0 ? existingSlot : count < capacity ? count : -1;
 }
 
+#if ENABLE_I2C_LCD
 enum LcdMode : uint8_t { LCD_SENSOR, LCD_DEBUG };
+#endif
 enum CloudState : uint8_t { CLOUD_OFF, CLOUD_WAIT, CLOUD_OK };
 enum PixelState : uint8_t { PIXEL_BOOT, PIXEL_UPDATE, PIXEL_BLE_OFF, PIXEL_WIFI_OFF, PIXEL_WAIT, PIXEL_OK };
 enum WifiFeedback : uint8_t { WIFI_FEEDBACK_NONE, WIFI_FEEDBACK_CONNECT, WIFI_FEEDBACK_PORTAL,
@@ -48,6 +56,7 @@ inline uint32_t otaRainbowColor(uint8_t phase) {
   return ((uint32_t)(phase * 3) << 16) | (255 - phase * 3);
 }
 
+#if ENABLE_I2C_LCD
 inline void fixedLine(char out[LCD_COLUMNS + 1], const char* text) {
   size_t n = strlen(text);
   if (n > LCD_COLUMNS) n = LCD_COLUMNS;
@@ -84,10 +93,13 @@ inline void formatSensor(bool haveSample, float t, float h, float p, float g,
   snprintf(temp, sizeof(temp), "P:%.0f G:%s", p, gas);
   fixedLine(line2, temp);
 }
+#endif
 
+#if ENABLE_I2C_LCD
 inline const char* cloudText(CloudState state) {
   return state == CLOUD_OK ? "OK" : state == CLOUD_WAIT ? "WAIT" : "--";
 }
+#endif
 
 inline CloudState cloudState(bool wifiOnline, bool dataHttpBusy,
                              bool dataUploadFailed, bool heartbeatFailed,
@@ -97,6 +109,7 @@ inline CloudState cloudState(bool wifiOnline, bool dataHttpBusy,
            ? CLOUD_WAIT : CLOUD_OK;
 }
 
+#if ENABLE_I2C_LCD
 inline void formatDebug(bool ble, bool wifi, CloudState cloud, uint32_t queue,
                         uint32_t spool, bool recordingKnown, bool recording,
                         char line1[LCD_COLUMNS + 1], char line2[LCD_COLUMNS + 1]) {
@@ -109,6 +122,7 @@ inline void formatDebug(bool ble, bool wifi, CloudState cloud, uint32_t queue,
            recordingKnown ? (recording ? '1' : '0') : '-');
   fixedLine(line2, temp);
 }
+#endif
 
 inline PixelState pixelState(bool ble, bool wifi, CloudState cloud, bool backlog,
                              bool updateActive=false) {

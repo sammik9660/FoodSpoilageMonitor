@@ -32,11 +32,17 @@
 
 // ============================================================
 
+#ifndef ENABLE_I2C_LCD
+#define ENABLE_I2C_LCD 0
+#endif
+
 #include <WiFi.h>
 
+#if ENABLE_I2C_LCD
 #include <Wire.h>
 
 #include <LiquidCrystal_I2C.h>
+#endif
 
 #include <Adafruit_NeoPixel.h>
 
@@ -77,6 +83,7 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
+#include <mbedtls/platform.h>
 #include "ota_signing_key.h"
 
 #include <sys/time.h>
@@ -95,6 +102,7 @@
 #include "NrfDfuPackagePolicy.h"
 #include "WifiRecoveryPolicy.h"
 #include "RemoteUpdateClient.h"
+#include "TlsMemory.h"
 
 // Arduino-ESP32 3.3.12 NetworkManager::hostByName() clears lwIP's DNS cache
 // directly when the interface address state changes. With lwIP thread-safety
@@ -168,17 +176,22 @@ constexpr uint8_t WIFI_RESET_PIN=0;
 constexpr uint32_t WIFI_CONNECT_MS=wifi_recovery::CONNECT_TIMEOUT_MS;
 constexpr uint32_t WIFI_RETRY_MS=wifi_recovery::RETRY_CYCLE_MS;
 
+#if ENABLE_I2C_LCD
 constexpr uint8_t LCD_SDA_PIN=8, LCD_SCL_PIN=9, LCD_ADDRESS=0x27;
+#endif
 
 constexpr uint8_t NEOPIXEL_PIN=48, NEOPIXEL_BRIGHTNESS=24;
 
+#if ENABLE_I2C_LCD
 constexpr uint32_t LCD_REFRESH_MS=750;
+#endif
 
 // Hardware CDC/JTAG is the verified console. Mirroring every line to UART0 made
 // combined captures show each event twice; UART0 remains available as an opt-in.
-constexpr bool UART_DIAGNOSTICS=false;
-#define FSGW_VERSION "2.0.25"
-#define FSGW_BUILD 2026110101
+//constexpr bool UART_DIAGNOSTICS = false;
+constexpr bool UART_DIAGNOSTICS = true;
+#define FSGW_VERSION "2.0.28"
+#define FSGW_BUILD 2026110806
 #define FSGW_STRINGIFY_INNER(value) #value
 #define FSGW_STRINGIFY(value) FSGW_STRINGIFY_INNER(value)
 constexpr char FIRMWARE_VERSION[]=FSGW_VERSION;
@@ -323,13 +336,16 @@ struct WifiDiagnosticEvent {
 QueueHandle_t wifiDiagnosticQueue=nullptr;
 uint32_t wifiDiagnosticDrops=0;
 
+#if ENABLE_I2C_LCD
 LiquidCrystal_I2C lcd(LCD_ADDRESS,16,2);
+#endif
 
 Adafruit_NeoPixel gatewayPixel(1,NEOPIXEL_PIN,NEO_GRB+NEO_KHZ800);
 
+#if ENABLE_I2C_LCD
 bool lcdReady=false;
-
 LcdMode lcdMode=LCD_DEBUG;
+#endif
 
 ActiveLowButton bootButton;
 
@@ -339,9 +355,10 @@ uint32_t wifiPixelShownColor=0;
 bool otaRainbowActive=false;
 uint64_t otaRainbowStartedAt=0,otaRainbowLastFrameAt=0;
 
+#if ENABLE_I2C_LCD
 uint64_t lastLcdRefresh=0;
-
 char shownLcd[2][LCD_COLUMNS+1]={{0},{0}};
+#endif
 
 uint32_t uploadFailures=0, unassignedCount=0;
 
@@ -1597,6 +1614,7 @@ void setGatewayPixel(PixelState state) {
 
 }
 
+#if ENABLE_I2C_LCD
 void writeLcdLine(uint8_t row,const char line[LCD_COLUMNS+1]) {
 
   if(!lcdReady||row>1||!strncmp(shownLcd[row],line,LCD_COLUMNS))return;
@@ -1632,15 +1650,16 @@ void initGatewayLcd() {
   logEvent("LCD init: OK address=0x%02X 16x2",LCD_ADDRESS);logEvent("LCD MODE DEBUG");
 
 }
+#endif
 
 void updateGatewayUi(uint64_t now,bool wifi,CloudState cloud,uint32_t queueDepth,
 
                      uint32_t spoolDepth,bool recordingKnown,bool recording,bool backlog,
                      bool updateActive) {
 
-  bool ble;Sample sample;bool sampleKnown;
+  bool ble;
 
-  portENTER_CRITICAL(&stateMux);ble=bleConnected;sample=latest;sampleKnown=haveLatest;portEXIT_CRITICAL(&stateMux);
+  portENTER_CRITICAL(&stateMux);ble=bleConnected;portEXIT_CRITICAL(&stateMux);
 
   if(otaRainbowActive) {
     if(otaRainbowVisible(otaRainbowStartedAt,now)) {
@@ -1675,6 +1694,9 @@ void updateGatewayUi(uint64_t now,bool wifi,CloudState cloud,uint32_t queueDepth
     }
   }
 
+#if ENABLE_I2C_LCD
+  Sample sample;bool sampleKnown;
+  portENTER_CRITICAL(&stateMux);sample=latest;sampleKnown=haveLatest;portEXIT_CRITICAL(&stateMux);
   if(!lcdReady||now-lastLcdRefresh<LCD_REFRESH_MS)return;
 
   lastLcdRefresh=now;char line1[LCD_COLUMNS+1],line2[LCD_COLUMNS+1];
@@ -1684,6 +1706,7 @@ void updateGatewayUi(uint64_t now,bool wifi,CloudState cloud,uint32_t queueDepth
   else formatDebug(ble,wifi,cloud,queueDepth,spoolDepth,recordingKnown,recording,line1,line2);
 
   writeLcdLine(0,line1);writeLcdLine(1,line2);
+#endif
 
 }
 
@@ -2616,6 +2639,7 @@ void setup() {
   jobsQueue=xQueueCreate(1,sizeof(UploadJob*));resultsQueue=xQueueCreate(1,sizeof(UploadResult));
 
   if(!logMutex||!samplesQueue||!jobsQueue||!resultsQueue){Serial0.println("FATAL allocation failed");while(true)delay(1000);}
+  logEvent("TLS PSRAM-preferred allocator status=%d",mbedtls_platform_set_calloc_free(gatewayTlsCalloc,gatewayTlsFree));
 
   wifiDiagnosticQueue=xQueueCreate(16,sizeof(WifiDiagnosticEvent));
   if(wifiDiagnosticQueue)WiFi.onEvent(captureWifiDiagnosticEvent);
@@ -2630,7 +2654,10 @@ void setup() {
     portEXIT_CRITICAL(&stateMux);
   },ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
-  initGatewayPixel();initGatewayLcd();
+  initGatewayPixel();
+#if ENABLE_I2C_LCD
+  initGatewayLcd();
+#endif
 
   uint32_t random[4];esp_fill_random(random,sizeof(random));
 
@@ -2651,7 +2678,7 @@ void setup() {
     otaPendingVerify=true;otaBootAt=uptimeMs();logEvent("OTA boot pending self-check; rollback remains enabled");
   }
   const esp_partition_t* spiffsPartition=esp_partition_find_first(
-    ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_SPIFFS,nullptr);
+    ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_SPIFFS,"spiffs");
   if(spiffsPartition)logEvent("SPIFFS partition offset=0x%lx size=0x%lx",
     (unsigned long)spiffsPartition->address,(unsigned long)spiffsPartition->size);
   else logEvent("ERROR SPIFFS partition missing");
@@ -2763,9 +2790,11 @@ void loop() {
 
   ButtonEvents button=bootButton.update(digitalRead(WIFI_RESET_PIN)==HIGH,now);
 
+#if ENABLE_I2C_LCD
   if(button.shortPress){lcdMode=lcdMode==LCD_DEBUG?LCD_SENSOR:LCD_DEBUG;
 
     logEvent(lcdMode==LCD_SENSOR?"LCD MODE SENSOR":"LCD MODE DEBUG");lastLcdRefresh=0;}
+#endif
 
   if(button.longPress){logEvent("Wi-Fi add portal; saved networks and spool preserved");
     wifiTrying=false;requestWifiPortal();}

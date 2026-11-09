@@ -170,6 +170,7 @@ int main(){
  endCooling();envCycle(testMillis+10);
  // Millis wrap across an ambient forced conversion must preserve the 120 s schedule.
  testMillis=UINT32_MAX-20;nextGasScan=1000000;nextEnvMeasurement=testMillis;
+ lastEnvironmentProgressAt=testMillis;lastProgressRecoveryAt=testMillis; // move all progress clocks with simulated uptime
  lastHealth=testMillis;loop();assert(envConversionPending&&nextEnvMeasurement<ENV_INTERVAL_MS);
  testFields.push_back(field(0,200,0,0x80));testMillis=nextMeasurement;lastHealth=testMillis;loop();
  assert(envReadOK&&envSequence>=4);

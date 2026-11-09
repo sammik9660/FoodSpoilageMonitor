@@ -15,21 +15,25 @@ uint64_t uptimeMs(){return ticks;}uint64_t utcMs(){return 1800000000000ULL+ticks
 #define portEXIT_CRITICAL(x) ((void)0)
 int otaIngressMutex=0,stateMux=0;void xSemaphoreTake(int,int){}void xSemaphoreGive(int){}
 struct {int status(){return 3;}} WiFi;
-constexpr int WL_CONNECTED=3,HTTPC_DISABLE_FOLLOW_REDIRECTS=0,FILE_WRITE=1;
+constexpr int WL_CONNECTED=3,HTTPC_DISABLE_FOLLOW_REDIRECTS=0,FILE_READ=0,FILE_WRITE=1;
 bool strictTls=false,cloudOK=true,validSignature=true,validZip=true,wrongRange=false,cutDownload=false,writeFail=false;
-unsigned commits=0,reboots=0,dfuStarts=0;std::string failState;
+unsigned commits=0,reboots=0,dfuStarts=0,redirectCount=0;std::string failState;
+size_t readLimit=17;
+size_t spiffsTotal=900000;
 std::map<std::string,std::vector<uint8_t>> disk,web;
+std::map<std::string,std::string> redirects;
 struct File{std::vector<uint8_t>* value=nullptr;operator bool()const{return value;}
- size_t write(const uint8_t* p,size_t n){if(!value||writeFail)return 0;value->insert(value->end(),p,p+n);return n;}void flush(){}void close(){value=nullptr;}};
+ size_t write(const uint8_t* p,size_t n){if(!value||writeFail)return 0;value->insert(value->end(),p,p+n);return n;}size_t size()const{return value?value->size():0;}void flush(){}void close(){value=nullptr;}};
 struct {bool exists(const char* p){return disk.count(p);}bool remove(const char* p){return disk.erase(p)>0;}
- File open(const char* p,int){disk[p].clear();return {&disk[p]};}size_t totalBytes(){return 900000;}size_t usedBytes(){size_t n=0;for(auto& i:disk)n+=i.second.size();return n;}} SPIFFS;
+ File open(const char* p,int mode){if(mode==FILE_READ)return disk.count(p)?File{&disk[p]}:File{};disk[p].clear();return {&disk[p]};}size_t totalBytes(){return spiffsTotal;}size_t usedBytes(){size_t n=0;for(auto& i:disk)n+=i.second.size();return n;}} SPIFFS;
 struct GatewaySecureClient{void useBuiltinCACertBundle(){strictTls=true;}void setInsecure(){strictTls=false;}void setHandshakeTimeout(int){}void stop(){}};
 struct Stream{std::vector<uint8_t> data;size_t at=0;int available(){return cutDownload&&at>=data.size()/2?0:(int)(data.size()-at);}
- int readBytes(uint8_t* p,size_t n){n=min(n,(size_t)17);memcpy(p,data.data()+at,n);at+=n;ticks+=10;return (int)n;}};
-struct HTTPClient{std::string url,range;Stream stream;unsigned total=0,start=0,last=0;
+ int readBytes(uint8_t* p,size_t n){n=min(n,readLimit);memcpy(p,data.data()+at,n);at+=n;ticks+=10;return (int)n;}};
+struct HTTPClient{std::string url,range,authorization;Stream stream;unsigned total=0,start=0,last=0;
  void setReuse(bool){}void setFollowRedirects(int){}void setConnectTimeout(int){}void setTimeout(int){}void collectHeaders(const char**,int){}
- bool begin(GatewaySecureClient&,const char* p){url=p;return true;}void addHeader(const char* k,const String& v){if(std::string(k)=="Range")range=v.c_str();}
- int GET(){assert(strictTls);if(!web.count(url))return 404;auto& bytes=web[url];total=(unsigned)bytes.size();sscanf(range.c_str(),"bytes=%u-%u",&start,&last);if(last>=total)return 416;stream.data.assign(bytes.begin()+start,bytes.begin()+last+1);return 206;}
+ bool begin(GatewaySecureClient&,const char* p){url=p;return true;}void addHeader(const char* k,const String& v){if(std::string(k)=="Range")range=v.c_str();if(std::string(k)=="Authorization")authorization=v.c_str();}
+ int GET(){assert(strictTls);if(redirects.count(url)){assert(authorization.empty());redirectCount++;return 302;}if(!web.count(url))return 404;auto& bytes=web[url];total=(unsigned)bytes.size();sscanf(range.c_str(),"bytes=%u-%u",&start,&last);if(last>=total)return 416;stream.data.assign(bytes.begin()+start,bytes.begin()+last+1);return 206;}
+ String getLocation(){return redirects[url];}
  int getSize(){return (int)stream.data.size();}String header(const char* key){if(std::string(key)!="Content-Range")return "";char v[80];snprintf(v,sizeof(v),"bytes %u-%u/%u",wrongRange?start+1:start,last,total);return v;}
  Stream* getStreamPtr(){return &stream;}bool connected(){return stream.available()>0;}void end(){}
 };
@@ -50,9 +54,9 @@ bool validateNrfPackageAt(const char*,NrfLegacyDfuRelay::PackageInfo&,char*,size
 bool promoteNrfPackage(char*,size_t){disk[nrf_dfu_package::FINAL_PATH]=disk[nrf_dfu_package::TEMP_PATH];disk.erase(nrf_dfu_package::TEMP_PATH);return true;}
 struct Client {
  struct Record{uint32_t seq=0;char id[33]={},kind[6]={},version[24]={},build[21]={},state[16]="IDLE",error[49]={};uint8_t percent=0;}record;
- remote_update::Command pending;bool queued=false,active=false,ready=true;uint64_t nextPoll=0;
+ remote_update::Command pending;bool queued=false,active=false,ready=true;uint64_t nextPoll=0;std::string token;
  bool enabled(){return ready;}bool requiresCloudTls(){return true;}void begin(const char*){}
- const char* hosts(){return "updates.example.invalid";}const char* downloadToken(){return "";}
+ const char* hosts(){return "updates.example.invalid,github.com";}const char* downloadToken(){return token.c_str();}
  bool configure(const String&,const String&,const String&){return true;}
  bool state(const char* state,const char* error="",uint8_t pct=0){if(failState==state){failState.clear();ready=false;return false;}strcpy(record.state,state);strcpy(record.error,error);record.percent=pct;return true;}
  bool take(remote_update::Command& c,uint32_t){if(!queued||active)return false;c=pending;queued=false;active=true;strcpy(record.kind,c.kind);strcpy(record.version,c.version);strcpy(record.build,c.build);record.seq=c.seq;return true;}
@@ -78,7 +82,7 @@ static void hash(const std::vector<uint8_t>& bytes,char out[65]){uint8_t d[32];a
 static void reset(const char* kind){
  remote_runtime::stage=remote_runtime::NONE;remote_runtime::ownsTemp=false;remote_runtime::hashStarted=false;remote_runtime::zip.close();
  remoteClient=Client{};failState.clear();otaMode=OTA_NORMAL;nrfDfuMode=NRF_DFU_NORMAL;remoteOwnsUpdate=false;otaPendingSamples=0;otaHttpBusy=false;bleConnected=false;otaLeaseHeld=false;otaLeaseReleasePending=false;otaPendingVerify=false;nrfDfuHasResult=false;nrfDfuLastSuccess=false;haveLatest=false;environmentState.known=false;
- cloudOK=validSignature=validZip=true;wrongRange=cutDownload=writeFail=false;commits=reboots=dfuStarts=0;written.clear();disk.clear();web.clear();
+ cloudOK=validSignature=validZip=true;wrongRange=cutDownload=writeFail=false;commits=reboots=dfuStarts=redirectCount=0;readLimit=17;spiffsTotal=900000;written.clear();disk.clear();web.clear();redirects.clear();
  disk["/spool-preserved"]={1,2,3};disk[nrf_dfu_package::FINAL_PATH]={4,5,6};ticks=100;strcpy(FIRMWARE_VERSION,"2.0.21");OTA_BUILD_NUMBER=2026102706;
  auto& c=remoteClient.pending;strcpy(c.kind,kind);strcpy(c.version,!strcmp(kind,"esp32")?"2.0.22":"2.0.12");strcpy(c.build,"2026102801");strcpy(c.sensor,targetSensorId);c.expires=(uint32_t)(utcMs()/1000)+600;c.seq=1;c.bytes=300;
  strcpy(c.url,"https://updates.example.invalid/image");web[c.url]=std::vector<uint8_t>(c.bytes,0x5a);hash(web[c.url],c.sha);
@@ -93,9 +97,34 @@ int main(){
  reset("nrf");prepare();cutDownload=true;serviceRemoteUpdate();assert(!strcmp(remoteClient.record.state,"FAILED"));assert(disk[nrf_dfu_package::FINAL_PATH]==std::vector<uint8_t>({4,5,6}));assert(!disk.count(nrf_dfu_package::TEMP_PATH));
  reset("nrf");prepare();serviceRemoteUpdate();assert(remote_runtime::stage==remote_runtime::WAIT_SENSOR&&dfuStarts==0);bleConnected=true;otaLeaseReleasePending=false;serviceRemoteUpdate();assert(dfuStarts==1);nrfDfuMode=NRF_DFU_NORMAL;nrfDfuHasResult=nrfDfuLastSuccess=true;serviceRemoteUpdate();assert(strcmp(remoteClient.record.state,"SUCCESS"));haveLatest=true;latest.receivedUptime=nrfDfuTransferStartedAt+1;serviceRemoteUpdate();assert(!strcmp(remoteClient.record.state,"SUCCESS"));
  reset("esp32");serviceRemoteUpdate();ticks+=601000;otaLeaseHeld=true;serviceRemoteUpdate();assert(!strcmp(remoteClient.record.error,"COMMAND_EXPIRED")&&commits==0);
- reset("nrf");spool.budget=900000;serviceRemoteUpdate();otaLeaseHeld=true;serviceRemoteUpdate();assert(!strcmp(remoteClient.record.error,"SPOOL_RESERVE_SPACE")&&disk[nrf_dfu_package::FINAL_PATH].size()==3);spool.budget=500000;
+ reset("nrf");spool.budget=950000;serviceRemoteUpdate();otaLeaseHeld=true;serviceRemoteUpdate();assert(!strcmp(remoteClient.record.error,"SPOOL_RESERVE_SPACE")&&disk[nrf_dfu_package::FINAL_PATH].size()==3);spool.budget=500000;
+ reset("nrf");spiffsTotal=836081;spool.budget=501648;disk[nrf_dfu_package::FINAL_PATH]=std::vector<uint8_t>(177274,0x42);
+ remoteClient.pending.bytes=177274;web[remoteClient.pending.url]=std::vector<uint8_t>(177274,0x5a);hash(web[remoteClient.pending.url],remoteClient.pending.sha);
+ prepare();assert(remote_runtime::stage==remote_runtime::DOWNLOAD&&disk[nrf_dfu_package::FINAL_PATH].size()==177274);spool.budget=500000;
  reset("esp32");serviceRemoteUpdate();otaLeaseHeld=true;failState="DOWNLOADING";serviceRemoteUpdate();assert(commits==0&&otaMode==OTA_NORMAL);serviceRemoteUpdate();assert(!remoteOwnsUpdate);
  reset("nrf");prepare();serviceRemoteUpdate();bleConnected=true;otaLeaseReleasePending=false;failState="UPDATING";serviceRemoteUpdate();assert(dfuStarts==0);serviceRemoteUpdate();assert(!remoteOwnsUpdate);
  reset("esp32");otaMode=OTA_PREPARE;serviceRemoteUpdate();assert(otaMode==OTA_PREPARE&&commits==0); // a remote command cannot cancel a local session
+ const char* asset="https://release-assets.githubusercontent.com/github-production-release-asset/123/file?se=tomorrow&sig=test";
+ assert(remote_update::githubAssetRedirect(asset));
+ assert(!remote_update::githubAssetRedirect("http://release-assets.githubusercontent.com/github-production-release-asset/123/file?sig=x"));
+ assert(!remote_update::githubAssetRedirect("https://release-assets.githubusercontent.com.evil/github-production-release-asset/123/file?sig=x"));
+ assert(!remote_update::githubAssetRedirect("https://release-assets.githubusercontent.com/github-production-release-asset/123/file#fragment"));
+ reset("esp32");
+ auto image=web[remoteClient.pending.url],signedManifest=web[remoteClient.pending.manifestUrl];
+ image.resize(remote_update::CHUNK_BYTES+32,0x5a);remoteClient.pending.bytes=(uint32_t)image.size();hash(image,remoteClient.pending.sha);readLimit=4096;
+ strcpy(remoteClient.pending.url,"https://github.com/example/releases/download/v1/gateway.ino.bin");
+ strcpy(remoteClient.pending.manifestUrl,"https://github.com/example/releases/download/v1/gateway.ino.manifest");
+ redirects[remoteClient.pending.url]=asset;
+ redirects[remoteClient.pending.manifestUrl]="https://release-assets.githubusercontent.com/github-production-release-asset/123/manifest?se=tomorrow&sig=test";
+ web[asset]=image;web[redirects[remoteClient.pending.manifestUrl]]=signedManifest;
+ prepare();for(int i=0;i<7&&!commits;++i)serviceRemoteUpdate();
+ assert(commits==1&&redirectCount==3&&written==image);
+ reset("esp32");strcpy(remoteClient.pending.url,"https://github.com/example/releases/download/v1/gateway.ino.bin");
+ redirects[remoteClient.pending.url]="https://untrusted.example.invalid/file";
+ prepare();serviceRemoteUpdate();serviceRemoteUpdate();
+ assert(!strcmp(remoteClient.record.error,"DOWNLOAD_REDIRECT_REJECTED")&&commits==0);
+ reset("esp32");strcpy(remoteClient.pending.url,"https://github.com/example/releases/download/v1/gateway.ino.bin");
+ remoteClient.token="private-store-token";prepare();serviceRemoteUpdate();serviceRemoteUpdate();
+ assert(!strcmp(remoteClient.record.error,"DOWNLOAD_AUTH")&&redirectCount==0&&commits==0);
  std::cout<<"PASS real remote runtime: safety drain, HTTPS/header/hash/write failures, preserved spool/ZIP, boot validation and nRF version+new-data completion\n";
 }

@@ -53,6 +53,7 @@ def reconstruct(rows):
                 for step, row in enumerate(ordered):
                     status = int(row["sensor_status"])
                     if (int(row["gas_index"]) != step or status & 0xB0 != 0xB0 or
+                        not 0 <= int(row['meas_index']) <= 255 or not 0 < int(row['nrf_seq']) <= 0xffffffff or
                         any(str(row[name]).lower() not in ("true", "1") for name in
                             ("gas_valid", "heater_stable", "measurement_valid")) or
                         not all(math.isfinite(float(row[name])) for name in

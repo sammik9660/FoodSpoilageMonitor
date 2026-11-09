@@ -15,7 +15,7 @@ class OutageSpool {
   bool begin() {
     // Mount failure is not evidence of an empty filesystem. Formatting here
     // would silently erase unacknowledged v2/v3 chunks.
-    mounted=SPIFFS.begin(false);
+    mounted=SPIFFS.begin(false,"/spiffs",10,"spiffs");
     if(!mounted) { fault=true; return false; }
     budget=SPIFFS.totalBytes()*60/100; // leave GC/metadata and other files headroom
     File root=SPIFFS.open("/");

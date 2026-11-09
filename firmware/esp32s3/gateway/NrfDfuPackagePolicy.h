@@ -18,4 +18,14 @@ inline size_t temporaryCapacity(size_t total, size_t used, size_t spoolReserve) 
   return available < MAX_PACKAGE_BYTES ? available : MAX_PACKAGE_BYTES;
 }
 
+// Only while recording is STOPPED, all pending samples are drained and BLE
+// ingress is paused. Both ZIPs must fit during download, and the FULL normal
+// spool reserve must fit again after the old ZIP is removed on promotion.
+inline size_t pausedIngressCapacity(size_t total,size_t used,size_t oldZipBytes,size_t spoolReserve) {
+  if(oldZipBytes>used||used>=total||total-used<=FILESYSTEM_HEADROOM_BYTES)return 0;
+  const size_t overlap=total-used-FILESYSTEM_HEADROOM_BYTES;
+  const size_t afterPromotion=temporaryCapacity(total,used-oldZipBytes,spoolReserve);
+  return overlap<afterPromotion?overlap:afterPromotion;
+}
+
 }  // namespace nrf_dfu_package

@@ -1,3 +1,133 @@
+## 2026-11-09 Device 1 nRF 2.0.14 인터넷 원격 Legacy DFU 사용자 실기 성공
+
+- 사용자가 대시보드 `업데이트 검증 성공 · nrf 2.0.14`, ESP 2.0.28/build 2026110806, nRF 2.0.14를 보고했다. 첨부 시리얼은 기존 SPIFFS total=836081/used=163652/old_zip=162102/spool_reserve=501648에서 normal=162589<요청177274이나 안전한 paused=324691로 새 ZIP을 기존 ZIP과 함께 저장할 수 있었음을 보여준다. BLE DFU bootloader 진입, MTU 247에서 20-byte payload/PRN 8, application 176412/176412 전송, activate/reset, 같은 sensor_id 재연결과 firmware 2.0.14 확인을 관측했다. 이후 Google POST→redirect GET 200과 application ACK, 새 BLE seq 및 spool 기록/재전송 시작도 관측했다. Dashboard SUCCESS는 기대 센서 버전과 DFU 뒤 새 측정 데이터가 확인된 후 보고된다. 첨부 로그는 후속 데이터 업로드 도중 끝나므로 최종 queue/spool=0과 장시간 ENV/GAS 지속성은 별도 확인 대상이다. 같은 내용의 시리얼 줄이 두 번씩 보이는 것은 이 덤프만으로 두 차례 DFU 수행 증거가 아니다.
+
+## 2026-11-09 16MB 파티션 재배치 후보 (격리 빌드, 장치 미적용)
+
+- 기존 활성 `firmware/esp32s3/gateway/partitions.csv`와 기존 signed OTA 패키지는 그대로다. 별도 `partitions.16m-spiffs3m-ai5m.csv`는 NVS 0x9000/20KiB, otadata 0xE000/8KiB, app0 0x10000/3MiB, 옛 SPIFFS 0x310000/896KiB(`spiffs_legacy`), coredump 0x3F0000/64KiB, app1 0x400000/3MiB를 원래 위치에 두고 새 `spiffs` 0x700000/3MiB, 모델 예약 data subtype 0x40 0xA00000/5MiB, 끝 1MiB 여유를 둔다. 앱 슬롯 축소나 기존 데이터 영역 이동은 하지 않는다. `Spool.begin`은 라벨 `spiffs`를 명시해 구/신 테이블에서 동일한 이름의 활성 파일시스템을 마운트하고, 진단도 해당 라벨을 사용한다. 자동 포맷은 여전히 false다.
+- ESP-IDF `gen_esp32part.py`가 후보 CSV를 변환·검증했고, 오프셋/정렬/겹침/16MB 경계 호스트 테스트를 통과했다. 격리된 후보 스케치(활성 소스와 후보 CSV 복사) Arduino core 3.3.12/16MB/custom/OPI/EraseNone 빌드 종료 코드 0, 681.2초, app BIN 1,650,192 bytes, static RAM 71,056 bytes. 실제 빌드 partitions.bin은 독립 변환 결과와 SHA-256 일치하고 앱은 두 3MiB 슬롯에 들어간다. 기존 spool CRC/FIFO/ACK/재부팅 복원 테스트는 라벨 지정 이후에도 통과했다. 새 SPIFFS가 비어 있으면 그대로는 마운트되지 않으므로 기존 파일의 raw 백업·검증·3MiB 이미지 생성/복원을 먼저 해야 한다.
+- `docs/ESP32_16MB_PARTITION_CANDIDATE.md`에 현행 정책 유지, 기존 SPIFFS 확장/새 영역 비교, STOPPED·ACK·spool 배출 후 USB 읽기 백업, 활성 OTA 슬롯 확인, 새 filesystem 이미지 검증과 승인된 USB 플래시 절차를 기록했다. USB ROM 부트로더 접근·실제 백업/마이그레이션/포맷/파티션 플래시·운영 서버 배포는 수행하지 않았다. 사용자의 별도 파티션 적용 승인 전까지 후보는 빌드 산출물로만 보관한다.
+
+## 2026-11-09 원격 nRF DFU 저장 공간 및 이메일 60초 경보 정책 (로컬 검증)
+
+- 실제 `partitions.csv`: NVS 0x9000/0x5000, otadata 0xE000/0x2000, app0 0x10000/0x300000, SPIFFS 0x310000/0xE0000(896KiB), coredump 0x3F0000/0x10000, app1 0x400000/0x300000. Flash 16MiB의 0x700000~0xFFFFFF는 9MiB 미할당이다. 파티션 테이블과 포맷은 변경하지 않았다. 사용자 실기 SPIFFS.totalBytes=836081, spool budget=501648, spool 데이터 0은 관측됐으나 기존 ZIP을 포함한 전체 SPIFFS.usedBytes는 로그가 없어 미확인이다.
+- 현재 파티션을 유지하는 최소 정책: 기존 temporaryCapacity는 로컬 ZIP 업로드와 평상시 full reserve용으로 유지한다. 원격 DFU만 STOPPED·미전송 데이터 0·BLE 수신 중단·HTTP 유휴를 확인한 `otaSafeState()` 이후 기존 ZIP 크기를 읽고, 새 ZIP까지 물리적으로 들어가며 교체 후에는 원래 spool reserve 전체가 복원되는지 함께 검사한다. 8KiB 파일시스템 여유와 기존 ZIP은 SHA/ZIP 검증 전까지 보존하고 실패 시 임시 파일만 정리한다. 두 조건 중 하나라도 부족하면 `SPOOL_RESERVE_SPACE`로 거부한다. total/used/old_zip/normal/paused/requested 크기를 로그에 남긴다. 기존·새 ZIP이 각각 177,274 bytes인 경우는 정책 호스트 테스트에서 허용, 물리적 겹침이나 교체 후 reserve가 부족하면 거부됨을 확인했다. 장기적으로 더 큰 ZIP이 필요하면 9MiB 미할당 영역의 별도 DFU 파티션이 적합하지만 파티션 변경·마이그레이션·USB 재플래시는 별도 승인 전 미수행이다.
+- `Monitoring.gs`는 동일 장애 최초 관찰 60초 지속 후 1회 ACTIVE, 지속 중 반복 없음, 복구 시 1회 RECOVERED, 60초 미만 복구 무알림으로 바꿨다. 마지막 heartbeat/ACK 시각을 아는 연결 장애는 실제 경과시간이 60초를 넘는 첫 1분 트리거에서 경고한다. incident 상태는 기존 `MONITOR_V1:<device>` Script Property에 유지하고 구형 `next` 상태를 이미 발송된 사건으로 해석한다. 실패한 이메일의 5분 재시도·기존 기록 알림/ACK는 유지한다. Apps Script 운영 배포·트리거/메일/SMS 실행은 하지 않았다.
+- 관련 원격 런타임/DFU 공간 C++ 테스트, 이메일 모의 테스트(재발·복구 포함), Apps Script 구문 및 cloud/remote/파티션 회귀, `git diff --check` 통과. 최종 ESP32 core 3.3.12 16MB/custom/OPI 전체 빌드 종료 코드 0: sketch 1,650,035 bytes, static RAM 71,056 bytes, 101.4초. 실제 원격 DFU와 수신·복구는 미검증이다. 기존 LCD 작업과 무관한 UART_DIAGNOSTICS=true 대 false 기대값 테스트 실패는 그대로 남기고 테스트를 약화하지 않았다.
+
+## 2026-11-09 nRF 원격 DFU 최신 실패 원인 확정 (데이터 보존)
+
+- 사용자가 Apps Script `REMOTE_JOB_24e27bd4db1c`를 읽어 최신 seq=3/nrf 2.0.14 명령의 `state=FAILED`, `percent=0`, `error=SPOOL_RESERVE_SPACE`를 확인했다. 이전 history에는 UNCONFIRMED 및 같은 공간 오류의 FAILED가 있다. 실제 원격 명령은 ESP32에 전달됐으나 `RemoteUpdateRuntime.h`의 새 ZIP 임시 저장 용량 검사에서 거부돼 BLE DFU 전송이 시작되지 않았다. `nrf-dfu/status`는 현재 부팅 이후 IDLE/기존 package_valid=true/센서 2.0.13을 보고한다. 현재 RECORDING은 DFU 당시 STOPPED였다는 사용자 보고와 시점이 달라 첫 실패 원인이 아니다. 재시도의 `Cloud is busy`는 독립적인 250ms Script Lock 충돌이다.
+- SPIFFS 총 836,081 bytes, spool reserve 501,648 bytes, 파일시스템 headroom 8,192 bytes, 새 ZIP 177,274 bytes이므로 기존 다른 파일은 148,967 bytes 이하여야 한다. 기존 유효 ZIP 하나만 149KB를 넘겨도 공간 검사에서 차단된다. `spool_depth=0`은 다른 SPIFFS 패키지 크기를 뜻하지 않는다. 기존 ZIP·spool을 삭제하거나 reserve를 낮추지 않았고 실제 장치 변경도 없다. 다음 단계는 기존 ZIP 백업/공간 확인과 명시적 사용자 선택을 전제로 해야 한다.
+
+## 2026-11-09 nRF 원격 DFU 결과 미확인 (원인 조사 중)
+
+- 사용자는 Device 1의 클라우드 `선택 장치 업데이트 승인`으로 nRF 2.0.14 명령을 시작했다고 보고했다. 대시보드는 `장치 결과 미확인 · nrf 2.0.14`, 마지막 보고 오후 1:55:42, ESP 2.0.28/build 2026110806, nRF 2.0.13 및 `실험 종료됨`을 표시했다. 같은 시점 Diagnostics는 BLE connected, cloud ACK 최근, `ota_state=IDLE`, queue=0, spool=0, sensor 정상이다. GitHub `nrf-v2.0.14` Release에는 로컬 검증 ZIP과 동일한 SHA-256의 파일이 게시돼 있다. 이는 DFU 성공 증거가 아니며 명령 전달·다운로드·저장·BLE DFU 중 어느 단계가 실패했는지는 로컬 `/nrf-dfu/status` 없이 확정하지 않는다. 원격 명령 결과가 보고되지 않을 경우 cloud 예약은 최대 명령 10분+실행 20분 후 UNCONFIRMED로 표시된다. 이후 사용자 재승인은 `Cloud is busy; retry approval later`로 250ms script tryLock 획득에 실패해 새 명령을 만들기 전에 거부됐다. 장치 재부팅·추가 DFU·데이터 삭제는 수행하지 않았다.
+
+## 2026-11-09 ESP32 I2C LCD 기본 비활성 (로컬 빌드, 장치 미적용)
+
+- 사용자 요청에 따라 `ENABLE_I2C_LCD=0`을 기본값으로 두고 GatewayUi LCD 포맷/모드, gateway의 Wire/LiquidCrystal include, LCD 객체·I2C 스캔·초기화·주기 갱신·BOOT 짧은 누름 화면 전환만 컴파일에서 제외했다. NeoPixel 상태, BOOT 3~10초 Wi-Fi 설정/10초 초기화, BLE/TLS/OTA/DFU/spool 경로는 그대로다. LCD 활성 포맷 테스트는 명시적 `ENABLE_I2C_LCD=1`로 유지하고 기본 비활성 버튼/픽셀 테스트를 추가했다.
+- ESP32 core 3.3.12 기존 16MB/custom/OPI/CDC/EraseNone 빌드 종료 코드 0, 648.5초. 현재 compile_commands.json에 LiquidCrystal_I2C 및 Wire가 없어 실제 빌드 의존성이 제거됐다. sketch 1,649,559 bytes, static RAM 71,056 bytes, BIN 1,649,712 bytes. 기존 서명된 2.0.28 BIN 1,666,672 bytes 대비 16,960 bytes 감소했지만 현재 작업트리의 별도 UART_DIAGNOSTICS=true 수동 변경도 포함돼 LCD 단독 효과로 단정하지 않는다. 이전 빌드 경과 시간 기록이 없어 시간 단축률 비교는 미검증이다.
+- gateway UI LCD on/off 호스트 테스트, Wi-Fi 포털, OTA 파티션, 원격 업데이트 cloud 테스트, git diff --check 통과. 전체 `test_reliability.ps1`은 LCD와 무관하게 `gateway_update_access_test.py`가 현재 사용자 작업트리의 `UART_DIAGNOSTICS=true`에 대해 기존 false 기대값으로 실패했다. 사용자 시리얼 변경을 되돌리거나 테스트 기대값을 약화하지 않았다. 새 빌드 BIN은 서명/배포하지 않았으며 기존 dist 패키지·장치·SPIFFS/NVS는 변경하지 않았다.
+
+## 2026-11-09 nRF 2.0.14 Legacy DFU 시험 ZIP 생성 (장치 미적용)
+
+- 사용자가 nRF 원격 DFU 경로 시험을 위해 기존 생성기 사용을 요청했다. 로컬 센서 `bme688_node.ino`는 실기 2.0.13과 동일성 미확인인 미커밋 ProgressGuard 복구 변경을 포함하므로 안전 버전 원본으로 취급하지 않는다. 다른 측정 코드를 수정하지 않고 `SENSOR_FIRMWARE_VERSION`만 2.0.13→2.0.14로 올렸다.
+- 기존 `NRF_DFU_만들기.bat`의 PowerShell 생성기를 실행했다. 샌드박스의 ARM 컴파일러 DLL 오류 뒤 동일 명령을 샌드박스 밖에서 한 번 실행해 Adafruit nRF52 core 1.7.0/Feather52840/S140 6.1.1 전체 컴파일·application-only Legacy DFU 0.5 ZIP 생성에 성공했다. `data/nrf-dfu-2.0.14/bme688-node-2.0.14-legacy-dfu.zip` 177,274 bytes SHA-256 `2559caaf92bcf3e6766535feaa6f93ffeb89810acd946e15d60d9ccfc47b5b76`; 내부 application BIN 176,412 bytes, device type 0x0052, sd_req 0x00B6, CRC16 통과. SHA256SUMS와 일치하고 bootloader/SoftDevice는 포함하지 않는다.
+- ZIP은 `HOLD_HARDWARE_TEST.txt`로 공개 업로드 도구가 거부한다. 기존 2.0.6 성공 ZIP과 센서 2.0.13, Device 1/2, 운영 Apps Script, SPIFFS/NVS는 변경하지 않았다. 실제 BLE DFU·부팅·ENV/GAS 및 ESP32 원격 다운로드는 미검증이다. 기존 ZIP과 새 임시 ZIP이 896KiB SPIFFS의 spool reserve를 함께 충족하는지도 실제 장치에서 별도 확인해야 한다.
+
+## 2026-11-09 Device 1 인터넷 원격 ESP32 OTA 사용자 실기 성공
+
+- 사용자 보고: 대시보드가 `업데이트 검증 성공 · esp32 2.0.28`, ESP build `2026110806`, nRF `2.0.13`을 표시했고 새 Firmware `2.0.28`로 정상 동작한다. 기존 원격 엔진의 SUCCESS는 새 버전 부팅·BLE 신규 프레임·Wi-Fi·클라우드 ACK 이후 보고된다. 동일 네트워크 밖에서의 실제 사용, 장시간 TLS 안정성, 최종 queue/spool 수치는 아직 별도 확인이 필요하다. nRF DFU는 미실행이며 센서 펌웨어는 변경되지 않았다. 사용자는 다중 계정/장치의 초기 키·카탈로그 설정 UX 개선 필요성을 보고했다.
+
+## 2026-11-09 카탈로그 운영 등록 승인·직접 접근 제한
+
+- 사용자는 운영 Apps Script `REMOTE_UPDATE_CATALOG` 등록을 별도로 승인했다. 로컬 `data/remote-update-catalog.json`은 2.0.28 항목 한 개의 JSON 배열이며 실제 BIN/manifest SHA-256과 일치한다. 그러나 이 작업 환경에는 Apps Script Script Properties 쓰기 연결이 없고 컴퓨터 사용 도구가 초기화 오류로 편집 화면에 접근하지 못해 **운영 속성은 아직 변경하지 않았다**. 사용자에게 해당 JSON 전체를 스크립트 속성 값에 한 번 붙여넣는 절차를 안내한다. 장치 OTA 명령은 보내지 않았다.
+
+## 2026-11-09 승인된 ESP32 2.0.28 GitHub Release 게시 (장치 OTA 미실행)
+
+- 사용자로부터 `esp-v2.0.28-2026110806` 공개 GitHub Release 업로드만 별도 승인받았다. 기존 도구의 HOLD 표시를 승인된 패키지에서만 제거하고 `publish_remote_github_release.ps1 -Publish`를 실행했다. Release는 공개 상태이며 asset은 `gateway.ino.bin`과 `gateway.ino.manifest` 두 개다. 도구의 업로드 후 읽기 복원 SHA-256과 공개 URL의 HTTPS 302→206 정확한 Range/Content-Length/Content-Range 검사가 통과했다. `data/remote-update-catalog.json`은 JSON 배열 1개이며 실제 BIN/manifest SHA-256과 일치한다. Device 1의 `remote_capable=true` 및 대시보드 `원격 인증 완료`도 사용자 보고로 확인됐다. Apps Script 운영 카탈로그 등록, 실제 OTA 명령 및 nRF DFU는 별도 승인 전까지 실행하지 않았다.
+
+## 2026-11-09 Device 1 원격 명령 인증 연결 실기 확인 (릴리스·OTA 미실행)
+
+- 사용자는 `192.168.0.142:8080/remote-config`에서 장치 키와 `github.com`을 Save했고 페이지가 `Saved in NVS`를 반환했다. 대시보드에 `remote_capable=true`, 원격 영역에 `원격 인증 완료. 릴리스 목록을 불러와 대상과 버전을 확인하세요.`가 표시됨을 보고했다. 이는 Device 1과 Apps Script의 장치별 키가 일치하는 인증된 heartbeat를 입증하나 GitHub 파일 다운로드·실제 OTA 성공은 뜻하지 않는다. 2.0.28/build 2026110806은 서명·SHA·anti-rollback 재검증에 통과했으며 HOLD 상태를 유지한다. 공개 GitHub Release 업로드, 운영 카탈로그 등록, OTA/DFU 명령은 수행하지 않았다.
+
+## 2026-11-08 원격 설정 접근성/관리 토큰 UI (로컬 수정, 운영 미배포)
+
+- 사용자 보고: Device 1이 `192.168.1.124`에서 cloud ACK를 보내며 로컬 OTA `/`는 열리지만 `/remote-config`는 브라우저 `ERR_CONNECTION_TIMED_OUT`이다. 개발 PC는 `192.168.0.3/24`여서 두 URL의 직접 읽기 요청 모두 4초 연결 시간 초과였다. 서명된 2.0.27/build 2026110805 BIN에는 `/remote-config` 라우트와 설정 페이지 문자열이 있다. 코드상 8080 서버는 Wi-Fi 연결 시 시작하고 RECORDING/spool은 페이지 접속이 아닌 Save/업데이트를 차단한다. 경로별 401/404가 아닌 브라우저 timeout의 원인은 동일 기기의 새로고침·페이지 링크 결과 없이는 확정할 수 없다. 장치 설정/재부팅은 수행하지 않았다.
+- Dashboard의 관리 토큰에 명시적인 **확인·이 브라우저에 저장** 및 **삭제** 버튼과 Enter 동작을 추가했다. 저장 전 기존 `getRemoteUpdateCatalog` 인증을 확인하며, 사용자가 선택한 경우에만 localStorage에 저장하고 새로고침 시 복원한다. 공용 브라우저 위험과 저장 차단 시 상태를 표시한다. 원격 패널은 로컬 관리 링크를 외우지 않고 기존 현장 복구 첫 화면의 `Remote update provisioning` 링크를 사용하도록 설명한다. 원격 cloud mock 10개(저장·복원·삭제 포함), 기존 cloud mock 41개, Apps Script 합본 문법, `git diff --check` 통과. Apps Script 운영 배포는 하지 않았다.
+
+## 2026-11-08 Device 1 2.0.27 실기 상태·USB 로그 경로 및 원격 시험 준비
+
+- 사용자 확인: Device 1은 서명된 2.0.27/build 2026110805를 로컬 OTA로 설치했고 대시보드에서 Wi-Fi·BLE·cloud ACK가 보인다. 제공된 Diagnostics는 uptime 6,224,854 ms(약 104분), ACK age 2,055 ms, BLE connected, sensor/environment/gas OK, queue=0, spool=0, spool_error=false, backlog_drained_ms=6,104,719, upload_failures=2, remote_capable=false, ota_state=IDLE이다. 이는 현재 전송/복구의 실기 증거지만 `-32512` 무재발이나 allocator 등록 status=0을 증명하지 않는다. Device 2/nRF 및 운영 설정은 변경하지 않았다.
+- 2.0.25와 2.0.27 `build.options.json` FQBN은 동일한 16MB/custom/OPI/CDCOnBoot=cdc/USBMode=hwcdc/EraseNone이고 양쪽 compile_commands는 `ARDUINO_USB_CDC_ON_BOOT=1`, `ARDUINO_USB_MODE=1`이다. core 3.3.12에서 `Serial`은 HWCDCSerial이고 `operator bool()`은 CDC 연결 상태를 반환한다. `logEvent()`는 `if(Serial)`일 때만 `Serial.println`하며 UART_DIAGNOSTICS=false라 Serial0으로 앱 로그를 복제하지 않는다. Windows COM10은 실제 `USB-Enhanced-SERIAL CH343` USB-UART 장치이고 현재 다른 CDC 포트는 열거되지 않아 ROM 메시지만 보는 원인이 설명된다. 펌웨어/시리얼 코드는 변경하지 않았다.
+- 설치된 2.0.27과 구별되는 2.0.28/build 2026110806을 기존 자동 생성기, core 3.3.12/기존 FQBN/캐시 빌드와 기존 서명키로 PC에서만 준비했다. `dist/ota-2.0.28-2026110806/` BIN 1,666,672 bytes SHA-256 `9ab1bbe43e51c9b9eec5e04387c9245abccf9a6d9e91d6d6d8c8f8f3bf4a2ce0`; manifest 서명·해시·anti-rollback 검사, 원격 Release 카탈로그 dry-run, 파티션 동일성 및 원격 비밀키 비노출 확인 통과. 예정 GitHub tag는 아직 없다. `HOLD_APPROVAL.txt`가 도구의 공개 업로드를 차단한다. 실제 GitHub 업로드, 운영 Script Properties, 원격 명령, ESP/nRF 실기 업데이트는 미실행이다.
+
+## 2026-11-08 TLS 개발 분리 및 최종 시험 후보 (장치 미적용)
+
+- 사용자 보고: Device 1은 별도 백업한 안정 ESP32 2.0.25로 복구됐고 nRF 2.0.13은 정상이다. 이 사용자 실기 복구를 로컬 `gateway.ino`가 정확한 안정 소스라는 뜻으로 취급하지 않는다. 현재 미커밋 작업은 초기 `git diff --binary` 패치와 미추적 파일 12개 사본을 Git 제외 `data/worktree-snapshot-20261108-remote-tls*`에 보존한 뒤 `codex/remote-tls-stabilization` 개발 브랜치로 이동했다. reset/clean/commit/push 및 백업 2.0.25 변경은 없었다.
+- `TlsMemory.h`를 검토해 >=4096-byte mbedTLS 할당만 PSRAM 우선·내부 RAM fallback으로 유지하고, 작은 할당은 내부 RAM 전용으로 제한했다. 등록은 setup의 초기 큐 생성 직후이며 mbedTLS의 전역 allocator에 적용된다. `mbedtls_platform_set_calloc_free` 결과를 부팅 로그에 기록한다. 기존 클라우드 `setInsecure()` 선택 범위, Google POST→GET/ACK, BLE/spool/UID/OTA/DFU 코드는 수정하지 않았다. 큰 mbedTLS 할당이 모두 DMA 비의존적이라는 실기 증거는 아직 없으며, 등록 상태·TLS/PSRAM 동작은 장치 확인이 필요하다.
+- 직접 원인은 `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y`인 core의 TLS 내부 할당 실패와 PSRAM 미활용이다. 반면 동일 2.0.26의 BLE 연결 후 장시간 ACK 성공 로그가 있어 2.0.25→2.0.26 버전 차이의 결정적 원인은 미확정이다. 지속 누수는 로그에서 확인되지 않았다. 기존 GitHub 302 처리는 원격 파일 다운로드 경로에 한정된다.
+- 변경 코드 사용의 고유 시험 패키지는 `dist/ota-2.0.27-2026110805/`이다. BIN 1,666,672 bytes, SHA-256 `afea03cb4e28315f6f75154567a9762896d43118c50597f14cdd930c681f5482`; manifest 235 bytes. ESP32 core 3.3.12/16MB/OPI/custom partition/EraseNone 빌드·링크, 실제 allocator 함수의 large/small/fallback/overflow 호스트 테스트, 기존 전체 회귀 스위트, embedded-key 서명/해시/버전/build 검사와 `git diff --check` 통과. 현재 BIN은 빌드 산출물과 SHA가 같고 partitions.bin은 안정 기준 2.0.25 빌드와 동일하다. `HOLD_HARDWARE_TEST.txt`로 GitHub 공개 업로드 도구가 거부하게 했으며 장치 플래시·실제 OTA/DFU·운영 배포·데이터 삭제는 수행하지 않았다.
+
+## 2026-11-08 Device 1 2.0.26 TLS -32512 진단 및 보류 후보 (실기 미검증)
+
+- 사용자 로그: Device 1 2.0.26은 부팅 직후 Wi-Fi/SPIFFS/첫 Google POST→redirect GET ACK에 성공했고, BLE 연결 뒤 내부 free 약 74KB/largest 약 34.8KB에서 `SSL - Memory allocation failed`가 반복됐다. 그러나 같은 2.0.26의 다른 구간에서는 BLE 연결 후에도 uptime 약 8.3백만 ms 동안 5초 heartbeat ACK가 연속 성공했고 largest는 오히려 약 25.6KB였다. 따라서 큰 블록 수치 하나의 임계값이나 2.0.26의 GitHub 302 코드가 평상시 POST를 직접 실패시킨다고 확정할 수 없다. 재시도 뒤 `JOB-free` 내부 메모리가 대체로 약 75KB로 돌아와 단조 누수 근거는 없다. 다른 부팅에서는 SPIFFS pending 12가 복원돼 ACK로 11까지 감소했고, 이후 TLS 실패 시 원래 UID 재시도/스풀 저장이 기록됐다. 데이터는 삭제하지 않았다.
+- 사용자는 `/remote-config` Save를 하지 않았다고 확인했다. 따라서 새 키가 클라우드 인증서 번들을 활성화한 가설은 이번 실기에 맞지 않는다. 2.0.25/2.0.26은 ESP32 core 3.3.12, static RAM 72,520 bytes, 동일 bootloader/partition 바이너리를 사용했고 실제 소스 변경은 원격 다운로드의 GitHub 302 처리와 버전/build 두 줄이다. Google POST→redirect GET 함수 자체는 바뀌지 않았다. core sdkconfig는 `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y`, 16KB TLS content buffer, 외부 할당 비활성이다. 직접 TLS 내부 할당 실패와 충분한 PSRAM 미사용은 확인했지만 버전별 현상 차이의 원인은 아직 미확정이다.
+- 최소 시험 후보로 `TlsMemory.h`의 큰 mbedTLS calloc(>=4096 bytes) PSRAM 우선·내부 fallback, 작은 calloc 내부 우선·PSRAM fallback과 setup의 플랫폼 allocator 등록/결과 로그만 추가했다. 기존 TLS 인증 선택, 센서/BLE/spool/ACK/OTA/DFU 흐름은 변경하지 않았다. 실제 allocator를 이용한 호스트 fallback/overflow 테스트, 전체 회귀 스위트, ESP32 core 3.3.12 빌드(1,666,575 sketch bytes, static RAM 72,520 bytes), 서명·해시 검증을 통과했다. `dist/ota-2.0.27-2026110804/` BIN 1,666,720 bytes SHA-256 `a66a61de3e811bb9c3507c4e893066f8ec37bd7a633a6d56c4e7657ba5d66cb0`는 **실기 TLS 미검증**이라 HOLD 파일로 공개 업로드를 막았다. 이전 2.0.27 build 0802/0803도 보류다. 장치 플래시·SPIFFS/NVS 조작·OTA·GitHub 공개·Apps Script 배포는 하지 않았다.
+
+## 2026-11-08 원격 OTA 시험용 2.0.27 준비와 Device 1 STALE (실기 업데이트 미실행)
+
+- 사용자가 Device 1의 USB 설치 후 대시보드 `2.0.26`과 최근 cloud ACK 갱신을 확인했다. 이후 같은 대시보드가 `STALE / CLOUD CONTACT UNKNOWN`, measurement mode unknown, 최근 heartbeat 없음으로 바뀌었고 Device 2는 LIVE라고 보고했다. 이전 Device 1 주소 `192.168.0.142:8080`에 비인증 GET 한 번을 시도했으나 현재 PC에서 4초 연결 타임아웃이었다. IP 변경·PC 경로·장치 Wi-Fi 장애를 이 결과만으로 구분할 수 없으며 BLE 장애로 단정할 수도 없다. 진행 중인 실험을 중지하거나 장치를 재부팅하지 않았고 원격 명령도 보내지 않았다.
+- 클라우드가 동일 ESP 버전을 거부하므로 기존 2.0.26 패키지 대신 현재 코드의 버전·build 식별자만 2.0.27/2026110802로 올려 기존 자동 생성기와 캐시 증분 컴파일로 `dist/ota-2.0.27-2026110802/`의 BIN(1,666,432 bytes, SHA-256 `4335742fe470f2dd6f4caf4593f467df9fd2e0a10f2a9fdcd9649b27cb94bef9`) 및 서명 manifest를 생성했다. 기존 키의 ECDSA·SHA-256·버전/build·anti-rollback 검사가 통과했다. GitHub 업로드 없는 카탈로그 항목 `data/remote-release-esp32-esp-v2_0_27-2026110802.json`과 미리보기 JSON을 준비했다. 해당 BIN/manifest에서 준비한 원격 토큰·장치 키·다운로드 토큰과 서명 개인키 PEM/스칼라가 발견되지 않았다. 공개 Release·Apps Script 설정·장치 설치는 아직 수행하지 않았다.
+
+## 2026-11-08 Device 1 유선 설치 사용자 보고 (원격 검증 대기)
+
+- 사용자는 로컬 OTA가 측정 중 안전 조건으로 차단돼 ESP32 펌웨어를 USB로 업로드했다고 보고했다. 실제 실행 버전/build, SPIFFS·NVS 보존, BLE 수신, cloud ACK는 아직 대시보드 증거로 확인하지 않았다. 사용자 실험이 진행 중이므로 원격 업데이트를 시작하지 않는다. 만약 새 실행 버전이 2.0.26이라면 기존 클라우드 정책이 같은 ESP 버전의 원격 명령을 거부하므로, 2.0.26 패키지는 Device 1 원격 OTA 시험 대상이 될 수 없다. GitHub Release 공개 업로드와 새 버전 시험은 별도 확인·승인 전까지 수행하지 않았다.
+
+## 2026-11-08 GitHub 원격 OTA 첫 설치 패키지 준비 (실기·공개 업로드 미실행)
+
+- GitHub CLI는 `C:\Program Files\GitHub CLI\gh.exe`에 설치됐고 샌드박스 밖 `gh auth status` 종료 코드 0, 기존 공개 저장소에 ADMIN 권한이 확인됐다. 예정 태그 `esp-v2.0.26-2026110801`는 아직 존재하지 않는다. Release 생성·asset 업로드·push는 수행하지 않았다.
+- Arduino CLI 상세 빌드에서 오래 걸린 단계는 멈춤이 아닌 라이브러리 의존성 탐색/첫 전체 컴파일이었다. ESP32 core 3.3.12, Flash 16MB, custom `partitions.csv`, OPI PSRAM, Hardware CDC/JTAG, EraseFlash=none 설정의 빌드가 종료 코드 0으로 완료됐다. 기존 자동 생성기 Manual 모드가 소스를 2.0.26/build 2026110801로 올리고 같은 캐시의 증분 빌드 BIN을 받아 기존 개인키로 manifest를 생성했다. 결과는 `dist/ota-2.0.26-2026110801/gateway.ino.bin`(1,666,432 bytes, SHA-256 `4ff7ddd4e4fb25dc3eb39180dcf95256d715036df20f2ea04d342ac6cc88c30f`) 및 `gateway.ino.manifest`(235 bytes)다. 기존 embedded-key 서명/해시/anti-rollback 패키지 검사, BIN 버전·build·원격 marker 및 파티션 CSV 동일성 검사가 통과했다.
+- GitHub 업로드 없이 `data/remote-release-esp32-esp-v2_0_26-2026110801.json`과 Apps Script 속성 복사용 `data/remote-update-catalog-preview.json`을 준비했다. 새 로컬 BIN·manifest·카탈로그에서 준비한 관리자 토큰/장치 키/다운로드 토큰과 서명 개인키 PEM/개인 스칼라가 발견되지 않았다. PEM 헤더 이름만 ESP32 라이브러리 상수로 포함돼 있어 실제 개인키 포함으로 해석하지 않는다. GitHub 업로드·장치 설치·운영 Apps Script 속성 변경·실제 원격 OTA/DFU는 미실행이다.
+
+## 2026-11-08 GitHub Releases 원격 업데이트 호환성 최소 변경 (호스트 검증)
+
+- 사용자가 설정 AP 비밀번호와 OTA/NVS 토큰을 명확히 구분하도록 정정했다. 로컬 2.0.25 BIN에 새 원격 관리자 토큰, Device 1 명령 키, 다운로드 토큰이 없는 것을 값 출력 없이 확인했다. OTA 토큰은 기존 NVS 명령으로 발급·저장되며 AP 비밀번호 체계는 변경하지 않았다.
+- 실제 공개 GitHub Release의 고정 asset URL은 첫 요청에 302, `release-assets.githubusercontent.com`의 약 900자 임시 서명 URL로 이동했다. 최종 주소는 큰 파일의 첫/중간 32바이트 Range 각각에 206, 정확한 Content-Length/Content-Range를 반환했다. `RemoteUpdateProtocol.h`/`RemoteUpdateRuntime.h`는 GitHub Release에서 이 정확한 HTTPS 대상 호스트/경로로 이동하는 302 한 번만 허용하고, 다운로드 bearer token이 있으면 GitHub 경로를 거부한다. 두 TLS/HTTP 객체는 순차 해제되며 기존 Range·크기·SHA·서명 검증은 그대로다. 보드의 실제 CA/TLS/메모리 동작은 미검증이다.
+- `prepare_remote_release.ps1`는 점이 포함된 GitHub tag 경로를 허용한다. 새 `publish_remote_github_release.ps1`는 기존 패키지를 검증해 공개 Release용 카탈로그를 생성하고, 승인 후 `gh`로 draft 생성·asset 업로드·읽기 복원 SHA 확인·공개·실제 Range 확인 후 합본 Script Property JSON을 준비하도록 작성했다. 로컬 PC에서 `gh`가 발견되지 않아 실제 업로드 경로는 실행하지 않았다. 호스트 회귀 스위트, OTA 서명·패키지 거부 테스트, GitHub URL dry-run과 `git diff --check` 통과. ESP32 Arduino CLI는 별도 폴더에서도 컴파일 산출물 전 단계에서 정체되어 중단했으므로 새 BIN/manifest는 없고 실기 설치도 하지 않았다.
+
+## 2026-11-08 GitHub Release 원격 파일 경로 조사 (읽기 전용, 배포 중단)
+
+- 기존 공개 GitHub 저장소에는 조사 시점 Release가 없고 로컬 `gh` CLI도 발견되지 않았다. 공개 GitHub CLI Release asset에 실제 Range GET을 수행했다. 원래 `github.com/.../releases/download/...` 주소는 `302`, `Content-Length: 0`이며 `release-assets.githubusercontent.com`의 임시 서명 쿼리 주소로 이동한다. 최종 주소는 작은 파일의 `bytes=0-31` 및 15.7MB 파일의 `bytes=0-31`, `bytes=131072-131103` 요청에 각각 `206`, 정확한 `Content-Length: 32`, `Content-Range`를 반환했다. 관측한 최종 주소는 약 47분 뒤 만료되는 매개변수를 포함했다. 기존 원격 다운로더는 리다이렉트를 금지하므로 현재 상태로는 GitHub Release와 호환되지 않는다.
+- 로컬 2.0.25 OTA BIN에 고정 설정 AP 자격 증명 문자열과 클라우드 엔드포인트가 들어 있음을 값 출력 없이 확인했다. 로컬 OTA 토큰과 원격 HMAC 키는 NVS에서 생성·저장하며 BIN에 하드코딩된 형태는 확인되지 않았다. 공개 Release에 인증 정보가 포함된 펌웨어를 게시하지 말라는 요청에 따라 GitHub 업로드·공개 Release 생성·펌웨어/클라우드 코드 변경을 중단했다. GitHub의 최종 TLS 인증서와 리다이렉트 처리의 ESP32 실기 호환성도 아직 미검증이다.
+
+## 2026-11-08 원격 업데이트 설정 준비 (운영 설정·실기 미적용)
+
+- 사용자 확인: 운영 Apps Script의 `REMOTE_OPERATOR_SHA256`, Device 1용 `REMOTE_KEY_...`, `REMOTE_DOWNLOAD_HOSTS`, `REMOTE_UPDATE_CATALOG`는 모두 없고, 기존 HTTPS 아티팩트 저장소도 없다. 운영 대시보드가 원격 업데이트 패널과 `Remote operator token required` 응답을 표시하므로 해당 원격 UI/카탈로그 함수의 배포는 관측되지만 인증 설정은 누락되어 있다. 로컬 OTA Basic 토큰과 원격 관리자 토큰은 별개다. 사용자가 `192.168.0.142:8080/remote-config` 관리 페이지를 열어 해당 IP 장치의 원격 수신기 존재를 확인했다. 페이지의 Device ID가 Device 1과 일치하는지는 아직 보고되지 않아 키 저장 전 확인이 필요하다.
+- Device 1용 원격 관리자 토큰·SHA-256 digest·장치 명령 키와 Cloudflare Worker 다운로드 토큰을 암호학적 난수로 생성해 Git 제외 `secrets/remote-update-provisioning.json`에만 보관했다. 비밀값은 로그/문서에 출력하지 않았다. 사용자 계정의 Script Properties, R2, Worker, 장치 NVS에는 아직 설정하지 않았다.
+- 2.0.26 검증 패키지 준비를 한 번 시도했으나 샌드박스에서는 컴파일러 DLL 재할당 오류, 샌드박스 밖에서는 산출물 없이 장시간 정체되어 중단했다. 2.0.26 BIN/manifest는 생성되지 않았다. 빌드 도구가 수정한 `gateway.ino` 버전·빌드 두 줄은 기존 2.0.25/2026110101로 복원했다. 운영 배포·장치 플래시·원격 명령은 수행하지 않았다.
+
+## 2026-11-07 원격 업데이트 실사용 준비 재확인 (장치·운영 환경 미검증)
+
+- 로컬 `data/build-wifi-portal-2.0.25/output/gateway.ino.bin`은 1,665,728 bytes, SHA-256 `4c846c648cb20bb0b9e40cea65060ca03515002fac2f08a97443d7214bdc1896`이며 `FSGWBUILD:2.0.25:2026110101`, 원격 명령/요청 marker 및 `/remote-config`를 포함한다. 이는 Device 1에 실제 설치된 이미지의 동일성을 입증하지 않는다. 설치 확인은 인증된 로컬 `/remote-config` GET 또는 장치의 인증된 원격 heartbeat가 필요하다.
+- 보유한 서명 ESP 패키지 2.0.22는 로컬 서명·해시·이미지 검증에 통과했으나 Device 1 보고 버전 2.0.25보다 오래되어 원격 검증용으로 선택하지 않았다. nRF 2.0.12 application-only Legacy ZIP도 로컬 형식 검증에 통과했으나 설치 센서 버전이 확인되지 않아 업데이트 대상으로 확정하지 않았다. 원격 cloud mock 10개, 기존 cloud mock 41개, Apps Script 합본 문법, private storage adapter mock 및 `git diff --check`가 통과했다. 실제 Script Properties, HTTPS 저장소, 장치 NVS, 원격 명령 수신 및 OTA/DFU는 확인하지 않았고 운영 배포·장치 쓰기를 수행하지 않았다.
+
+## 2026-11-07 원격 OTA/DFU 대시보드 접근성 점검 (호스트 검증)
+
+- 기존 원격 HMAC 명령, per-device NVS 실행 barrier, HTTPS Range 다운로드, 서명 ESP OTA, application-only Legacy nRF DFU 및 로컬 8080 복구 페이지가 구현돼 있음을 재확인했다. 외부 네트워크 접근 실패 원인은 브라우저가 사설 IP에 접속하는 로컬 링크와 실제 원격 경로의 구분이 불명확한 점 및 원격 수신 펌웨어·장치 키·HTTPS 저장소·Script Properties·인증 heartbeat 선행 설정 부족이다. 현재 운영 장치의 원격 키 설정 여부는 직접 확인하지 않았고 실제 인터넷 OTA/DFU는 미검증이다.
+- Dashboard는 두 접근 경로를 명시적으로 구분하고, 최근 cloud contact/remote_capable/인증 보고/STOPPED에 따른 원격 준비 사유를 표시한다. 원격 승인 버튼은 조건 미충족 시 비활성이다. 로컬 링크는 마지막 보고 IP를 사용하므로 같은 LAN에서 복구 가능하며 cloud STALE 시 주소가 오래됐음을 title로 표시한다. 원격 경로는 URL에 로컬 IP를 사용하지 않는다. Cloud mock 41개, remote mock 10개와 Apps Script 합본 문법 검사를 통과했으며 운영 배포·실제 파일 저장소·기기 업로드는 수행하지 않았다. 설정 순서는 `docs/REMOTE_UPDATES.md`에 반영했다.
+
+## 2026-11-07 측정 진행 감시·독립 클라우드 경보·CSV 전처리 (로컬 검증)
+
+- 사용자 운영 웹앱에 `SyntaxError: Identifier 'MAX_BATCH' has already been declared`가 발생했다. 로컬 `Code.gs`, `Monitoring.gs`, `RemoteUpdates.gs`를 한 전역 스크립트로 합쳐 검사하면 MAX_BATCH 선언은 한 번이며 parse가 통과한다. 운영 프로젝트에는 복제된 `Code.gs` 내용이 있을 가능성이 크지만 실제 파일 목록은 확인하지 못했다. 새 `tests/apps_script_syntax_test.cjs`는 모든 로컬 `.gs`를 합쳐 문법 검사하며 중복 MAX_BATCH 주입을 거부한다. 이 오류는 운영 코드 실행/ACK를 막지만 기존 Sheets 행 삭제의 증거는 아니다. 운영 프로젝트/배포/Sheets는 변경하지 않았다.
+
+- 사용자 실험은 운영 중이므로 운영 장치와 Apps Script/Sheets에는 접근하지 않았다. nRF 소스는 2.0.13으로 식별한다. 실기 설치 버전은 확인되지 않았다. 이전과 현재 코드의 GAS pending/Notify 분기가 연결은 살아 있어도 다음 스캔을 막는 재현 가능한 경로다. 실제 5시간 장애의 물리 원인은 확정하지 않았다.
+- 실제 센서 소스의 5시간 모의 시험은 수정 전 재연결 0회로 실패했고, 수정 뒤 원본 프레임/SEQ 보존, 제한된 BLE 재연결과 Notify 복구 후 전송을 통과했다. ENV 유효측정 180초 정체는 기존 단계별 sensor recovery를 재사용하며 기존 GAS 60초·forced 200ms·냉각 60초 제한을 유지한다. 계속 Notify가 꺼져 있으면 데이터가 없는 기간이 생기며 RAM 프레임은 MCU 전원 차단/리셋 시 보존되지 않는다.
+- `Monitoring.gs`는 기본 비활성이다. 1분 독립 트리거를 나중에 명시적으로 설치할 수 있도록 만들고, heartbeat/ENV/GAS/완전 스캔/ACK/backlog/storage/battery 상태 감지, 첫 알림·1시간 재알림·복구 알림·5분 재시도와 계정 할당량 확인을 모의 테스트했다. 이메일은 발송하지 않았고 운영 트리거도 만들지 않았다. Dashboard STALE는 클라우드 연락과 측정 지연 사유를 구분한다. ESP32 펌웨어는 변경하지 않았다.
+- 실제 `food-spoilage-all (3).csv`는 입력 SHA-256을 보존한 채 4,259 유효행, 7 세션, HP-354 완전 스캔 366개, 무효/불완전 그룹 81개, 20분 초과 GAS 행 간격 8개로 처리했다. 산출물은 Git 제외 `data/reliability-20261107/csv-audit-final/`. 2026-11-05 KST 02:53~09:06 약 6시간 13분 공백 앞뒤 BID/SEQ가 변경되어 재부팅은 관측되나 공백의 원인은 CSV만으로 미확인이다. 음식별 검증 레이블/독립 반복 세션이 부족하여 ML 일반화 성능은 평가하지 않았다.
+- nRF Adafruit core 1.7.0 S140 v6 로컬 컴파일·링크 종료 코드 0: 앱 176,404 bytes, 정적 RAM 18,888 bytes. 센서 실소스 호스트/스풀·UID·ACK·Wi-Fi·OTA·DFU·mock cloud/모니터링/CSV 테스트 통과. 자세한 범위·실기 미검증·운영 승인 절차는 `docs/PROGRESS_MONITORING.md`를 따른다. 장치 업로드, 배포, 실제 이메일, Git commit/push는 수행하지 않았다.
+
 ## 2026-11-01 ESP32-S3 독립 Wi-Fi 연결 진단 스케치 (실기 미검증)
 
 - 기존 `2.0.25` 게이트웨이, NVS 자격 증명, SPIFFS spool, OTA 파티션 및 서명 패키지는 변경하지 않았다. `firmware/esp32s3/wifi_connection_diagnostic/`에 별도 스케치를 추가해 Serial 입력값을 RAM에서만 사용한다. 게이트웨이와 같은 `WiFi.begin(ssid,password)`를 스캔 전에 호출해 20초간 이벤트를 관찰한다. 실패 시 SSID를 두 번 검색해 RSSI/채널/auth/BSSID suffix를 보고, 찾은 대상의 채널/BSSID 고정 연결 1회를 제공한다. 기존 partition CSV와 동일한 배치를 동봉했다.

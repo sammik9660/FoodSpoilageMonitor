@@ -70,14 +70,24 @@ bool remoteReadRange(const char* url,uint32_t total,uint32_t start,uint32_t amou
   using namespace remote_runtime;
   downloadError="URL_OR_CLOCK";
   if(!clockValid()||!remote_update::allowedUrl(url,remoteClient.hosts()))return false;
-  GatewaySecureClient client;client.useBuiltinCACertBundle();client.setHandshakeTimeout(15);
-  HTTPClient http;http.setReuse(false);http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);http.setConnectTimeout(10000);http.setTimeout(10000);
-  const char* keys[]={"Content-Range","Content-Encoding"};http.collectHeaders(keys,2);
-  downloadError="HTTPS_BEGIN";if(!http.begin(client,url))return false;
+  if(remote_update::githubReleaseUrl(url)&&remoteClient.downloadToken()[0]){downloadError="DOWNLOAD_AUTH";return false;}
+  String currentUrl(url);
   char range[64];snprintf(range,sizeof(range),"bytes=%lu-%lu",(unsigned long)start,(unsigned long)(start+amount-1));
-  http.addHeader("Range",range);http.addHeader("Accept-Encoding","identity");
-  if(remoteClient.downloadToken()[0])http.addHeader("Authorization",String("Bearer ")+remoteClient.downloadToken());
-  const int code=http.GET();
+  for(int hop=0;hop<2;++hop) {
+    GatewaySecureClient client;client.useBuiltinCACertBundle();client.setHandshakeTimeout(15);
+    HTTPClient http;http.setReuse(false);http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);http.setConnectTimeout(10000);http.setTimeout(10000);
+    const char* keys[]={"Content-Range","Content-Encoding"};http.collectHeaders(keys,2);
+    downloadError="HTTPS_BEGIN";if(!http.begin(client,currentUrl.c_str()))return false;
+    http.addHeader("Range",range);http.addHeader("Accept-Encoding","identity");
+    if(remoteClient.downloadToken()[0])http.addHeader("Authorization",String("Bearer ")+remoteClient.downloadToken());
+    const int code=http.GET();
+    if(code==302) {
+      const String location=http.getLocation();
+      const bool allowed=hop==0&&remote_update::githubReleaseUrl(url)&&remote_update::githubAssetRedirect(location.c_str());
+      http.end();client.stop();
+      if(!allowed){downloadError="DOWNLOAD_REDIRECT_REJECTED";return false;}
+      currentUrl=location;continue;
+    }
   const bool headerOK=http.getSize()==(int)amount&&(!http.header("Content-Encoding").length()||http.header("Content-Encoding")=="identity")&&
     ((code==206&&remote_update::rangeMatches(http.header("Content-Range").c_str(),start,start+amount-1,total))||(code==200&&start==0&&amount==total));
   if(!headerOK){
@@ -100,6 +110,8 @@ bool remoteReadRange(const char* url,uint32_t total,uint32_t start,uint32_t amou
     delay(1);
   }
   http.end();client.stop();return ok&&done==amount;
+  }
+  downloadError="DOWNLOAD_REDIRECT_REJECTED";return false;
 }
 bool remoteDigestMatches(const uint8_t* digest,const char* expected) {
   char text[65];for(int i=0;i<32;++i)snprintf(text+i*2,3,"%02x",digest[i]);return !strcmp(text,expected);
@@ -161,7 +173,18 @@ void serviceRemoteUpdate() {
     if(!strcmp(command.kind,"esp32"))stage=MANIFEST;
     else {
       if(SPIFFS.exists(nrf_dfu_package::TEMP_PATH)){remoteFailure("TEMP_PACKAGE_EXISTS");return;}
-      if(command.bytes>nrf_dfu_package::temporaryCapacity(SPIFFS.totalBytes(),SPIFFS.usedBytes(),spool.budget)){remoteFailure("SPOOL_RESERVE_SPACE");return;}
+      const size_t total=SPIFFS.totalBytes(),used=SPIFFS.usedBytes();
+      size_t oldZipBytes=0;
+      if(SPIFFS.exists(nrf_dfu_package::FINAL_PATH)){
+        File oldZip=SPIFFS.open(nrf_dfu_package::FINAL_PATH,FILE_READ);
+        if(!oldZip){remoteFailure("PACKAGE_OPEN");return;}
+        oldZipBytes=oldZip.size();oldZip.close();
+      }
+      const size_t normal=nrf_dfu_package::temporaryCapacity(total,used,spool.budget);
+      const size_t paused=nrf_dfu_package::pausedIngressCapacity(total,used,oldZipBytes,spool.budget);
+      logEvent("nRF DFU space total=%u used=%u old_zip=%u spool_reserve=%u normal=%u paused=%u requested=%lu",
+        (unsigned)total,(unsigned)used,(unsigned)oldZipBytes,(unsigned)spool.budget,(unsigned)normal,(unsigned)paused,(unsigned long)command.bytes);
+      if(!otaSafeState()||command.bytes>paused){remoteFailure("SPOOL_RESERVE_SPACE");return;}
       zip=SPIFFS.open(nrf_dfu_package::TEMP_PATH,FILE_WRITE);if(!zip){remoteFailure("PACKAGE_OPEN");return;}ownsTemp=true;stage=DOWNLOAD;
       mbedtls_sha256_init(&hash);hashStarted=true;if(mbedtls_sha256_starts(&hash,0)){remoteFailure("HASH_INIT");return;}
     }

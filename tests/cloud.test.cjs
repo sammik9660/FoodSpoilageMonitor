@@ -30,7 +30,7 @@ function environment(){
  const api={Date:Clock,console,JSON,Number,String,Math,Array,Object,Error,
   LockService:{getScriptLock:()=>({waitLock(){waitLockCalls++;if(forceLockBusy||locked)throw Error('잠금 시간초과');locked=true;time+=lockAdvance;},
     tryLock(){tryLockCalls++;if(forceLockBusy||locked)return false;locked=true;time+=lockAdvance;return true;},releaseLock(){locked=false;}})},
-  PropertiesService:{getScriptProperties:()=>({getProperty:k=>props.get(k)})},
+  PropertiesService:{getScriptProperties:()=>({getProperty:k=>props.get(k),setProperty:(k,v)=>props.set(k,v)})},
   SpreadsheetApp:{openById:id=>{assert.equal(id,'existing-id');return book;},flush(){}},
   Utilities:{getUuid:()=>String(++uuid).padStart(32,'0')},
   CacheService:{getScriptCache:()=>({get:k=>cache.get(k),put:(k,v)=>cache.set(k,v),remove:k=>cache.delete(k)})},
@@ -39,6 +39,7 @@ function environment(){
   HtmlService:{createTemplateFromFile:name=>({evaluate(){return {setTitle(){return {name,url:this.webAppUrl};}};}})}
  };
  vm.createContext(api);vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Code.gs'),'utf8'),api);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Monitoring.gs'),'utf8'),api);
  api.setupReliability();
  return {api,all,sensor,props,cache,setTime:t=>time=t,now:()=>time,setFail:f=>fail=f,
   setLockBusy:v=>forceLockBusy=v,setLockAdvance:v=>lockAdvance=v,
@@ -217,7 +218,7 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  const ctx={document:{getElementById:element},google:{script:{run:runner}},setInterval(){},setTimeout(){},Number,String,JSON,encodeURIComponent,Map,Date};
  vm.createContext(ctx);vm.runInContext(script,ctx);
  assert(element('panel-'+a)&&element('panel-'+b));
- ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_mv:4090,battery_percent:89,battery_calibration_state:'COLLECTING',battery_min_mv:3600,battery_max_mv:4150,battery_measurement_valid:true,usb_power:false,local_ip:'192.168.0.142'},
+ ctx.show(a,{state:'STALE',age:20000,server_time:e.now(),health:{server_seen_at:e.now(),sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_mv:4090,battery_percent:89,battery_calibration_state:'COLLECTING',battery_min_mv:3600,battery_max_mv:4150,battery_measurement_valid:true,usb_power:false,local_ip:'192.168.0.142'},
   recording:{state:'STOPPED',session_id:null,download_session_id:'EXP-recent',download_experiment_label:'바나나껍데기',download_started_at:e.now(),download_kind:'LATEST'}});
  assert.equal(element('state-'+a).textContent,'STALE');
  assert.equal(element('values-'+a).textContent,'24.50 °C · 47.25 % · 1002.50 hPa');
@@ -228,6 +229,15 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  assert.equal(element('age-'+a).textContent,'Last environment sample: 20.0 s ago');
  assert.equal(element('recording-'+a).textContent,'실험 종료됨');assert.equal(element('sessionName-'+a).textContent,'바나나껍데기');
  assert(element('sessionDate-'+a).textContent.startsWith('실험 시작: '));assert.equal(element('sessionId-'+a).textContent,'EXP-recent');
+ ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{server_seen_at:e.now(),local_ip:'192.168.68.57',remote_capable:false},recording:{state:'STOPPED'}});
+ assert.equal(element('espOtaLink-'+a).href,'http://192.168.68.57:8080/');
+ assert(element('remotePrereq-'+a).textContent.includes('장치 키'));
+ assert(element('remoteStart-'+a).disabled);
+ ctx.show(a,{state:'STALE',age:120000,server_time:e.now(),health:{server_seen_at:e.now()-120000,local_ip:'192.168.68.57',remote_capable:true},recording:{state:'STOPPED'}});
+ assert(!element('espOtaLink-'+a).hidden&&element('espOtaLink-'+a).title.includes('마지막 보고'));
+ assert(element('localLinkStatus-'+a).textContent.includes('마지막 보고된 로컬 주소'));
+ assert(element('remoteStart-'+a).disabled);
+ assert(element('remotePrereq-'+a).textContent.includes('최근 클라우드'));
  element('page-'+a).value='2';ctx.csvLinks(a);assert(element('all-'+a).href.includes('offset=10000'));assert(element('sessionCsv-'+a).href.includes('offset=10000'));
  ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{sensor_mode:'ENV',environment:{t:24.5,h:47.25,p:1002.5},battery_measurement_valid:false,usb_power:true,battery_last_percent:89},
   recording:{state:'UNKNOWN',session_id:null,download_session_id:null}});
@@ -441,5 +451,20 @@ test('two virtual gateways keep recording, live cache, registry, and CSV isolate
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
  assert(html.includes('.getDashboard(id)'));assert(html.includes('.startRecording(el(id,\'label\').value,id)'));
  assert(html.includes('.stopRecording(id)'));assert(html.includes("device='+encodeURIComponent(id)"));
+});
+test('monitoring observes committed complete scans without changing ordered ACK or duplicate replay',()=>{
+ const e=environment();e.props.set('MONITOR_ENABLED','true');e.api.startRecording('test');
+ const rows=Array.from({length:10},(_,i)=>v3(i+1,i,e.now()+i));
+ const a=e.api.ingest({version:3,samples:rows.slice(0,5)});
+ assert.equal(a.stored,5);
+ assert.equal(JSON.parse(e.props.get('MONITOR_STORE_V1:legacy')).lastCompleteCapture,undefined);
+ const b=e.api.ingest({version:3,samples:rows.slice(5)});assert.equal(b.stored,5);
+ assert.equal(JSON.parse(e.props.get('MONITOR_STORE_V1:legacy')).lastCompleteCapture,e.now()+9);
+ assert(e.api.ingest({version:3,samples:rows}).acks.every(x=>x.status==='duplicate'));
+});
+test('STALE explains measurement versus cloud-contact freshness',()=>{
+ const e=environment();e.api.ingest({version:2,samples:[],health:{sensor_mode:'ENV',sensor_ok:true,ble_connected:true,environment:{t:25,h:50,p:1000,age_ms:300000}}});
+ assert.equal(e.api.getDashboard().state,'STALE');assert(e.api.getDashboard().progress_reason.includes('환경 측정값'));
+ e.setTime(e.now()+20000);assert(e.api.getDashboard().progress_reason.includes('heartbeat'));
 });
 console.log(`${tests} cloud tests passed (mock Sheets, no external services).`);

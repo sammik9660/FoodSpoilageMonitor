@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstring>
+#define ENABLE_I2C_LCD 1
 #include "../firmware/esp32s3/gateway/GatewayUi.h"
 
 using namespace gateway_ui;

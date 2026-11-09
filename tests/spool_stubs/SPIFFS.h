@@ -33,7 +33,9 @@ class File{
 #define FILE_WRITE "w"
 #define FILE_READ "r"
 struct SpiffsStub{
- bool begin(bool format){formatAttempted|=format;return mountOK;}
+ bool begin(bool format,const char* basePath="/spiffs",uint8_t maxOpenFiles=10,const char* label=nullptr){
+  formatAttempted|=format;return mountOK&&!strcmp(basePath,"/spiffs")&&maxOpenFiles==10&&label&&!strcmp(label,"spiffs");
+ }
  size_t totalBytes(){return 896*1024;}size_t usedBytes(){size_t n=0;for(auto& f:disk)n+=f.second.size()+256;return n;}
  bool exists(const String& p){return disk.count(p);}
  File open(const String& p,const char* mode=FILE_READ){if(p=="/")return File(p);if(*mode=='w'){disk[p]={};return File(p);}return exists(p)?File(p):File();}

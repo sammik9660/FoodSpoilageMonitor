@@ -20,11 +20,13 @@ inline std::string transmitted;
 inline bool testBleConnected=true;
 inline uint32_t testBleWriteDelayMs=0;
 inline bool testBleWriteFails=false;
-struct BLEUart{void begin(){}bool notifyEnabled(){return true;}size_t write(const uint8_t* p,size_t n){testMillis+=testBleWriteDelayMs;if(testBleWriteFails)return 0;transmitted.append((char*)p,n);return n;}};
+inline bool testNotifyEnabled=true;
+inline unsigned testDisconnects=0;
+struct BLEUart{void begin(){}bool notifyEnabled(){return testNotifyEnabled;}size_t write(const uint8_t* p,size_t n){testMillis+=testBleWriteDelayMs;if(testBleWriteFails)return 0;transmitted.append((char*)p,n);return n;}};
 struct AdvertisingStub{void addService(BLEUart&){}void addName(){}void restartOnDisconnect(bool){}void setInterval(int,int){}void setFastTimeout(int){}void start(int){}};
 struct PeriphStub{uint16_t minMs=0,maxMs=0,latency=0,timeoutMs=0;
  bool setConnIntervalMS(uint16_t min,uint16_t max){minMs=min;maxMs=max;return true;}
  bool setConnSlaveLatency(uint16_t value){latency=value;return true;}
  bool setConnSupervisionTimeoutMS(uint16_t value){timeoutMs=value;return true;}};
-struct BluefruitStub{AdvertisingStub Advertising,ScanResponse;PeriphStub Periph;void begin(){}void setTxPower(int){}void setName(const char*){}void autoConnLed(bool){}bool connected(){return testBleConnected;}};
+struct BluefruitStub{AdvertisingStub Advertising,ScanResponse;PeriphStub Periph;void begin(){}void setTxPower(int){}void setName(const char*){}void autoConnLed(bool){}bool connected(){return testBleConnected;}uint16_t connHandle(){return 0;}bool disconnect(uint16_t){++testDisconnects;testBleConnected=false;return true;}};
 inline BluefruitStub Bluefruit;

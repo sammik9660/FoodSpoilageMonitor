@@ -26,6 +26,18 @@ inline bool allowedUrl(const char* url,const char* hosts) {
   for(const char* p=hosts;*p;){const char* comma=strchr(p,',');const size_t len=comma?(size_t)(comma-p):strlen(p);if(len==n&&!memcmp(p,url+8,n))return true;if(!comma)break;p=comma+1;}
   return false;
 }
+inline bool githubReleaseUrl(const char* url) {
+  const char* prefix="https://github.com/";
+  return url&&strncmp(url,prefix,strlen(prefix))==0&&strstr(url+strlen(prefix),"/releases/download/")!=nullptr;
+}
+inline bool githubAssetRedirect(const char* url) {
+  const char* prefix="https://release-assets.githubusercontent.com/github-production-release-asset/";
+  if(!url||strncmp(url,prefix,strlen(prefix))!=0)return false;
+  const size_t length=strlen(url);if(length>2048)return false;
+  const char* query=strchr(url+strlen(prefix),'?');if(!query||query==url+strlen(prefix)||!query[1])return false;
+  for(const char* p=url;*p;++p)if((unsigned char)*p<=32||(unsigned char)*p>126||*p=='#'||*p=='\\')return false;
+  return true;
+}
 inline bool validCommand(const Command& c,const char* device,uint32_t now,uint32_t previous,const char* hosts) {
   if(strcmp(c.device,device)||!hex(c.id,32)||!hex(c.nonce,32)||!hex(c.sha,64)||!version(c.version)||
      c.seq<=previous||c.issued>now+60||now>c.expires||c.expires<c.issued||c.expires-c.issued>600||!c.bytes||!allowedUrl(c.url,hosts))return false;

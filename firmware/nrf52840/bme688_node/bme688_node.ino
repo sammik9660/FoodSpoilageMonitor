@@ -210,6 +210,7 @@
 #include "src/Bosch-BME68x-Library/src/bme68xLibrary.h"
 #endif
 #include "Scan.h"
+#include "ProgressGuard.h"
 #include "MeasurementGuard.h"
 #include <math.h>
 #if !defined(_MSC_VER)  // Windows host sensor test에는 OLED 하드웨어가 없다.
@@ -246,11 +247,14 @@ constexpr uint32_t ENV_FAILURE_RETRY_MS = 5000;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 30000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.12";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.14";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 gas_scan::Diagnostics gasScanDiagnostics;
 gas_scan::FrameBuffer gasFrames;
+progress_guard::Pending gasTxProgress;
+uint32_t gasTxRecoveries=0;
+uint32_t lastEnvironmentProgressAt=0,lastProgressRecoveryAt=0;
 uint32_t nextGasTxAttempt=0, gasTxMaxUs=0, gasTxSerialMaxUs=0;
 constexpr uint32_t GAS_TX_RETRY_MS=5000;
 bool gasHeaterOff=false, haveRejectedGas=false;
@@ -742,10 +746,21 @@ bool stopGasHeater() {
   return gasHeaterOff;
 }
 
+void serviceGasTxRecovery() {
+  if(gasTxProgress.poll(millis(),gasFrames.pending(),gasFrames.sent,Bluefruit.connected())) {
+    ++gasTxRecoveries;
+    Serial.print("BLE TX STALLED pending=");Serial.print(gasFrames.count-gasFrames.sent);
+    Serial.print(" notify=");Serial.print(bleuart.notifyEnabled());
+    Serial.print(" reconnect_attempt=");Serial.println(gasTxRecoveries);
+    Serial.println("BLE TX recovery: original frames retained in RAM; reboot would lose pending data");
+    Bluefruit.disconnect(Bluefruit.connHandle());
+  }
+}
+
 bool serviceGasFrames() {
   if(sensorMode==MODE_GAS || !gasHeaterOff || !gasFrames.pending() ||
-     (int32_t)(millis()-nextGasTxAttempt)<0 || !Bluefruit.connected() ||
-     !bleuart.notifyEnabled())return false;
+     (int32_t)(millis()-nextGasTxAttempt)<0)return false;
+  if(!Bluefruit.connected() || !bleuart.notifyEnabled()){serviceGasTxRecovery();return false;}
   const char* frame=gasFrames.frame[gasFrames.sent];
   const uint32_t started=micros();
   const bool sent=sendLine(frame);
@@ -754,9 +769,11 @@ bool serviceGasFrames() {
   if(!sent) {
     nextGasTxAttempt=millis()+GAS_TX_RETRY_MS;
     Serial.println("SCAN TX deferred; same frame retained in RAM");
+    serviceGasTxRecovery();
     return false;
   }
   ++gasFrames.sent;
+  gasTxProgress.poll(millis(),gasFrames.pending(),gasFrames.sent,Bluefruit.connected());
   nextGasTxAttempt=millis();
   const uint32_t serialStarted=micros();
   Serial.print("TX ");Serial.println(frame);
@@ -1075,6 +1092,7 @@ void serviceEnvironment(uint32_t now) {
   if(envSequence==UINT32_MAX){sensorReady=false;sensorMode=MODE_REC;
     Serial.println("ERROR environment SEQ exhausted");return;}
   ++envSequence;lastEnvData=data;envReadOK=true;envConsecutiveFailures=0;
+  lastEnvironmentProgressAt=millis();
   measurementGuard.acceptEnvironment(data.temperature,data.humidity,data.pressure,millis());
   lastEnvMeasurementIndex=data.meas_index;haveEnvMeasurementIndex=true;
   recoveryDelay=RECOVERY_MIN_MS;
@@ -1101,6 +1119,15 @@ void loop() {
 #if !defined(_MSC_VER)
   loopHeartbeatAt = now;
 #endif
+  // This checks measurement progress, not merely execution of loop(). Existing
+  // GAS/forced-conversion timeouts remain the owners of their active modes.
+  if(sensorReady&&!recoveryPending&&sensorMode==MODE_ENV&&
+     uint32_t(now-lastEnvironmentProgressAt)>ENV_INTERVAL_MS+60000UL&&
+     uint32_t(now-lastProgressRecoveryAt)>=60000UL) {
+    lastProgressRecoveryAt=now;
+    Serial.println("ENV PROGRESS STALLED; sensor recovery; pending GAS frames retained");
+    recoverSensor();
+  }
   if(serviceGasFrames())return;
   serviceBatteryVoltage(now);
 #if !defined(_MSC_VER)

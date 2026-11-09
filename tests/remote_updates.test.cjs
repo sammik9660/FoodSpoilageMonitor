@@ -93,19 +93,23 @@ test('downgrades and legacy targets require explicit approval; same ESP version 
 });
 test('real dashboard requires approval, scopes the selected device and preserves command state after refresh',()=>{
  const e=env();let approvals=false,queued=0;
- function browser(){
-  const elements=new Map(),element=id=>{if(!elements.has(id))elements.set(id,{value:id==='remoteToken'?operator:'',textContent:'',innerHTML:'',disabled:false,hidden:false,options:[],appendChild(option){this.options.push(option);if(!this.value)this.value=option.value;},remove(){elements.delete(id);}});return elements.get(id);};
+ const saved=new Map(),localStorage={getItem:key=>saved.get(key)||null,setItem:(key,value)=>saved.set(key,value),removeItem:key=>saved.delete(key)};
+ function browser(initialToken=operator){
+  const elements=new Map(),element=id=>{if(!elements.has(id))elements.set(id,{value:id==='remoteToken'?initialToken:'',textContent:'',innerHTML:'',disabled:false,hidden:false,options:[],appendChild(option){this.options.push(option);if(!this.value)this.value=option.value;},remove(){elements.delete(id);}});return elements.get(id);};
   element('devices').insertAdjacentHTML=(_,html)=>{for(const m of html.matchAll(/id="([^"]+)"/g))element(m[1]);};
   let success,failure;const runner={withSuccessHandler(fn){success=fn;return this;},withFailureHandler(fn){failure=fn;return this;}};
   for(const name of ['getDashboardDevices','getDashboard','getBatteryHistory','getRemoteUpdateCatalog','queueRemoteUpdate'])runner[name]=(...args)=>{try{if(name==='queueRemoteUpdate')queued++;success(e.api[name](...args));}catch(err){failure(err);}};
   const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8'),script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','5000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
-  const ctx={document:{getElementById:element,createElement:()=>({})},google:{script:{run:runner}},Date:e.api.Date,crypto:crypto.webcrypto,confirm:()=>approvals,setInterval(){},setTimeout(){},console};
+  const ctx={document:{getElementById:element,createElement:()=>({})},google:{script:{run:runner}},localStorage,Date:e.api.Date,crypto:crypto.webcrypto,confirm:()=>approvals,setInterval(){},setTimeout(){},console};
   vm.createContext(ctx);vm.runInContext(script,ctx);return {ctx,element};
  }
  const first=browser();first.ctx.loadRemoteCatalog(a);first.element('remoteRelease-'+a).value='esp-test';
  first.ctx.approveRemoteUpdate(a);assert.equal(queued,0);
  approvals=true;first.ctx.approveRemoteUpdate(a);assert.equal(queued,1);assert.equal(e.api.remoteLoad_(a,true).command.device,a);assert.equal(e.api.remoteSummary_(b).state,'IDLE');
- const second=browser();assert.equal(second.element('remoteStart-'+a).disabled,true);assert.equal(queued,1);assert.match(second.element('remoteState-'+a).textContent,/명령 전달 대기/);
+ first.element('remoteToken').value='bad';first.ctx.saveRemoteToken();assert.equal(saved.size,0);
+ first.element('remoteToken').value=operator;first.ctx.saveRemoteToken();assert.equal(saved.get('foodmonitor.remote.operator.v1'),operator);
+ const second=browser('');assert.equal(second.element('remoteToken').value,operator);assert.equal(second.element('remoteStart-'+a).disabled,true);assert.equal(queued,1);assert.match(second.element('remoteState-'+a).textContent,/명령 전달 대기/);
+ second.ctx.clearRemoteToken();assert.equal(saved.size,0);assert.equal(second.element('remoteToken').value,'');
 });
 // Public, deterministic host-test vectors; these are NOT deployment secrets or live URLs.
 const vector=env();vector.queue();const command=vector.exchange(vector.request());

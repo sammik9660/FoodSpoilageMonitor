@@ -431,6 +431,7 @@ function ingest(payload) {
       }
     }
     const record=cacheRecording(recordingResult(ctx,deviceId));
+    if(typeof monitorStoredProgress_==='function')try{monitorStoredProgress_(deviceId,samples,acks,Date.now());}catch(error){console.error('Monitoring snapshot failed: '+String(error));}
     try {cache.put(heartbeatStateKey,otaState,600);} catch(_) {}
     const snap=cacheHealth(payload,normalized,samples,deviceId,now);
     try {appendBatteryHistory(ctx,deviceId,normalized.sensorId,snap);SpreadsheetApp.flush();} catch(error) {
@@ -493,7 +494,11 @@ function getDashboard(requestedDeviceId) {
   const integrity_reason=!h?null:h.spool_error?'SPIFFS/spool fault reported by gateway':
     h.spool_full?'Spool capacity exhausted; unacknowledged data is retained':
     h.queue_drops>0?'Gateway reported '+h.queue_drops+' rejected queue item(s) since boot':null;
-  return {device_id:deviceId,state,age,health:h,recording,server_time:now,integrity_reason,
+  const progress_reason=transportStale?'최근 게이트웨이 heartbeat가 없습니다. Wi-Fi 단절 여부는 확인할 수 없습니다.':
+    state==='STALE'?(age===null?'클라우드 연결은 유지되지만 유효한 환경 측정값이 없습니다.':'클라우드 연결은 유지되지만 환경 측정값이 '+Math.floor(age/1000)+'초 동안 갱신되지 않았습니다.'):
+    h&&typeof h.last_valid_age_ms==='number'&&h.last_valid_age_ms+now-h.server_seen_at>1200000?
+      '유효 GAS 데이터가 20분 이상 갱신되지 않았습니다. 연결 상태만으로 측정 진행을 보장할 수 없습니다.':null;
+  return {device_id:deviceId,state,age,health:h,recording,server_time:now,integrity_reason,progress_reason,
     remote_update:typeof remoteSummary_==='function'?remoteSummary_(deviceId):null};
 }
 function getBatteryHistory(requestedDeviceId, requestedRange) {
