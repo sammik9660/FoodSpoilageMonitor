@@ -247,7 +247,7 @@ constexpr uint32_t ENV_FAILURE_RETRY_MS = 5000;
 constexpr uint32_t FAILURE_THRESHOLD = 3;
 constexpr uint32_t RECOVERY_MIN_MS = 5000;
 constexpr uint32_t RECOVERY_MAX_MS = 30000;
-constexpr char SENSOR_FIRMWARE_VERSION[] = "2.0.14";
+constexpr char SENSOR_FIRMWARE_VERSION[] = "2.1.0";
 Bme68x bme;
 gas_scan::Tracker scanTracker;
 gas_scan::Diagnostics gasScanDiagnostics;

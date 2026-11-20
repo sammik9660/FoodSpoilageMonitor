@@ -3,7 +3,7 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const path=require('node:path');
 let tests=0;
-function environment(){
+function environment(options={}){
  let time=Date.parse('2026-09-28T12:00:00Z'),uuid=0,fail=null,locked=false,forceLockBusy=false,lockAdvance=0;
  let waitLockCalls=0,tryLockCalls=0;
  const cache=new Map();
@@ -40,6 +40,13 @@ function environment(){
  };
  vm.createContext(api);vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Code.gs'),'utf8'),api);
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Monitoring.gs'),'utf8'),api);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/StorageSessions.gs'),'utf8'),api);
+  if(!options.noProgress){
+    vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/FoodProgressModel.gs'),'utf8'),api);
+    vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/FoodProgress.gs'),'utf8'),api);
+  }
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/FoodReview.gs'),'utf8'),api);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/StorageRisk.gs'),'utf8'),api);
  api.setupReliability();
  return {api,all,sensor,props,cache,setTime:t=>time=t,now:()=>time,setFail:f=>fail=f,
   setLockBusy:v=>forceLockBusy=v,setLockAdvance:v=>lockAdvance=v,
@@ -231,6 +238,12 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  assert(element('sessionDate-'+a).textContent.startsWith('실험 시작: '));assert.equal(element('sessionId-'+a).textContent,'EXP-recent');
  ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{server_seen_at:e.now(),local_ip:'192.168.68.57',remote_capable:false},recording:{state:'STOPPED'}});
  assert.equal(element('espOtaLink-'+a).href,'http://192.168.68.57:8080/');
+  ctx.show(a,{state:'LIVE / ONLINE',age:1000,server_time:e.now(),health:{server_seen_at:e.now(),local_ip:'10.0.0.57',remote_capable:false},recording:{state:'STOPPED'}});
+  assert.equal(element('espOtaLink-'+a).href,'http://10.0.0.57:8080/');
+  assert.equal(element('nrfDfuStatusLink-'+a).href,'http://10.0.0.57:8080/nrf-dfu/status');
+  assert.equal(element('espOtaLink-'+a).hidden,false);
+  assert.equal(ctx.privateLanIp('172.16.1.57'),true);
+  assert.equal(ctx.privateLanIp('8.8.8.8'),false);
  assert(element('remotePrereq-'+a).textContent.includes('장치 키'));
  assert(element('remoteStart-'+a).disabled);
  ctx.show(a,{state:'STALE',age:120000,server_time:e.now(),health:{server_seen_at:e.now()-120000,local_ip:'192.168.68.57',remote_capable:true},recording:{state:'STOPPED'}});
@@ -250,6 +263,370 @@ test('dashboard renders two virtual devices and scopes control, errors, and CSV 
  offlineB=true;ctx.poll();assert.equal(element('state-'+a).textContent,e.api.getDashboard(a).state);assert.equal(element('state-'+b).textContent,'CLOUD/UPLOAD ERROR (dashboard request)');
  ctx.control(a,false);assert.equal(e.api.getDashboard(a).recording.state,'STOPPED');assert.equal(e.api.getDashboard(b).recording.state,'STOPPED');
  assert.equal(element('message-'+a).textContent,'실험을 종료했습니다.');
+});
+ test('food section leads each device while management controls and two-device isolation remain',()=>{
+ const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
+ const script=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('<?= refreshMs ?>','5000').replace('<?= webAppUrl ?>','https://example.invalid/exec');
+  const ids=['111111111111','222222222222'],elements=new Map(),calls=[],storageCalls=[],backfillCalls=[],now=Date.now();let failSecond=false,holdSecond=false,pendingFood,foodStatus='EXPERIMENTAL_ONLY',foodAt=now,foodSensor='aaaabbbbccccdddd',anomalyIndex=1.2,riskWarning=true,progressCode=null;
+ function element(id){if(!elements.has(id))elements.set(id,{id,value:'',href:'',textContent:'',innerHTML:'',children:[],hidden:false,disabled:false,
+  appendChild(x){this.children.push(x);},remove(){elements.delete(id);}});return elements.get(id);}
+ element('loading');element('remoteToken');element('remoteTokenStatus');element('devices').insertAdjacentHTML=(_,markup)=>{for(const m of markup.matchAll(/id="([^"]+)"/g))element(m[1]);};
+ let success,failure;
+ const runner={withSuccessHandler(fn){success=fn;return this;},withFailureHandler(fn){failure=fn;return this;},
+   getDashboardDevices(){success(ids.map(device_id=>({device_id})));},getBatteryHistory(){success({points:[],range:'24h',total:0});},
+   updateStorageDetails(...args){storageCalls.push(args);success({});},
+   getStorageGasBackfill(id){backfillCalls.push(id);success({complete_scans:4,status:'READY'});},
+  getDashboard(id){success({state:'LIVE / ONLINE',age:1000,server_time:now,health:{server_seen_at:now,environment:{t:25,h:50,p:1000}},recording:{state:'RECORDING',session_id:'EXP-'+id}});},
+  getFoodReview(id,selected){calls.push([id,selected]);if(id===ids[1]&&failSecond){failure(Error('food RPC offline'));return;}
+   const deliver=success,result={choices:[{id:'EXP-'+id,label:'현재 음식',stopped_at:null},{id:'EXP-past',label:'과거 음식',stopped_at:now-1000}],
+     session:selected||'EXP-'+id,live:!selected,storage_started_at:now-3600000,food_name:selected?'과거 음식':'현재 음식',food_source:'실험명에 입력된 음식',elapsed_ms:3600000,
+    health:{server_seen_at:now,ble_connected:true,sensor_id:'aaaabbbbccccdddd',
+      environment:{t:24.5,h:63.2,age_ms:id===ids[0]?600000:60000},
+       food_ai:id===ids[1]?{sensor_id:foodSensor,status:foodStatus,candidate:'chicken',inferred_at:foodAt}:null,
+       gas_anomaly:id===ids[1]?{storage_session_id:'STO-'+'a'.repeat(32),sensor_id:'aaaabbbbccccdddd',status:'EXPERIMENTAL_INDEX',index:anomalyIndex,inferred_at:now}:null},
+    storage_session:id===ids[1]?{state:'ACTIVE',storage_session_id:'STO-'+'a'.repeat(32),sensor_id:'aaaabbbbccccdddd'}:null,
+    gas_status:{code:id===ids[0]?'DELAYED':'NORMAL',text:id===ids[0]?'GAS 주기 초과':'GAS 정상 주기 대기',at:now-120000},
+    storage_risk:id===ids[0]?{score:null,reasons:['식품 상태에 맞는 기간 기준 없음'],period_score:null,temperature_score:100,observed_h:82.9,over_4c_h:65.4,temperature_warning:'4°C 초과 관측 시간이 2시간 이상입니다.'}:
+       {score:54,reasons:[],period_score:8,temperature_score:100,observed_h:3,over_4c_h:2,temperature_warning:riskWarning?'냉장 기준 초과':null},
+     progress:progressCode?{code:progressCode,index:50,at:now,basis:'model_time',model:'assumed-progress-v1',
+       groups:10,evaluated:1139,label_basis:'초반·후반 가정',reason:'음식 종류와 보관 시간'}:null,
+    decision:{code:'UNKNOWN',title:'판정 불가',icon:'⚪',tone:'unknown',reasons:['검증 레이블 부족'],judged_at:null}};
+   if(id===ids[1]&&holdSecond){holdSecond=false;pendingFood=()=>deliver(result);return;}deliver(result);}};
+  const opened=[];
+  const ctx={document:{getElementById:element,createElement:()=>({})},google:{script:{run:runner}},
+   window:{open:url=>opened.push(url)},setInterval(){},setTimeout(){},Number,String,JSON,Map,Date,encodeURIComponent};
+ vm.createContext(ctx);vm.runInContext(script,ctx);
+  for(const id of ids){assert(element('panel-'+id));assert(element('all-'+id).href.includes('device='+id));assert.equal(element('foodAiState-'+id).textContent,'');assert.equal(element('foodAiPanel-'+id).hidden,true);}
+  const markup=ctx.panelMarkup(ids[0],0);assert(markup.indexOf('id="foodCard-'+ids[0])<markup.indexOf('id="health-'+ids[0]));
+  assert(markup.includes('관리·개발 기능'));assert(markup.includes('실제 음식 투입 시각'));
+  assert(markup.includes('manualLocalIp-'+ids[0]));
+  assert(html.includes('id="fieldRecoveryIp"'));
+  element('manualLocalIp-'+ids[1]).value='192.168.1.124';ctx.openManualLocal(ids[1],'/remote-config');
+  assert.deepEqual(opened,['http://192.168.1.124:8080/remote-config']);
+  element('fieldRecoveryIp').value='10.0.0.57';ctx.openFieldRecovery('/nrf-dfu/status');
+  assert.equal(opened[1],'http://10.0.0.57:8080/nrf-dfu/status');
+  element('manualLocalIp-'+ids[1]).value='8.8.8.8';ctx.openManualLocal(ids[1],'/');
+  assert.equal(opened.length,2);
+ assert(markup.includes('<details><summary>상세 진단 JSON 보기</summary>'));
+ assert.equal(element('foodMeasure-'+ids[0]).textContent,'환경 측정 갱신 대기');
+ assert.equal(element('foodMeasure-'+ids[1]).textContent,'환경 측정 정상');assert.equal(element('foodTemp-'+ids[1]).textContent,'24.5 °C');
+ assert.equal(element('foodGasState-'+ids[0]).textContent,'GAS 주기 초과');
+ assert.equal(element('foodGasState-'+ids[1]).textContent,'GAS 정상 주기 대기');
+  assert.equal(element('foodRiskScore-'+ids[0]).textContent,'온도 노출 100 / 100');
+ assert.equal(element('foodTitle-'+ids[0]).textContent,'음식 보관 중');
+  assert.equal(element('foodAiState-'+ids[0]).textContent,'');
+  assert(!/미평가|미검증|부족/.test([element('foodTitle-'+ids[0]).textContent,
+    element('foodRiskScore-'+ids[0]).textContent,element('foodRiskReason-'+ids[0]).textContent,
+    element('foodReason-'+ids[0]).textContent].join(' ')));
+ assert.equal(element('foodRiskScore-'+ids[1]).textContent,'54 / 100');
+ assert.equal(element('foodTempWarning-'+ids[1]).textContent,'냉장 기준 초과');
+ assert.match(element('foodEdge-'+ids[1]).textContent,/닭가슴살/);
+  assert.equal(element('foodAiCandidate-'+ids[1]).textContent,'닭가슴살 (추정)');
+   assert.match(element('foodAiCandidateDetail-'+ids[1]).textContent,/ESP32 최근 GAS/);
+  assert.equal(element('foodAiCandidate-'+ids[0]).textContent,'최근 추론 결과 없음');
+  foodStatus='ABSTAIN_ONE_EXPOSURE';ctx.loadFoodReview(ids[1],true);
+  assert.equal(element('foodAiCandidate-'+ids[1]).textContent,'닭가슴살 (추정)');
+   assert.match(element('foodAiCandidateDetail-'+ids[1]).textContent,/ESP32 최근 GAS/);
+  foodAt=now-1300000;ctx.loadFoodReview(ids[1],true);
+  assert.equal(element('foodAiCandidate-'+ids[1]).textContent,'최근 추론 결과 없음');
+  foodAt=now;foodSensor='ffffffffffffffff';ctx.loadFoodReview(ids[1],true);
+  assert.equal(element('foodAiCandidate-'+ids[1]).textContent,'최근 추론 결과 없음');
+  foodSensor='aaaabbbbccccdddd';foodStatus='EXPERIMENTAL_ONLY';ctx.loadFoodReview(ids[1],true);
+ assert.match(element('foodAnomaly-'+ids[1]).textContent,/1.20/);
+  assert.match(element('foodAnomaly-'+ids[1]).textContent,/가스 패턴 변화 관찰/);
+  assert.equal(element('foodAnomaly-'+ids[1]).className,'food-signal watch');
+  anomalyIndex=5;ctx.loadFoodReview(ids[1],true);
+  assert.equal(element('foodAnomaly-'+ids[1]).className,'food-signal high');
+  anomalyIndex=0.8;ctx.loadFoodReview(ids[1],true);
+  assert.match(element('foodAnomaly-'+ids[1]).textContent,/변화 작음/);
+  anomalyIndex=1.2;ctx.loadFoodReview(ids[1],true);
+  riskWarning=false;progressCode='MIDDLE';ctx.loadFoodReview(ids[1],true);
+   assert.equal(element('foodTitle-'+ids[1]).textContent,'소비 우선 권장');
+  assert.equal(element('foodCard-'+ids[1]).className,'food-status suspect');
+   assert.match(element('foodAiReason-'+ids[1]).textContent,/음식 종류와 보관 시간/);
+   assert.equal(element('foodAiPanel-'+ids[1]).hidden,false);
+  assert.match(element('foodModelEvidence-'+ids[1]).textContent,/실측 부패 정확도/);
+  riskWarning=true;progressCode='EARLY';ctx.loadFoodReview(ids[1],true);
+  assert.equal(element('foodTitle-'+ids[1]).textContent,'신선 단계 추정');
+  assert.equal(element('foodCard-'+ids[1]).className,'food-status fresh');
+  assert.equal(element('foodTempWarning-'+ids[1]).textContent,'냉장 기준 초과');
+  progressCode='MIDDLE';ctx.loadFoodReview(ids[1],true);
+  assert.equal(element('foodCard-'+ids[1]).className,'food-status suspect');
+  progressCode='LATE';ctx.loadFoodReview(ids[1],true);
+  assert.equal(element('foodCard-'+ids[1]).className,'food-status signs');
+  riskWarning=true;progressCode=null;ctx.loadFoodReview(ids[1],true);
+ holdSecond=true;ctx.loadFoodReview(ids[1],true);
+ element('foodSession-'+ids[1]).value='EXP-past';ctx.loadFoodReview(ids[1],true);
+ assert.equal(element('foodName-'+ids[1]).textContent,'음식 정보 확인 중');pendingFood();
+ assert.equal(element('foodName-'+ids[1]).textContent,'과거 음식 · 실험명에 입력된 음식');
+  assert.equal(element('foodAiCandidate-'+ids[1]).textContent,'최근 추론 결과 없음');
+  assert.match(element('foodAnomaly-'+ids[1]).textContent,/확인 대기/);
+ element('foodSession-'+ids[1]).value='EXP-past';ctx.loadFoodReview(ids[1],true);
+ assert.equal(element('foodSession-'+ids[1]).value,'EXP-past');assert.equal(element('foodName-'+ids[1]).textContent,'과거 음식 · 실험명에 입력된 음식');
+ failSecond=true;ctx.loadFoodReview(ids[1],true);
+ assert.equal(element('foodTitle-'+ids[1]).textContent,'보관 조건 확인 중');assert.equal(element('foodName-'+ids[1]).textContent,'음식 정보 확인 중');
+  assert.equal(element('foodAiCandidate-'+ids[1]).textContent,'확인 불가');
+  assert.equal(element('foodAnomaly-'+ids[1]).className,'food-signal');
+ assert.equal(element('foodTime-'+ids[1]).textContent,'--');assert.equal(element('foodTemp-'+ids[1]).textContent,'--');
+ assert.equal(element('foodMeasure-'+ids[1]).textContent,'환경 조회 실패');assert.equal(element('foodGasState-'+ids[1]).textContent,'GAS 조회 실패');assert.match(element('foodReason-'+ids[1]).textContent,/food RPC offline/);
+ assert.equal(element('foodName-'+ids[0]).textContent,'현재 음식 · 실험명에 입력된 음식');
+ assert(element('all-'+ids[1]).href.includes('device='+ids[1]));
+ assert(calls.some(([id,selected])=>id===ids[1]&&selected==='EXP-past'));
+  vm.runInContext(`panels.get('${ids[1]}').storage={state:'ACTIVE',container_name:'기존 용기',placed_at:${now-3600000}}`,ctx);
+  element('containerName-'+ids[1]).value='같은 용기';element('storageFood-'+ids[1]).value='생숙주';
+  element('storagePlaced-'+ids[1]).value='2026-11-16T15:00';ctx.storageControl(ids[1],true);
+  assert.equal(storageCalls.length,1);assert.equal(storageCalls[0][0],ids[1]);
+  assert.equal(storageCalls[0][1],'같은 용기');assert.equal(storageCalls[0][2],'생숙주');
+  assert(Number.isFinite(storageCalls[0][3]));
+  assert.deepEqual(backfillCalls,[ids[1]]);
+});
+test('food review uses live data but abstains on stale, incomplete and unverified status',()=>{
+ const e=environment(),id='111111111111',t=e.now(),s=e.api.startRecording('숙주나물 냉장',id);
+ const health={ble_connected:true,sensor_ok:true,server_seen_at:t};
+ const base={session:s.session_id,live:true,now:t,health,scan:{at:t,quality:'OK'}};
+ assert.equal(e.api.foodDecision_(base).code,'UNKNOWN');
+ assert.match(e.api.foodDecision_(base).reasons.join(' '),/레이블/);
+ assert.match(e.api.foodDecision_({...base,now:t+120000}).reasons.join(' '),/통신/);
+ assert.match(e.api.foodDecision_({...base,scan:{at:t,quality:'NEWER_INCOMPLETE_SCAN'}}).reasons.join(' '),/정보가 부족/);
+ assert.match(e.api.foodDecision_({...base,scan:null}).reasons.join(' '),/완성 GAS/);
+ assert.match(e.api.foodDecision_({...base,scan:null,window_limited:true}).reasons.join(' '),/조회 범위 밖/);
+ const review=e.api.getFoodReview(id,'');assert.equal(review.session,s.session_id);
+ assert.equal(review.food_name,'숙주나물');assert.equal(review.food_source,'실험명에 입력된 음식');
+ assert.equal(review.decision.code,'UNKNOWN');
+});
+test('two food reviews remain read-only while ingest Script Lock is busy',()=>{
+ const e=environment(),a='111111111111',b='222222222222';
+ e.api.startRecording('숙주나물 냉장',a);e.api.startRecording('삶은계란 상온',b);
+ const before=e.lockCounts();e.setLockBusy(true);
+ const first=e.api.getFoodReview(a,''),second=e.api.getFoodReview(b,'');
+ assert.equal(first.food_name,'숙주나물');assert.equal(second.food_name,'삶은계란');
+ assert.equal(first.decision.code,'UNKNOWN');assert.equal(second.decision.code,'UNKNOWN');
+ assert.deepEqual(e.lockCounts(),before);
+ assert.equal(e.sensor.getLastRow(),2);e.setLockBusy(false);
+});
+test('GAS freshness follows ten-minute complete-scan cadence independently of ENV',()=>{
+ const e=environment(),now=e.now(),base={session:'EXP-live',live:true,now,
+   health:{server_seen_at:now,ble_connected:true},scan:{at:now-120000,quality:'OK'}};
+ assert.equal(e.api.foodGasStatus_(base).code,'NORMAL'); // two minutes is normal
+ assert.equal(e.api.foodGasStatus_({...base,scan:{at:now-780001,quality:'OK'}}).code,'DELAYED');
+ assert.equal(e.api.foodGasStatus_({...base,scan:{at:now-1500001,quality:'OK'}}).code,'STALLED');
+ assert.equal(e.api.foodGasStatus_({...base,scan:null}).code,'NO_COMPLETE_SCAN');
+ assert.equal(e.api.foodGasStatus_({...base,scan:null,window_limited:true}).code,'WINDOW_LIMIT');
+ assert.equal(e.api.foodGasStatus_({...base,health:{server_seen_at:now-91000,ble_connected:true}}).code,'DISCONNECTED');
+ assert.equal(e.api.foodGasStatus_({...base,live:false}).code,'HISTORICAL');
+ assert.equal(e.api.foodGasStatus_({...base,scan:{at:now-1500000,quality:'OK'},
+   health:{server_seen_at:now,ble_connected:true,ai_shadow:{last_complete_scan_at:now-120000}}}).code,'RECORDING_PENDING');
+ assert.equal(e.api.foodGasStatus_({...base,scan:{at:now-1000000,quality:'OK'},newer_input_at:now-10000}).code,'DELAYED');
+ assert.equal(e.api.foodDecision_({...base,health:{server_seen_at:now,ble_connected:true,sensor_ok:true}}).code,'UNKNOWN');
+});
+test('food review refreshes GAS age across a 60-second cached result',()=>{
+ const e=environment(),id='111111111111',started=e.now();e.api.startRecording('밥 상온',id);
+ const frames=Array.from({length:10},(_,i)=>v3(i+1,i,started));
+ assert.equal(e.api.ingest({version:3,device_id:id,samples:frames,health:{ble_connected:true,sensor_ok:true}}).stored,10);
+ e.setTime(started+750000);
+ e.api.ingest({version:3,device_id:id,samples:[],health:{ble_connected:true,sensor_ok:true}});
+ const first=e.api.getFoodReview(id,'');assert.equal(first.gas_status.code,'NORMAL');
+ e.setTime(started+795000);
+ e.api.ingest({version:3,device_id:id,samples:[],health:{ble_connected:true,sensor_ok:true}});
+ const cached=e.api.getFoodReview(id,'');assert.equal(cached.gas_status.code,'DELAYED');
+ assert(cached.gas_status.age_ms>first.gas_status.age_ms);
+});
+test('new partial GAS input preserves complete fingerprint quality and 127-minute stall',()=>{
+ const e=environment(),id='111111111111',t=e.now();e.api.startRecording('숙주나물 냉장',id);
+ const complete=Array.from({length:10},(_,i)=>({...v3(i+1,i,t),g:50+i*10}));
+ assert.equal(e.api.ingest({version:3,device_id:id,samples:complete,health:{ble_connected:true,sensor_ok:true}}).stored,10);
+ e.setTime(t+127*60000);
+ const partial={...v3(11,0,e.now()),scan_seq:2,g:62};
+ assert.equal(e.api.ingest({version:3,device_id:id,samples:[partial],health:{ble_connected:true,sensor_ok:true}}).stored,1);
+ const review=e.api.getFoodReview(id,'');
+ assert.equal(review.scan.quality,'OK');assert.equal(review.gas_status.code,'STALLED');
+ assert(review.newer_input_at>review.scan.at);assert(review.rejected_groups.incomplete>=1);
+ assert.equal(review.food_prediction,null);
+});
+test('storage rule scores complete cold history and flags room exposure without GAS',()=>{
+ const e=environment(),now=e.now(),start=now-3600000;
+ const points=Array.from({length:13},(_,i)=>({at:start+i*300000,t:3,h:90}));
+ const cold=e.api.storageRisk_({now,started_at:start,label:'삶은계란',points});
+ assert(Number.isFinite(cold.score)&&cold.score<20);assert.equal(cold.temperature_score,0);
+ assert.equal(cold.official_duration_h,168);assert.equal(cold.official_c,4);
+ assert.equal(cold.humidity_score,null);assert.equal(cold.gas_added_to_score,false);
+ const warm=e.api.storageRisk_({now,started_at:start,label:'삶은계란',points:points.map(p=>({...p,t:25}))});
+ assert(warm.score>cold.score);assert(warm.temperature_warning);
+ assert.equal(warm.temperature_state,'ACTIVE');
+});
+test('brief refrigerator excursions preserve exposure but do not become active warnings',()=>{
+ const e=environment(),now=e.now(),start=now-3*3600000;
+ const points=Array.from({length:37},(_,i)=>({at:start+i*300000,t:i<30?5:i===36?4.5:3}));
+ const brief=e.api.storageRisk_({now,started_at:start,label:'삶은계란',points});
+  assert(brief.over_4c_h>2);assert.equal(brief.temperature_state,'REFERENCE_EXPOSURE');
+  assert.equal(brief.temperature_warning,null);assert.equal(brief.temperature_note,null);
+ const cooled=e.api.storageRisk_({now,started_at:start,label:'삶은계란',points:points.map((p,i)=>i===36?{...p,t:3}:p)});
+ assert.equal(cooled.temperature_state,'HISTORICAL');assert.equal(cooled.temperature_warning,null);
+ assert.equal(cooled.temperature_score,brief.temperature_score); // original cumulative exposure preserved
+  const recent=Array.from({length:7},(_,i)=>({at:now-1800000+i*300000,t:6.5}));
+ const sustained=e.api.storageRisk_({now,started_at:now-1800000,label:'삶은계란',points:recent});
+ assert.equal(sustained.temperature_state,'ACTIVE');assert(sustained.temperature_warning);
+  assert.equal(sustained.active_alert_c,6);
+  const cycling=e.api.storageRisk_({now,started_at:now-1800000,label:'삶은계란',
+    points:recent.map(p=>({...p,t:5.8}))});
+  assert(cycling.over_4c_h>0);assert.equal(cycling.temperature_warning,null);
+  assert.equal(cycling.temperature_state,'REFERENCE_EXPOSURE');
+});
+test('storage rule preserves nulls for unknown preparation, missing start, duration and gaps',()=>{
+ const e=environment(),now=e.now(),start=now-3600000;
+ const sparse=[{at:start,t:3},{at:now,t:3}];
+ const gap=e.api.storageRisk_({now,started_at:start,label:'삶은계란',points:sparse});
+ assert.equal(gap.score,null);assert(gap.has_gap);assert(gap.reasons.some(x=>x.includes('공백')));
+ const noStart=e.api.storageRisk_({now,started_at:null,label:'삶은계란',points:[]});
+ assert.equal(noStart.score,null);assert.equal(noStart.period_score,null);assert.equal(noStart.temperature_score,null);
+ assert.equal(noStart.observed_h,null);assert.equal(noStart.over_4c_h,null);
+ const sprouts=e.api.storageRisk_({now,started_at:start,label:'숙주나물',points:[]});
+ assert.equal(sprouts.official_duration_h,null);assert.equal(sprouts.score,null);
+ assert.equal(e.api.storageRiskProfile_('생닭').duration_h,24);
+ assert.equal(e.api.storageRiskProfile_('익힌 닭').duration_h,72);
+ assert.equal(e.api.storageRiskProfile_('생달걀').duration_h,null);
+ assert.equal(e.api.storageRiskProfile_('생달걀 껍질').duration_h,504);
+ assert.equal(e.api.storageRiskProfile_('익힌 숙주').duration_h,72);
+ const elapsed=e.api.storageRisk_({now,started_at:now-169*3600000,label:'삶은계란',points:[]});
+ assert(elapsed.period_score>=70);assert.equal(elapsed.score,null);
+});
+test('active STO telemetry supplies a rule score without changing EXP recording',()=>{
+ const e=environment(),device='111111111111',sensor='aaaabbbbccccdddd';
+ const recording=e.api.startRecording('삶은계란 냉장',device);
+ let storageId=null;
+ function heartbeat(change){const at=e.now(),health={ble_connected:true,environment_ok:true,sensor_id:sensor,ota_state:'IDLE',
+  environment:{t:3,h:80,p:1010,age_ms:0,captured_at_ms:at}};
+  if(Number.isFinite(change)&&storageId)health.ai_shadow={storage_session_id:storageId,sensor_id:sensor,change_index:change,
+    shape_change:change,level_change:change,scored_at:at};
+  return JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:device,sensor_id:sensor,samples:[],health})}}).text);}
+ heartbeat();storageId=e.api.startStorageSession('egg container',device).storage_session_id;
+ e.setTime(e.now()+300000);heartbeat();
+ for(let i=0;i<12;i++){e.setTime(e.now()+300000);heartbeat(i===0?.08:i===11?.12:undefined);}
+ const review=e.api.getFoodReview(device,'');
+ assert.equal(review.session,recording.session_id);assert(Number.isFinite(review.storage_risk.score));
+ assert.equal(review.storage_risk.temperature_score,0);
+ const history=e.api.getStorageTelemetry(device).points;
+ assert.equal(review.gas_change.index,history[history.length-1].change);
+ assert(Math.abs(review.gas_change.delta-.04)<1e-10);
+ assert.equal(e.api.getDashboard(device).recording.state,'RECORDING');
+});
+test('editing actual placement time backfills matching device and food ENV without resetting STO',()=>{
+ const e=environment(),a='111111111111',b='222222222222',sensor='aaaabbbbccccdddd',other='1111222233334444',placed=e.now();
+ e.api.startRecording('숙주나물 냉장',a);e.api.startRecording('삶은계란 냉장',b);
+ const env=(id,seq,at,t)=>{const s={...sample(seq,at,{t}),sample_schema:4};delete s.g;
+   s.uid=(id===a?'b':'c').repeat(32)+'-'+seq;
+   return e.api.ingest({version:3,device_id:id,sensor_id:id===a?sensor:other,samples:[s]});};
+ env(a,1,placed,8);env(b,1,placed,28);
+ e.setTime(placed+300000);env(a,2,e.now(),7);env(b,2,e.now(),27);
+ const heartbeat=()=>JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:a,sensor_id:sensor,samples:[],
+   health:{ble_connected:true,sensor_id:sensor,ota_state:'IDLE',environment:{t:3,h:80,p:1010,age_ms:0,captured_at_ms:e.now()}}})}}).text);
+ e.setTime(placed+600000);heartbeat();const state=e.api.startStorageSession('시연용 용기',a);
+ e.setTime(placed+900000);heartbeat();const active=e.api.getStorageSession(a);
+ const corrected=e.api.updateStorageDetails(a,'시연용 용기','생숙주',placed);
+ assert.equal(corrected.storage_session_id,state.storage_session_id);
+ assert.equal(corrected.started_at,active.started_at);assert.equal(corrected.placed_at,placed);
+ const fingerprint=[20,200,400,300,80,70,60,30,40,50];
+ for(let scan=1;scan<=4;scan++){
+   const frames=Array.from({length:10},(_,step)=>({...v3((scan-1)*10+step+1,step,placed+(scan-1)*300000),
+     scan_seq:scan,g:fingerprint[step]*(scan===4?2:1)}));
+   assert.equal(e.api.ingest({version:3,device_id:a,sensor_id:sensor,samples:frames}).stored,10);
+ }
+ const otherFrames=Array.from({length:10},(_,step)=>({...v3(step+1,step,placed),
+   uid:'e'.repeat(32)+'-'+(step+1),nrf_boot:77,g:fingerprint[step]*3}));
+ assert.equal(e.api.ingest({version:3,device_id:b,sensor_id:other,samples:otherFrames}).stored,10);
+ const gasHistory=e.api.getStorageGasBackfill(a);
+ assert.equal(gasHistory.complete_scans,4);assert.equal(gasHistory.status,'READY');
+ assert.equal(gasHistory.source_rows,40);
+ assert(gasHistory.change.index>0);
+ heartbeat();
+ const review=e.api.getFoodReview(a,'');
+ assert.equal(review.food_name,'숙주나물');assert.equal(review.food_source,'보관 설정 음식');
+ assert.equal(review.elapsed_ms,900000);assert(review.storage_risk.observed_h>0);
+ assert(review.storage_risk.over_4c_h>0);assert.equal(review.storage_risk.official_duration_h,null);
+  assert.equal(review.storage_risk.history_source.older_env_rows,2);
+  assert.equal(review.storage_risk.history_source.matching_experiments,1);
+  assert.equal(review.historical_gas.complete_scans,4);assert.equal(review.gas_history_limited,false);
+  assert.equal(review.progress.code,'EARLY');assert.equal(review.progress.basis,'model_a');
+ assert.equal(e.api.getDashboard(b).recording.state,'RECORDING');
+ assert.equal(e.api.getStorageSession(b).state,'NONE');
+ assert.equal(e.all.get('EnvironmentHistory').getLastRow(),5); // original ENV rows preserved
+});
+test('assumption-based progression has time fallback and does not turn stale contact into a verdict',()=>{
+ const e=environment(),now=e.now();
+ const base={label:'생숙주',live:true,elapsed_ms:90*3600000,now,
+   health:{server_seen_at:now,ble_connected:true,environment:{t:3,age_ms:0}},
+   storage_risk:{over_4c_h:0,coverage:1,has_gap:false}};
+ const withEnv=e.api.foodProgress_(base);
+ assert.equal(withEnv.basis,'model_a');
+ assert.equal(withEnv.label_basis.includes('가정'),true);
+ const timeOnly=e.api.foodProgress_({...base,storage_risk:{}});
+ assert.equal(timeOnly.basis,'model_time');
+ const early=e.api.foodProgress_({...base,elapsed_ms:3600000});
+ assert.equal(early.code,'EARLY');assert(withEnv.index>early.index);
+ assert.equal(e.api.foodProgress_({...base,health:{server_seen_at:now-91000}}).basis,'model_time');
+});
+test('yellow food state starts near the observed end, not at a refrigerator temperature swing',()=>{
+ const e=environment(),p={code:'MIDDLE',index:65,model:'test'};
+ const at=hours=>e.api.foodDisplayProgress_(p,{label:'생숙주',elapsed_ms:hours*3600000});
+ assert.equal(at(25.6).display_code,'EARLY');
+ assert.equal(at(70).display_code,'MIDDLE');
+ assert.equal(at(85).display_code,'LATE');
+ assert.equal(at(25.6).code,'MIDDLE'); // raw model output is preserved for diagnostics
+});
+test('ESP progression health is accepted only for matching current food, STO and placement',()=>{
+ const e=environment(),now=e.now(),session='STO-'+'a'.repeat(32),sensor='aaaabbbbccccdddd',placed=now-120*3600000;
+ const payload={model:'assumed-progress-v1-time',storage_session_id:session,sensor_id:sensor,
+   food_code:'sprouts',stage:'LATE',index:100,placed_at:placed,inferred_at:now};
+ const health=e.api.healthSnapshot({food_progress:payload},now,0);
+ assert.equal(health.food_progress.index,100);
+ assert.equal(e.api.healthSnapshot({food_progress:{...payload,index:101}},now,0).food_progress,undefined);
+ assert.equal(e.api.healthSnapshot({food_progress:{...payload,inferred_at:now+6000}},now,0).food_progress,undefined);
+ const ctx={live:true,label:'생숙주',started_at:placed,elapsed_ms:120*3600000,now,
+   storage_session:{state:'ACTIVE',storage_session_id:session,sensor_id:sensor},
+   health:{...health,server_seen_at:now,sensor_id:sensor}};
+ assert.equal(e.api.foodEdgeProgress_(ctx).basis,'esp32_time');
+ assert.equal(e.api.foodEdgeProgress_({...ctx,started_at:placed+1}),null);
+ assert.equal(e.api.foodEdgeProgress_({...ctx,label:'밥'}),null);
+ assert.equal(e.api.foodProgressUnavailable_({...ctx,health:{server_seen_at:now-91000}}),'CLOUD_CONTACT_STALE');
+});
+test('missing cloud progression runtime and coefficients have explicit deployment reasons',()=>{
+ const isolated={Date,Number,Math,JSON};vm.createContext(isolated);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/FoodReview.gs'),'utf8'),isolated);
+ const input={live:true,label:'생숙주',elapsed_ms:3600000,now:Date.now(),health:{server_seen_at:Date.now()}};
+ assert.equal(isolated.foodProgressUnavailable_(input),'PROGRESS_RUNTIME_MISSING');
+ assert.equal(isolated.foodFallbackProgress_(input).code,'EARLY');
+ assert.equal(isolated.foodFallbackProgress_({...input,elapsed_ms:120*3600000}).code,'LATE');
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../cloud/apps_script/FoodProgress.gs'),'utf8'),isolated);
+ assert.equal(isolated.foodProgressUnavailable_(input),'PROGRESS_MODEL_MISSING');
+});
+test('historic GAS trend uses only complete time-ordered fingerprints',()=>{
+ const e=environment(),start=e.now(),gas=[20,200,400,300,80,70,60,30,40,50];
+ const scans=Array.from({length:4},(_,i)=>({at:start+i*600000,quality:'OK',gas:i===3?gas.map(x=>x*2):gas}));
+ const result=e.api.foodHistoricalChange_(scans.slice().reverse());
+ assert.equal(result.complete_scans,4);assert.equal(result.baseline_at,start);
+ assert(Math.abs(result.index-.3*Math.log10(2))<1e-9);
+ assert.equal(e.api.foodHistoricalChange_(scans.slice(1).reverse()),null);
+});
+test('automatic food view keeps current STO after EXP stops without reusing stopped GAS rows',()=>{
+ const e=environment(),device='111111111111',sensor='aaaabbbbccccdddd';
+ e.api.startRecording('숙주나물 냉장',device);
+ const heartbeat=()=>{const at=e.now();const payload={version:3,device_id:device,sensor_id:sensor,samples:[],
+  health:{ble_connected:true,environment_ok:true,sensor_id:sensor,ota_state:'IDLE',
+    ai_shadow:{feature:1,state:'SCORED',reason:'VALID_CHANGE_INDEX',active:true,baseline_scans:3,
+      complete_scans:4,invalid_scans:0,queue_drops:0,persistent:true,last_complete_scan_at:at,
+      storage_session_id:storageId,sensor_id:sensor,storage_started_at:started},
+    environment:{t:3,h:90,p:1010,age_ms:0,captured_at_ms:at}}};
+  return JSON.parse(e.api.doPost({postData:{contents:JSON.stringify(payload)}}).text);};
+ let storageId=null,started=0;heartbeat();storageId=e.api.startStorageSession('숙주나물 용기',device).storage_session_id;
+ e.setTime(e.now()+120000);heartbeat();assert.equal(e.api.getStorageSession(device).state,'ACTIVE');
+ started=e.api.getStorageSession(device).started_at;
+ e.api.stopRecording(device);e.setTime(e.now()+300000);heartbeat();
+ const review=e.api.getFoodReview(device,'');assert.equal(review.session,storageId);
+ assert.equal(review.storage_only,true);assert.equal(review.live,true);
+ assert.equal(review.food_source,'보관 용기 이름');assert.equal(review.scan,null);
+ assert.equal(review.gas_status.code,'RECORDING_PENDING');
+ assert.equal(review.storage_risk.official_duration_h,null);
+ assert.equal(e.api.getDashboard(device).recording.state,'STOPPED');
 });
 test('device loading displays empty, failure, malformed response, and delayed lookup states',()=>{
  const html=fs.readFileSync(path.join(__dirname,'../cloud/apps_script/Dashboard.html'),'utf8');
@@ -466,5 +843,131 @@ test('STALE explains measurement versus cloud-contact freshness',()=>{
  const e=environment();e.api.ingest({version:2,samples:[],health:{sensor_mode:'ENV',sensor_ok:true,ble_connected:true,environment:{t:25,h:50,p:1000,age_ms:300000}}});
  assert.equal(e.api.getDashboard().state,'STALE');assert(e.api.getDashboard().progress_reason.includes('환경 측정값'));
  e.setTime(e.now()+20000);assert(e.api.getDashboard().progress_reason.includes('heartbeat'));
+});
+test('explicit storage intent survives reboot and activates only on later valid ENV',()=>{
+ const e=environment(),device='111111111111',sensor='aaaabbbbccccdddd',start=e.now();
+ const health=(captured,valid=true)=>({ble_connected:true,environment_ok:valid,sensor_id:sensor,ota_state:'IDLE',
+  environment:{t:valid?25:999,h:50,p:1000,age_ms:0,captured_at_ms:captured}});
+ const sendHealth=(captured,valid=true)=>JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:device,sensor_id:sensor,samples:[],health:health(captured,valid)})}}).text);
+ assert.equal(sendHealth(start-1000).success,true);
+ const state=e.api.startStorageSession('rice container',device);assert.equal(state.state,'PENDING');
+ const noUtc=health(e.now());delete noUtc.environment.captured_at_ms;
+ const noUtcAck=JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:device,sensor_id:sensor,samples:[],health:noUtc})}}).text);
+ assert.equal(noUtcAck.storage_session.reason,'GATEWAY_ENV_UTC_MISSING');
+ const oldEnv=sendHealth(start-1000);assert.equal(oldEnv.success,true);
+ assert.equal(oldEnv.storage_session.reason,'WAIT_ENV_AFTER_REQUEST');
+ assert.equal(e.api.getDashboard(device).storage_session.state,'PENDING');
+ e.setTime(e.now()+120000);assert.equal(sendHealth(e.now(),false).storage_session.reason,'WAIT_VALID_ENV');
+ assert.equal(e.api.getDashboard(device).storage_session.state,'PENDING');
+ const staleStat={...health(e.now()),environment_ok:false};
+ const activated=JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:device,sensor_id:sensor,samples:[],health:staleStat})}}).text);
+ assert.equal(activated.success,true); // accepted ENV, stale STAT must not block start
+ assert.equal(activated.storage_session.state,'ACTIVE');
+ assert.equal(activated.storage_session.storage_session_id,state.storage_session_id);
+ const active=e.api.getDashboard(device).storage_session;assert.equal(active.state,'ACTIVE');
+ assert.equal(active.started_at,e.now());assert.equal(active.sensor_id,sensor);
+ assert.equal(e.api.getStorageTelemetry(device).points.length,1);
+ sendHealth(e.now());assert.equal(e.api.getStorageTelemetry(device).points.length,1);
+ e.setTime(e.now()+300000);
+ const ai={feature:1,state:'SCORED',reason:'VALID_CHANGE_INDEX',active:true,complete_scans:4,
+  storage_session_id:state.storage_session_id,sensor_id:sensor,baseline_scans:3,
+  storage_started_at:active.started_at,baseline_first_at:active.started_at+600000,
+  baseline_ready_at:active.started_at+1800000,invalid_scans:0,queue_drops:0,
+  persistent:true,change_index:0.08,shape_change:0.1,level_change:0.03,scored_at:e.now()};
+ const h={...health(e.now()),ai_shadow:ai};
+ assert.equal(JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:device,sensor_id:sensor,samples:[],health:h})}}).text).success,true);
+ assert.equal(e.api.getStorageTelemetry(device).points.length,2);
+ assert.equal(e.api.getStorageTelemetry(device).points[1].change,0.08);
+ assert.equal(e.api.getDashboard(device).health.ai_shadow.change_index,0.08);
+ const key='STORAGE_V1:'+device,stale=JSON.parse(e.props.get(key));stale.last_telemetry_at=0;
+ e.props.set(key,JSON.stringify(stale));sendHealth(e.now());
+ assert.equal(e.api.getStorageTelemetry(device).points.length,2); // property update lost after row append
+ e.cache.clear();assert.equal(e.api.getStorageSession(device).started_at,active.started_at); // gateway/Cloud cache restart
+ assert.throws(()=>e.api.startStorageSession('duplicate',device),/Finish or repair/);
+ const other='222222222222',otherSensor='1111222233334444';
+ const otherHealth={...health(e.now()),sensor_id:otherSensor};
+ assert.equal(JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:other,sensor_id:otherSensor,samples:[],health:otherHealth})}}).text).success,true);
+ const otherSession=e.api.startStorageSession('other container',other);
+ assert.notEqual(otherSession.storage_session_id,state.storage_session_id);
+ assert.equal(e.api.getStorageSession(device).state,'ACTIVE');
+ assert.equal(e.api.getStorageTelemetry(other).points.length,0);
+ assert.equal(e.api.endStorageSession(device).state,'ENDED');
+ assert.equal(e.all.get('StorageSessions').rows[1][7],'ENDED');
+});
+test('food and placement produce a provisional stage before the first new GAS scan',()=>{
+ const e=environment(),device='111111111111',sensor='aaaabbbbccccdddd',now=e.now();
+ const payload={version:3,device_id:device,sensor_id:sensor,samples:[],health:{ble_connected:true,
+   sensor_id:sensor,environment:{t:3.5,h:80,p:1010,age_ms:0,captured_at_ms:now}}};
+ assert.equal(JSON.parse(e.api.doPost({postData:{contents:JSON.stringify(payload)}}).text).success,true);
+ const state=e.api.startStorageSession('냉장 용기',device,'생숙주',now);
+ assert.equal(state.state,'PENDING');
+ const review=e.api.getFoodReview(device,'');
+ assert.equal(review.session,state.storage_session_id);assert.equal(review.live,true);
+ assert.equal(review.food_name,'숙주나물');assert.equal(review.elapsed_ms,0);
+ assert.equal(review.progress.code,'EARLY');assert.equal(review.progress.basis,'model_time');
+ assert.equal(review.scan,null);
+});
+test('six hours of storage still has a stage when separate cloud model files are absent',()=>{
+ const e=environment({noProgress:true}),device='111111111111',sensor='aaaabbbbccccdddd',now=e.now();
+ const payload={version:3,device_id:device,sensor_id:sensor,samples:[],health:{ble_connected:true,
+   sensor_id:sensor,environment:{t:3.5,h:80,p:1010,age_ms:0,captured_at_ms:now}}};
+ e.api.doPost({postData:{contents:JSON.stringify(payload)}});
+ e.api.startStorageSession('냉장 용기',device,'생숙주',now-6*3600000);
+ const review=e.api.getFoodReview(device,'');
+ assert.equal(review.progress.code,'EARLY');
+ assert.equal(review.progress.basis,'historical_duration_fallback');
+ assert.equal(review.progress_fallback_reason,'PROGRESS_RUNTIME_MISSING');
+ assert.equal(review.elapsed_ms,6*3600000);
+ e.setTime(now+114*3600000);
+ const later=e.api.getFoodReview(device,'');
+ assert.equal(later.progress.code,'LATE');
+ assert.equal(later.progress.basis,'historical_duration_fallback');
+});
+test('missing storage module is explicit without changing committed ACK',()=>{
+ const e=environment();e.api.storageResponse_=undefined;
+ const result=JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:'111111111111',samples:[]})}}).text);
+ assert.equal(result.success,true);assert.equal(result.storage_session.state,'UNAVAILABLE');
+ assert.equal(result.storage_session.reason,'STORAGE_MODULE_MISSING');
+});
+test('inactive AI reason remains visible in dashboard health without STO session',()=>{
+ const e=environment(),device='111111111111';
+ const ai={feature:1,state:'INACTIVE',reason:'START_REQUIRED',active:false,baseline_scans:0,
+  complete_scans:2,invalid_scans:0,queue_drops:0,persistent:true};
+ const ack=JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:device,samples:[],health:{ai_shadow:ai}})}}).text);
+ assert.equal(ack.success,true);assert.equal(ack.storage_session.state,'NONE');
+ const shown=e.api.getDashboard(device).health.ai_shadow;
+ assert.equal(shown.state,'INACTIVE');assert.equal(shown.reason,'START_REQUIRED');
+ assert.equal(shown.complete_scans,2);
+});
+test('new food storage intent leaves an existing EXP recording unchanged',()=>{
+ const e=environment(),device='111111111111',sensor='aaaabbbbccccdddd';
+ const recording=e.api.startRecording('ongoing experiment',device);
+ const health={ble_connected:true,environment_ok:true,sensor_id:sensor,ota_state:'IDLE',
+  environment:{t:25,h:50,p:1000,age_ms:0,captured_at_ms:e.now()-1000}};
+ const send=()=>JSON.parse(e.api.doPost({postData:{contents:JSON.stringify({version:3,device_id:device,sensor_id:sensor,samples:[],health})}}).text);
+ send();const storage=e.api.startStorageSession('container',device);
+ assert(storage.storage_session_id.startsWith('STO-'));
+ assert.equal(e.api.getDashboard(device).recording.session_id,recording.session_id);
+ e.setTime(e.now()+120000);health.environment.captured_at_ms=e.now();
+ const result=send();assert.equal(result.storage_session.state,'ACTIVE');
+ assert.equal(result.recording.session_id,recording.session_id);
+ assert.equal(e.api.getDashboard(device).recording.state,'RECORDING');
+});
+test('food candidate and anomaly diagnostics stay separate from recording ACK and safety score',()=>{
+ const e=environment(),id='111111111111',sensor='aaaabbbbccccdddd',at=e.now();
+ const health={sensor_id:sensor,ble_connected:true,sensor_mode:'GAS',sensor_tx_errors:4,
+   ai_shadow:{feature:1,state:'SCORED',reason:'VALID_CHANGE_INDEX',active:true,baseline_scans:3,
+     complete_scans:12,invalid_scans:0,queue_drops:0,partial_scans:2,rejected_fields:1,last_partial_mask:7,persistent:true},
+   food_ai:{model:'centroid-20261116',sensor_id:sensor,status:'ABSTAIN_ONE_EXPOSURE',
+     candidate:'sprouts',inferred_at:at,distance:2.5,margin:1.2},
+   gas_anomaly:{model:'diagonal-loggas-six-baseline',storage_session_id:'STO-'+ 'a'.repeat(32),sensor_id:sensor,
+     status:'EXPERIMENTAL_INDEX',baseline_scans:6,index:1.4,inferred_at:at,slope_per_hour:.2}};
+ const ack=e.api.ingest({version:3,device_id:id,sensor_id:sensor,samples:[],health});
+ assert.equal(ack.success,true);assert.equal(ack.acks.length,0);
+ const h=e.api.getDashboard(id).health;
+ assert.equal(h.food_ai.candidate,'sprouts');assert.equal(h.food_ai.status,'ABSTAIN_ONE_EXPOSURE');
+ assert.equal(h.gas_anomaly.index,1.4);assert.equal(h.gas_anomaly.spoilage_probability,false);
+ assert.equal(h.ai_shadow.partial_scans,2);assert.equal(h.sensor_tx_errors,4);
+ assert.equal(e.sensor.getLastRow(),2);
 });
 console.log(`${tests} cloud tests passed (mock Sheets, no external services).`);

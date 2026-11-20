@@ -268,7 +268,7 @@ function healthSnapshot(h, now, ageDelta) {
   const numeric=['last_valid_age_ms','queue_depth','spool_depth','sensor_failures','sensor_recoveries',
     'sensor_attempts','ble_gaps','ble_restarts','parse_errors','queue_drops','upload_failures',
     'last_upload_at','nrf_seq','spool_capacity_bytes','spool_used_bytes','unassigned_count',
-    'gateway_uptime_ms','wifi_connected_ms','ble_connected_ms','first_frame_ms','first_post_ms',
+    'gateway_uptime_ms','wifi_connected_ms','ble_connected_ms','first_frame_ms','first_post_ms','sensor_tx_errors',
     'last_post_ms','last_redirect_ms','last_ack_ms','backlog_drained_ms',
     'battery_nrf_boot','battery_sample_ms','battery_age_ms'];
   numeric.forEach(k=>{if(typeof h[k]==='number'&&Number.isFinite(h[k])&&h[k]>=0)out[k]=h[k];});
@@ -294,10 +294,76 @@ function healthSnapshot(h, now, ageDelta) {
   if(typeof h.gas_ok==='boolean')out.gas_ok=h.gas_ok;
   if(h.environment){const x=h.environment;try {out.environment={t:number(x.t,-40,85,'T'),
     h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),
-    age_ms:number(x.age_ms,0,1e12,'environment age')+ageDelta};}catch(_) {}}
+    age_ms:number(x.age_ms,0,1e12,'environment age')+ageDelta};
+    if(Number.isSafeInteger(x.captured_at_ms)&&x.captured_at_ms>0&&x.captured_at_ms<=now+5000)
+      out.environment.captured_at_ms=x.captured_at_ms;
+  }catch(_) {}}
   if(h.latest) {const x=h.latest;try {out.latest={t:number(x.t,-40,85,'T'),h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),g:number(x.g,0,1e9,'G')};}catch(_) {}}
   if(typeof h.firmware_version==='string')out.firmware_version=h.firmware_version;
   if(typeof h.sensor_id==='string')out.sensor_id=h.sensor_id;
+  if(h.ai_shadow&&typeof h.ai_shadow==='object')try{
+    const a=h.ai_shadow;
+    if(a.feature===1&&typeof a.state==='string'&&/^[A-Z_]{1,20}$/.test(a.state)&&
+       typeof a.reason==='string'&&/^[A-Z0-9_]{1,40}$/.test(a.reason)){
+      const shadow={feature:1,state:a.state,reason:a.reason,active:a.active===true,
+        baseline_scans:number(a.baseline_scans,0,3,'AI baseline scans'),
+        complete_scans:number(a.complete_scans,0,1e9,'AI complete scans'),
+        invalid_scans:number(a.invalid_scans,0,1e9,'AI invalid scans'),
+        queue_drops:number(a.queue_drops,0,1e9,'AI queue drops'),persistent:a.persistent===true};
+      if(typeof a.storage_session_id==='string'&&/^STO-[\w-]{32,40}$/.test(a.storage_session_id)&&
+         typeof a.sensor_id==='string'&&/^[a-f0-9]{16}$/.test(a.sensor_id)&&
+         typeof a.storage_started_at==='number'){
+        shadow.storage_session_id=a.storage_session_id;shadow.sensor_id=a.sensor_id;
+        shadow.storage_started_at=number(a.storage_started_at,0,1e13,'storage start');
+      }
+      for(const k of ['baseline_first_at','baseline_ready_at','scored_at'])
+        if(typeof a[k]==='number')shadow[k]=number(a[k],0,1e13,k);
+      if(typeof a.last_complete_scan_at==='number')
+        shadow.last_complete_scan_at=number(a.last_complete_scan_at,0,1e13,'AI scan time');
+      for(const k of ['partial_scans','rejected_fields','last_partial_mask'])
+        if(typeof a[k]==='number')shadow[k]=number(a[k],0,1e9,k);
+      for(const k of ['change_index','shape_change','level_change'])
+        if(typeof a[k]==='number')shadow[k]=number(a[k],0,100,k);
+      out.ai_shadow=shadow;
+    }
+  }catch(_){};
+  if(h.food_ai&&typeof h.food_ai==='object')try{
+    const f=h.food_ai,classes=['banana','chicken','egg','rice','sprouts','tofu'];
+    if(f.model==='centroid-20261116'&&/^[a-f0-9]{16}$/.test(f.sensor_id)&&
+       ['EXPERIMENTAL_ONLY','ABSTAIN_ONE_EXPOSURE','LOW_INFORMATION','INVALID_INPUT'].includes(f.status)){
+      const v={model:f.model,sensor_id:f.sensor_id,status:f.status,
+        inferred_at:number(f.inferred_at,0,1e13,'food inference time'),probability_calibrated:false};
+      if(classes.includes(f.candidate)&&typeof f.distance==='number'&&typeof f.margin==='number'){
+        v.candidate=f.candidate;v.distance=number(f.distance,0,1e9,'food distance');
+        v.margin=number(f.margin,0,1e9,'food margin');}
+      out.food_ai=v;
+    }
+  }catch(_){};
+  if(h.gas_anomaly&&typeof h.gas_anomaly==='object')try{
+    const a=h.gas_anomaly;
+    if(a.model==='diagonal-loggas-six-baseline'&&/^STO-[\w-]{32,40}$/.test(a.storage_session_id)&&
+       /^[a-f0-9]{16}$/.test(a.sensor_id)&&['BASELINE_PENDING','EXPERIMENTAL_INDEX','PERSISTENCE_UNAVAILABLE'].includes(a.status)){
+      const v={model:a.model,storage_session_id:a.storage_session_id,sensor_id:a.sensor_id,status:a.status,
+        baseline_scans:number(a.baseline_scans,0,6,'anomaly baseline'),spoilage_probability:false};
+      if(a.status==='EXPERIMENTAL_INDEX'&&typeof a.index==='number'&&typeof a.inferred_at==='number'){
+        v.index=number(a.index,0,1e9,'anomaly index');v.inferred_at=number(a.inferred_at,0,1e13,'anomaly time');
+        if(typeof a.slope_per_hour==='number')v.slope_per_hour=number(a.slope_per_hour,-1e9,1e9,'anomaly slope');}
+      out.gas_anomaly=v;
+    }
+  }catch(_){};
+  if(h.food_progress&&typeof h.food_progress==='object')try{
+    const p=h.food_progress,foods=['banana','chicken','egg','rice','sprouts','tofu'];
+    if(p.model==='assumed-progress-v1-time'&&/^STO-[\w-]{32,40}$/.test(p.storage_session_id)&&
+       /^[a-f0-9]{16}$/.test(p.sensor_id)&&foods.includes(p.food_code)&&
+       ['EARLY','MIDDLE','LATE'].includes(p.stage)){
+      const v={model:p.model,storage_session_id:p.storage_session_id,sensor_id:p.sensor_id,
+        food_code:p.food_code,stage:p.stage,index:number(p.index,0,100,'progress index'),
+        placed_at:number(p.placed_at,1577836800000,1e13,'placement time'),
+        inferred_at:number(p.inferred_at,1577836800000,1e13,'progress time')};
+      if(Number.isInteger(v.index)&&v.placed_at<=v.inferred_at&&v.inferred_at<=now+5000)
+        out.food_progress=v;
+    }
+  }catch(_){};
   out.ota_state=h.ota_state==='UPDATING'||h.ota_state==='VERIFYING'?h.ota_state:'IDLE';
   if(typeof h.local_ip==='string'&&/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h.local_ip))out.local_ip=h.local_ip;
   if(typeof out.last_valid_age_ms==='number')out.last_valid_age_ms+=ageDelta;
@@ -452,6 +518,13 @@ function doPost(e) {
     const payload=JSON.parse(e.postData.contents);
     if(payload && payload.version===3)requestVersion=3;
     const result=ingest(payload);
+    // Optional storage-session activation must not change a committed ACK.
+    if(typeof observeStorageSession_==='function')try{observeStorageSession_(payload,Date.now());}catch(_){}
+    if(typeof observeStorageTelemetry_==='function')try{observeStorageTelemetry_(payload,Date.now());}catch(_){}
+    try{result.storage_session=typeof storageResponse_==='function'?
+      storageResponse_(validDeviceId(payload.device_id),payload,Date.now()):
+      {state:'UNAVAILABLE',reason:'STORAGE_MODULE_MISSING'};
+    }catch(_){result.storage_session={state:'UNAVAILABLE',reason:'STORAGE_STATE_UNAVAILABLE'};}
     // Remote control failure must never invalidate an already committed sample ACK.
     if(typeof remoteExchange_==='function'&&payload.remote)try{result.remote=remoteExchange_(payload);}catch(_){result.remote=null;}
     return json(result);
@@ -499,7 +572,11 @@ function getDashboard(requestedDeviceId) {
     h&&typeof h.last_valid_age_ms==='number'&&h.last_valid_age_ms+now-h.server_seen_at>1200000?
       '유효 GAS 데이터가 20분 이상 갱신되지 않았습니다. 연결 상태만으로 측정 진행을 보장할 수 없습니다.':null;
   return {device_id:deviceId,state,age,health:h,recording,server_time:now,integrity_reason,progress_reason,
-    remote_update:typeof remoteSummary_==='function'?remoteSummary_(deviceId):null};
+    remote_update:typeof remoteSummary_==='function'?remoteSummary_(deviceId):null,
+    monitoring:typeof monitorSummaryV2_==='function'?monitorSummaryV2_(deviceId):null,
+    storage_session:typeof storageResponse_==='function'?
+      storageResponse_(deviceId,{health:h,sensor_id:h&&h.sensor_id},now):
+      {state:'UNAVAILABLE',reason:'STORAGE_MODULE_MISSING'}};
 }
 function getBatteryHistory(requestedDeviceId, requestedRange) {
   const deviceId=validDeviceId(requestedDeviceId), range=requestedRange||'24h';

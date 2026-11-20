@@ -36,8 +36,13 @@ class GatewayUpdateAccessTest(unittest.TestCase):
         self.assertIn('otaServer.on("/",HTTP_GET,handleOtaPage)', SOURCE)
         self.assertIn('otaServer.on("/nrf-dfu",HTTP_GET,handleNrfPackagePage)', SOURCE)
 
-    def test_default_console_is_not_mirrored(self):
-        self.assertIn("constexpr bool UART_DIAGNOSTICS=false", SOURCE)
+    def test_console_mirrors_to_uart0_when_user_diagnostics_enabled(self):
+        # The verified source intentionally enables UART0 as well as USB CDC.
+        # A commented-out old default must not satisfy this assertion.
+        active = [line.strip() for line in SOURCE.splitlines()
+                  if line.strip().startswith("constexpr bool UART_DIAGNOSTICS")]
+        self.assertEqual(active, ["constexpr bool UART_DIAGNOSTICS = true;"])
+        self.assertIn("if(UART_DIAGNOSTICS)Serial0.println(line)", SOURCE)
 
     def test_http_payload_uses_psram_with_internal_fallback(self):
         serializer = SOURCE[SOURCE.index("char* serializeHttpJson"):

@@ -33,7 +33,12 @@ if(Test-Path -LiteralPath $catalog){
 $assets=if($Kind -eq 'esp32'){@((Join-Path $package 'gateway.ino.bin'),(Join-Path $package 'gateway.ino.manifest'))}else{@($package)}
 if(!$Publish){Write-Output "Prepared only: $catalog. Pass -Publish after approving a public GitHub Release upload.";return}
 $catalogAll=Join-Path $root 'data/remote-update-catalog.json'
-$entries=if(Test-Path -LiteralPath $catalogAll){@([IO.File]::ReadAllText($catalogAll)|ConvertFrom-Json -AsHashtable)}else{@()}
+$entries=@()
+if(Test-Path -LiteralPath $catalogAll){
+  $parsed=[IO.File]::ReadAllText($catalogAll)|ConvertFrom-Json -AsHashtable -NoEnumerate
+  if($parsed -isnot [array]){throw 'Combined catalog must be a JSON array.'}
+  $entries=[object[]]$parsed
+}
 $entry=[IO.File]::ReadAllText($catalog)|ConvertFrom-Json -AsHashtable
 if(@($entries|Where-Object {$_.id -eq $entry.id}).Count){throw 'Release ID already appears in the combined catalog; refusing to replace it.'}
 if($entries.Count -ge 8){throw 'Cloud catalog already has eight releases; no upload performed.'}

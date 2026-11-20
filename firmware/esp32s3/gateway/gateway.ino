@@ -93,6 +93,12 @@
 #include <cJSON.h>
 
 #include "Integrity.h"
+#include "AiScan.h"
+#include "AiChange.h"
+#include "AiState.h"
+#include "AiFoodModel.h"
+#include "AiAnomaly.h"
+#include "AiProgress.h"
 
 #include "Spool.h"
 
@@ -190,8 +196,8 @@ constexpr uint32_t LCD_REFRESH_MS=750;
 // combined captures show each event twice; UART0 remains available as an opt-in.
 //constexpr bool UART_DIAGNOSTICS = false;
 constexpr bool UART_DIAGNOSTICS = true;
-#define FSGW_VERSION "2.0.28"
-#define FSGW_BUILD 2026110806
+#define FSGW_VERSION "2.0.29"
+#define FSGW_BUILD 2026111601
 #define FSGW_STRINGIFY_INNER(value) #value
 #define FSGW_STRINGIFY(value) FSGW_STRINGIFY_INNER(value)
 constexpr char FIRMWARE_VERSION[]=FSGW_VERSION;
@@ -243,6 +249,29 @@ WiFiManager wifiManager;
 Preferences wifiPreferences;
 Preferences pairingPreferences;
 Preferences otaPreferences;
+Preferences aiPreferences;
+bool aiPreferencesReady=false,aiPersistOk=false,aiStorageActive=false,aiScoreKnown=false;
+char aiStorageId[48]={},aiSensorId[17]={};
+int64_t aiStorageStartedAt=0,aiBaselineFirstAt=0,aiBaselineReadyAt=0,aiLastScoreAt=0;
+double aiLastChange=0,aiLastShape=0,aiLastLevel=0;
+uint32_t aiInvalidScans=0,aiQueueDrops=0;
+uint32_t aiCompleteScans=0;
+uint32_t aiPartialScans=0,aiRejectedFields=0,aiLastPartialMask=0;
+int64_t aiLastScanAt=0;
+char aiStateText[20]="INACTIVE",aiReasonText[40]="WAIT_CLOUD_ACK";
+bool aiStatusLogged=false;
+ai_change::Model aiModel;
+ai_anomaly::Model aiAnomaly;
+ai_food::Result aiFoodResult={};
+int64_t aiFoodAt=0,aiAnomalyAt=0;
+double aiAnomalyIndex=0,aiAnomalySlope=0;
+bool aiAnomalyKnown=false,aiAnomalySlopeKnown=false,aiAnomalyPersistOk=false;
+char aiFoodSensor[17]={};
+char aiProgressFood[16]={};
+int64_t aiPlacedAt=0;
+ai_scan::Assembler aiAssembler;
+struct AiScanEvent { ai_scan::Complete scan;int64_t capturedAt;char sensor[17]; };
+QueueHandle_t aiScansQueue=nullptr;
 struct SavedWifi { char ssid[33]; char password[65]; };
 constexpr uint8_t WIFI_MAX_NETWORKS=4;
 SavedWifi wifiNetworks[WIFI_MAX_NETWORKS]={};
@@ -372,7 +401,9 @@ int64_t lastCloudUpload=0;
 struct AckIdentity { char boot[32]; uint32_t rx; };
 struct UploadJob { AckIdentity acks[BATCH_SIZE]; uint32_t count; bool heartbeat; bool jsonInPsram; char* json; char remoteNonce[33]={}; };
 
-struct UploadResult { bool ok; bool heartbeat; int http; uint32_t unassigned; char recording[16]; char session[64]; };
+struct UploadResult { bool ok; bool heartbeat; int http; uint32_t unassigned; char recording[16]; char session[64];
+  char storageState[12],storageId[48],storageSensor[17],storageReason[40],storageFoodCode[16];
+  int64_t storageStartedAt,storagePlacedAt; };
 uint64_t wifiConnectedAt=0, bleConnectedAt=0, firstFrameAt=0;
 uint64_t firstPostAt=0, lastPostAt=0, lastRedirectAt=0, lastAckAt=0, backlogDrainedAt=0;
 
@@ -1139,7 +1170,13 @@ void handleOtaStatus() {
   const String body=String("{\"mode\":\"")+(otaMode==OTA_PREPARE?"PREPARE":otaMode==OTA_ACTIVE?"ACTIVE":"NORMAL")+
     "\",\"ready\":"+(otaMode==OTA_PREPARE&&otaLeaseHeld&&otaSafeState()?"true":"false")+
     ",\"queue\":"+String(queued)+",\"spool\":"+String(spool.count)+
-    ",\"http\":"+(otaHttpBusy?"true":"false")+"}";
+    ",\"http\":"+(otaHttpBusy?"true":"false")+
+    ",\"ai_shadow\":{\"feature\":1,\"state\":\""+aiStateText+"\",\"reason\":\""+aiReasonText+
+    "\",\"baseline_scans\":"+String(aiStorageActive?aiModel.baselineCount():0)+
+    ",\"complete_scans\":"+String(aiCompleteScans)+
+    ",\"active\":"+(aiStorageActive?"true":"false")+
+    (aiStorageActive?String(",\"storage_session_id\":\"")+aiStorageId+"\",\"sensor_id\":\""+aiSensorId+"\"":"")+
+    (aiScoreKnown?String(",\"change_index\":")+String(aiLastChange,5):"")+"}}";
   otaServer.sendHeader("Cache-Control","no-store");otaServer.send(200,"application/json",body);
 }
 
@@ -1714,6 +1751,124 @@ String uid(const Sample& s){char b[33];memcpy(b,s.boot,32);b[32]=0;return String
 
 void addNumber(cJSON* o,const char* k,double n){cJSON_AddNumberToObject(o,k,n);}
 
+void aiSetStatus(const char* state,const char* reason){
+  if(aiStatusLogged&&!strcmp(aiStateText,state)&&!strcmp(aiReasonText,reason))return;
+  snprintf(aiStateText,sizeof(aiStateText),"%s",state);
+  snprintf(aiReasonText,sizeof(aiReasonText),"%s",reason);
+  aiStatusLogged=true;
+  logEvent("AI SHADOW state=%s active=%u reason=%s baseline=%u/3",aiStateText,
+    aiStorageActive?1:0,aiReasonText,aiStorageActive?aiModel.baselineCount():0);
+}
+
+void aiPersistBaseline(){
+  if(!aiPreferencesReady||!aiStorageActive)return;
+  ai_state::Blob saved={};
+  snprintf(saved.storage,sizeof(saved.storage),"%s",aiStorageId);
+  snprintf(saved.sensor,sizeof(saved.sensor),"%s",aiSensorId);
+  saved.started=aiStorageStartedAt;saved.firstBaseline=aiBaselineFirstAt;
+  saved.readyBaseline=aiBaselineReadyAt;saved.model=aiModel.snapshot();
+  ai_state::seal(saved);
+  if(aiPreferences.putBytes("shadow",&saved,sizeof(saved))!=sizeof(saved)){
+    aiPersistOk=false;aiScoreKnown=false;
+    aiSetStatus("ERROR","PERSISTENCE_WRITE_FAILED");
+  }
+}
+void aiPersistAnomaly(){
+  if(!aiPreferencesReady||!aiStorageActive||!aiAnomalyPersistOk)return;
+  ai_anomaly::Blob saved={};
+  snprintf(saved.storage,sizeof(saved.storage),"%s",aiStorageId);
+  snprintf(saved.sensor,sizeof(saved.sensor),"%s",aiSensorId);
+  saved.started=aiStorageStartedAt;saved.state=aiAnomaly.state;ai_anomaly::seal(saved);
+  if(aiPreferences.putBytes("anom",&saved,sizeof(saved))!=sizeof(saved)){
+    aiAnomalyPersistOk=false;aiAnomalyKnown=false;
+    logEvent("AI ANOMALY persistence failed; inference withheld");
+  }
+}
+void aiApplyStorage(const UploadResult& r){
+  if(!r.storageState[0]){aiStorageActive=false;aiScoreKnown=false;aiPlacedAt=0;aiProgressFood[0]=0;
+    aiSetStatus("INACTIVE","STORAGE_FIELD_MISSING");return;}
+  const bool valid=!strcmp(r.storageState,"ACTIVE")&&r.storageStartedAt>0&&
+    !strncmp(r.storageId,"STO-",4)&&strlen(r.storageId)<sizeof(aiStorageId)&&
+    strlen(r.storageSensor)==16;
+  if(!valid){aiStorageActive=false;aiScoreKnown=false;aiPlacedAt=0;aiProgressFood[0]=0;
+    aiSetStatus("INACTIVE",!strcmp(r.storageState,"ACTIVE")?"INVALID_STORAGE_IDENTITY":
+      r.storageReason[0]?r.storageReason:!strcmp(r.storageState,"PENDING")?"WAIT_NEW_VALID_ENV":
+      !strcmp(r.storageState,"NONE")?"START_REQUIRED":
+      !strcmp(r.storageState,"ENDED")?"STORAGE_ENDED":"STORAGE_UNAVAILABLE");return;}
+  if(r.storagePlacedAt>0&&r.storagePlacedAt<=utcMs()+5000&&
+     ai_progress::foodIndex(r.storageFoodCode)>=0){
+    aiPlacedAt=r.storagePlacedAt;
+    snprintf(aiProgressFood,sizeof(aiProgressFood),"%s",r.storageFoodCode);
+  }else{aiPlacedAt=0;aiProgressFood[0]=0;}
+  if(aiStorageActive&&!strcmp(aiStorageId,r.storageId)&&!strcmp(aiSensorId,r.storageSensor))return;
+  snprintf(aiStorageId,sizeof(aiStorageId),"%s",r.storageId);
+  snprintf(aiSensorId,sizeof(aiSensorId),"%s",r.storageSensor);
+  aiStorageStartedAt=r.storageStartedAt;aiStorageActive=true;aiScoreKnown=false;
+  aiBaselineFirstAt=aiBaselineReadyAt=aiLastScoreAt=0;aiModel.reset();
+  aiAnomaly.reset();aiAnomalyKnown=aiAnomalySlopeKnown=false;aiAnomalyAt=0;
+  aiAnomalyPersistOk=aiPreferencesReady;
+  ai_state::Blob saved={};
+  if(aiPreferencesReady&&aiPreferences.getBytesLength("shadow")==sizeof(saved)&&
+     aiPreferences.getBytes("shadow",&saved,sizeof(saved))==sizeof(saved)&&
+     ai_state::validFor(saved,aiStorageId,aiSensorId,aiStorageStartedAt)&&aiModel.restore(saved.model)){
+    aiBaselineFirstAt=saved.firstBaseline;aiBaselineReadyAt=saved.readyBaseline;
+    logEvent("AI SHADOW baseline restored count=%u",aiModel.baselineCount());
+  }else logEvent("AI SHADOW new baseline session; no prior state reused");
+  ai_anomaly::Blob anomalySaved={};
+  if(aiPreferencesReady&&aiPreferences.getBytesLength("anom")==sizeof(anomalySaved)&&
+     aiPreferences.getBytes("anom",&anomalySaved,sizeof(anomalySaved))==sizeof(anomalySaved)&&
+     ai_anomaly::validFor(anomalySaved,aiStorageId,aiSensorId,aiStorageStartedAt)&&
+     aiAnomaly.restore(anomalySaved.state)){
+    if(aiAnomaly.state.scores){aiAnomalyKnown=true;aiAnomalyIndex=aiAnomaly.state.last[2];aiAnomalyAt=aiAnomaly.state.at[2];}
+    logEvent("AI ANOMALY baseline restored count=%lu",(unsigned long)aiAnomaly.state.count);
+  }
+  aiSetStatus(!aiScansQueue||!aiPersistOk?"ERROR":aiModel.baselineCount()<3?"BASELINE":"READY",
+    !aiScansQueue?"SCAN_QUEUE_UNAVAILABLE":!aiPersistOk?"PERSISTENCE_UNAVAILABLE":
+    aiModel.baselineCount()<3?"WAIT_3_VALID_SCANS":"WAIT_NEXT_SCAN");
+}
+void aiService(){
+  if(!aiScansQueue||otaMode!=OTA_NORMAL||nrfDfuMode!=NRF_DFU_NORMAL)return;
+  AiScanEvent event;
+  if(xQueueReceive(aiScansQueue,&event,0)!=pdTRUE)return;
+  ++aiCompleteScans;aiLastScanAt=event.capturedAt;
+  logEvent("AI SHADOW scan complete scan=%lu total=%lu",(unsigned long)event.scan.scan,(unsigned long)aiCompleteScans);
+  aiFoodResult=ai_food::predict(event.scan.gas,event.scan.t,event.scan.h,event.scan.p);
+  aiFoodAt=event.capturedAt;snprintf(aiFoodSensor,sizeof(aiFoodSensor),"%s",event.sensor);
+  if(aiFoodResult.measured)logEvent("AI FOOD candidate=%s status=%s distance=%.3f margin=%.3f scan=%lu",
+    ai_food::LABELS[aiFoodResult.candidate],aiFoodResult.reason,
+    aiFoodResult.distance,aiFoodResult.margin,(unsigned long)event.scan.scan);
+  if(!aiStorageActive||strcmp(event.sensor,aiSensorId)||
+     event.capturedAt<=aiStorageStartedAt){
+    if(aiStorageActive&&strcmp(event.sensor,aiSensorId))aiSetStatus("INACTIVE","SENSOR_ID_MISMATCH");
+    else if(aiStorageActive&&event.capturedAt<=aiStorageStartedAt)aiSetStatus("BASELINE","SCAN_BEFORE_STORAGE_START");
+    return;
+  }
+  if(aiAnomalyPersistOk){
+    const unsigned beforeBaseline=aiAnomaly.state.count,beforeScores=aiAnomaly.state.scores;
+    const auto result=aiAnomaly.observe(event.scan.gas,event.capturedAt);
+    if(result.valid){aiAnomalyKnown=true;aiAnomalyAt=event.capturedAt;
+      aiAnomalyIndex=result.index;aiAnomalySlope=result.slopePerHour;
+      aiAnomalySlopeKnown=result.slopeValid;}
+    if(result.valid||aiAnomaly.state.count!=beforeBaseline||aiAnomaly.state.scores!=beforeScores)aiPersistAnomaly();
+  }
+  if(!aiPersistOk)return;
+  const unsigned before=aiModel.baselineCount();
+  const ai_change::Result result=aiModel.observe(event.scan.gas);
+  if(!result.valid&&aiModel.baselineCount()==before){++aiInvalidScans;
+    aiSetStatus(before<3?"BASELINE":"READY","LOW_INFORMATION_SCAN");return;}
+  if(before==0)aiBaselineFirstAt=event.capturedAt;
+  if(before<3){if(aiModel.baselineCount()==3)aiBaselineReadyAt=event.capturedAt;
+    aiPersistBaseline();
+    logEvent("AI SHADOW baseline=%u/3 scan=%lu",aiModel.baselineCount(),(unsigned long)event.scan.scan);
+    if(aiPersistOk)aiSetStatus(aiModel.baselineCount()<3?"BASELINE":"READY",
+      aiModel.baselineCount()<3?"WAIT_3_VALID_SCANS":"WAIT_NEXT_SCAN");
+    return;}
+  aiLastChange=result.change;aiLastShape=result.shape;aiLastLevel=result.level;
+  aiLastScoreAt=event.capturedAt;aiScoreKnown=true;
+  logEvent("AI SHADOW score=%.4f shape=%.4f level=%.4f scan=%lu",aiLastChange,aiLastShape,aiLastLevel,(unsigned long)event.scan.scan);
+  aiSetStatus("SCORED","VALID_CHANGE_INDEX");
+}
+
 
 
 void receiveLine(const char* line) {
@@ -1756,10 +1911,12 @@ void receiveLine(const char* line) {
 
   if(f.version==4) {
     const uint64_t received=uptimeMs();
+    const uint64_t captured=clockValid()?utcMs():0;
     Sample env={};bool historyDue=false,accepted=false;
     portENTER_CRITICAL(&stateMux);
     accepted=environmentState.accept(f,received,historyDue);
     if(accepted) {
+      environmentState.capturedAt=captured;
       if(sensorHealth.mode==1)sensorOK=true;
       if(historyDue && rxSequence!=0xffffffffu) {
         env.rx=++rxSequence;
@@ -1837,6 +1994,21 @@ void receiveLine(const char* line) {
 
     logEvent("DATA LOSS RAM queue full; newest UID=%s rejected",uid(s).c_str());
 
+  }
+
+  if(queued==pdTRUE&&f.version==3&&aiScansQueue){
+    ai_scan::Complete complete;
+    const ai_scan::Step step={f.boot,f.scan,f.seq,f.ms,f.step,f.gasIndex,f.measIndex,f.status,f.g,f.t,f.h,f.p};
+    if(aiAssembler.observe(step,complete)){
+      AiScanEvent event={};event.scan=complete;event.capturedAt=s.capturedAt;
+      snprintf(event.sensor,sizeof(event.sensor),"%s",connectedSensorId);
+      if(xQueueSend(aiScansQueue,&event,0)!=pdTRUE){portENTER_CRITICAL(&stateMux);++aiQueueDrops;portEXIT_CRITICAL(&stateMux);
+        logEvent("AI SHADOW scan queue full; original sample path unchanged");}
+    }
+    portENTER_CRITICAL(&stateMux);
+    aiPartialScans=aiAssembler.partialScans;aiRejectedFields=aiAssembler.rejectedFields;
+    aiLastPartialMask=aiAssembler.lastPartialMask;
+    portEXIT_CRITICAL(&stateMux);
   }
 
   if(gaps!=before)logEvent("BLE sequence gap total=%lu",(unsigned long)gaps);
@@ -2064,12 +2236,13 @@ cJSON* sampleJson(const Sample& s) {
 cJSON* healthJson(uint32_t activeCount,uint32_t stagedCount) {
 
   Sample s;Health h;Continuity cont;bool has,known,ok;uint32_t errors,drops;
-  Frame env;uint64_t envAt;bool hasEnv;
+  Frame env;uint64_t envAt,envCaptured;bool hasEnv;uint32_t aiDropped,aiPartial,aiRejected,aiMask;
 
   portENTER_CRITICAL(&stateMux);s=latest;h=sensorHealth;cont=continuity;has=haveLatest;known=haveHealth;
-  env=environmentState.latest;envAt=environmentState.receivedAt;hasEnv=environmentState.known;
+  env=environmentState.latest;envAt=environmentState.receivedAt;envCaptured=environmentState.capturedAt;hasEnv=environmentState.known;
 
-  ok=sensorOK;errors=parseErrors;drops=queueDrops;portEXIT_CRITICAL(&stateMux);
+  ok=sensorOK;errors=parseErrors;drops=queueDrops;aiDropped=aiQueueDrops;
+  aiPartial=aiPartialScans;aiRejected=aiRejectedFields;aiMask=aiLastPartialMask;portEXIT_CRITICAL(&stateMux);
 
   cJSON* o=cJSON_CreateObject();
 
@@ -2114,13 +2287,70 @@ cJSON* healthJson(uint32_t activeCount,uint32_t stagedCount) {
   }
   if(hasEnv){cJSON* v=cJSON_CreateObject();addNumber(v,"t",env.t);addNumber(v,"h",env.h);
     addNumber(v,"p",env.p);addNumber(v,"age_ms",uptimeMs()-envAt);
+    if(envCaptured)addNumber(v,"captured_at_ms",envCaptured);
     cJSON_AddItemToObject(o,"environment",v);}
+  {cJSON* ai=cJSON_CreateObject();
+    addNumber(ai,"feature",1);
+    cJSON_AddStringToObject(ai,"state",aiStateText);
+    cJSON_AddStringToObject(ai,"reason",aiReasonText);
+    cJSON_AddBoolToObject(ai,"active",aiStorageActive);
+    addNumber(ai,"baseline_scans",aiStorageActive?aiModel.baselineCount():0);
+    addNumber(ai,"complete_scans",aiCompleteScans);
+    if(aiLastScanAt)addNumber(ai,"last_complete_scan_at",aiLastScanAt);
+    addNumber(ai,"invalid_scans",aiInvalidScans);addNumber(ai,"queue_drops",aiDropped);
+    addNumber(ai,"partial_scans",aiPartial);addNumber(ai,"rejected_fields",aiRejected);
+    addNumber(ai,"last_partial_mask",aiMask);
+    cJSON_AddBoolToObject(ai,"persistent",aiPersistOk);
+    if(aiStorageActive){
+    cJSON_AddStringToObject(ai,"storage_session_id",aiStorageId);
+    cJSON_AddStringToObject(ai,"sensor_id",aiSensorId);
+    addNumber(ai,"storage_started_at",aiStorageStartedAt);
+    if(aiBaselineFirstAt)addNumber(ai,"baseline_first_at",aiBaselineFirstAt);
+    if(aiBaselineReadyAt)addNumber(ai,"baseline_ready_at",aiBaselineReadyAt);
+    if(aiScoreKnown){addNumber(ai,"change_index",aiLastChange);
+      addNumber(ai,"shape_change",aiLastShape);addNumber(ai,"level_change",aiLastLevel);
+      addNumber(ai,"scored_at",aiLastScoreAt);}
+    }
+    cJSON_AddItemToObject(o,"ai_shadow",ai);}
+  if(aiFoodAt){cJSON* food=cJSON_CreateObject();
+    cJSON_AddStringToObject(food,"model","centroid-20261116");
+    cJSON_AddStringToObject(food,"sensor_id",aiFoodSensor);
+    cJSON_AddStringToObject(food,"status",aiFoodResult.reason);addNumber(food,"inferred_at",aiFoodAt);
+    if(aiFoodResult.measured&&aiFoodResult.candidate>=0){
+      cJSON_AddStringToObject(food,"candidate",ai_food::LABELS[aiFoodResult.candidate]);
+      addNumber(food,"distance",aiFoodResult.distance);addNumber(food,"margin",aiFoodResult.margin);}
+    cJSON_AddBoolToObject(food,"probability_calibrated",false);cJSON_AddItemToObject(o,"food_ai",food);}
+  if(aiStorageActive){cJSON* anomaly=cJSON_CreateObject();
+    cJSON_AddStringToObject(anomaly,"model","diagonal-loggas-six-baseline");
+    cJSON_AddStringToObject(anomaly,"storage_session_id",aiStorageId);
+    cJSON_AddStringToObject(anomaly,"sensor_id",aiSensorId);
+    addNumber(anomaly,"baseline_scans",aiAnomaly.state.count);
+    cJSON_AddStringToObject(anomaly,"status",!aiAnomalyPersistOk?"PERSISTENCE_UNAVAILABLE":
+      aiAnomalyKnown?"EXPERIMENTAL_INDEX":"BASELINE_PENDING");
+    if(aiAnomalyKnown){addNumber(anomaly,"index",aiAnomalyIndex);addNumber(anomaly,"inferred_at",aiAnomalyAt);
+      if(aiAnomalySlopeKnown)addNumber(anomaly,"slope_per_hour",aiAnomalySlope);}
+    cJSON_AddBoolToObject(anomaly,"spoilage_probability",false);
+    cJSON_AddItemToObject(o,"gas_anomaly",anomaly);}
+  if(aiStorageActive&&aiPlacedAt>0&&clockValid()){
+    const int64_t now=utcMs();
+    const auto progress=ai_progress::predict(ai_progress::foodIndex(aiProgressFood),
+      double(now-aiPlacedAt)/3600000.0);
+    if(progress.valid){cJSON* item=cJSON_CreateObject();
+      cJSON_AddStringToObject(item,"model",ai_progress::MODEL);
+      cJSON_AddStringToObject(item,"storage_session_id",aiStorageId);
+      cJSON_AddStringToObject(item,"sensor_id",aiSensorId);
+      cJSON_AddStringToObject(item,"food_code",aiProgressFood);
+      cJSON_AddStringToObject(item,"stage",progress.stage);
+      addNumber(item,"placed_at",aiPlacedAt);addNumber(item,"inferred_at",now);
+      addNumber(item,"index",progress.index);
+      cJSON_AddItemToObject(o,"food_progress",item);}}
 
   addNumber(o,"nrf_seq",cont.seq);addNumber(o,"queue_depth",uxQueueMessagesWaiting(samplesQueue)+activeCount+stagedCount);
 
   addNumber(o,"spool_depth",spool.count);addNumber(o,"sensor_failures",h.failures);addNumber(o,"sensor_recoveries",h.recoveries);
 
-  addNumber(o,"sensor_attempts",h.attempts);addNumber(o,"ble_gaps",cont.gaps);addNumber(o,"ble_restarts",cont.restarts);
+  addNumber(o,"sensor_attempts",h.attempts);addNumber(o,"sensor_tx_errors",h.txErrors);
+  addNumber(o,"ble_gaps",cont.gaps);addNumber(o,"ble_restarts",cont.restarts);
 
   addNumber(o,"parse_errors",errors);addNumber(o,"queue_drops",drops);addNumber(o,"upload_failures",uploadFailures);
 
@@ -2184,6 +2414,23 @@ bool validAck(const char* response,const UploadJob& job,UploadResult& result) {
   if(cJSON_IsString(session))snprintf(result.session,sizeof(result.session),"%s",session->valuestring);
 
   if(ok&&job.remoteNonce[0])remoteClient.receive(root,job.remoteNonce);
+  if(ok){
+    cJSON* storage=cJSON_GetObjectItemCaseSensitive(root,"storage_session");
+    cJSON* st=cJSON_GetObjectItemCaseSensitive(storage,"state");
+    cJSON* id=cJSON_GetObjectItemCaseSensitive(storage,"storage_session_id");
+    cJSON* sensor=cJSON_GetObjectItemCaseSensitive(storage,"sensor_id");
+    cJSON* started=cJSON_GetObjectItemCaseSensitive(storage,"started_at");
+    cJSON* reason=cJSON_GetObjectItemCaseSensitive(storage,"reason");
+    cJSON* foodCode=cJSON_GetObjectItemCaseSensitive(storage,"food_code");
+    cJSON* placed=cJSON_GetObjectItemCaseSensitive(storage,"placed_at");
+    if(cJSON_IsString(st))snprintf(result.storageState,sizeof(result.storageState),"%s",st->valuestring);
+    if(cJSON_IsString(id))snprintf(result.storageId,sizeof(result.storageId),"%s",id->valuestring);
+    if(cJSON_IsString(sensor))snprintf(result.storageSensor,sizeof(result.storageSensor),"%s",sensor->valuestring);
+    if(cJSON_IsNumber(started))result.storageStartedAt=(int64_t)started->valuedouble;
+    if(cJSON_IsString(reason))snprintf(result.storageReason,sizeof(result.storageReason),"%s",reason->valuestring);
+    if(cJSON_IsString(foodCode))snprintf(result.storageFoodCode,sizeof(result.storageFoodCode),"%s",foodCode->valuestring);
+    if(cJSON_IsNumber(placed))result.storagePlacedAt=(int64_t)placed->valuedouble;
+  }
   cJSON_Delete(root);return ok;
 
 }
@@ -2637,6 +2884,7 @@ void setup() {
   logMutex=xSemaphoreCreateMutex();otaIngressMutex=xSemaphoreCreateMutex();samplesQueue=xQueueCreate(RAM_SAMPLES,sizeof(Sample));
 
   jobsQueue=xQueueCreate(1,sizeof(UploadJob*));resultsQueue=xQueueCreate(1,sizeof(UploadResult));
+  aiScansQueue=xQueueCreate(4,sizeof(AiScanEvent));
 
   if(!logMutex||!samplesQueue||!jobsQueue||!resultsQueue){Serial0.println("FATAL allocation failed");while(true)delay(1000);}
   logEvent("TLS PSRAM-preferred allocator status=%d",mbedtls_platform_set_calloc_free(gatewayTlsCalloc,gatewayTlsFree));
@@ -2672,6 +2920,10 @@ void setup() {
   logEvent("OTA package identity=%s",OTA_BIN_ID);
   logHttpsHeapDiagnostic("BOOT");
   loadOtaSettings();
+  aiPreferencesReady=aiPreferences.begin("fsm-ai",false);
+  aiPersistOk=aiPreferencesReady;
+  aiSetStatus(!aiPreferencesReady||!aiScansQueue?"ERROR":"INACTIVE",
+    !aiPreferencesReady?"PERSISTENCE_UNAVAILABLE":!aiScansQueue?"SCAN_QUEUE_UNAVAILABLE":"WAIT_CLOUD_ACK");
   const esp_partition_t* running=esp_ota_get_running_partition();
   esp_ota_img_states_t otaState=ESP_OTA_IMG_UNDEFINED;
   if(running&&esp_ota_get_state_partition(running,&otaState)==ESP_OK&&otaState==ESP_OTA_IMG_PENDING_VERIFY) {
@@ -2811,6 +3063,7 @@ void loop() {
   if(xQueueReceive(resultsQueue,&result,0)==pdTRUE) {
 
     busy=false;activeJobHeartbeat=false;
+    if(result.ok)aiApplyStorage(result);
 
     if(result.heartbeat) {
       if(result.ok) {
@@ -3052,6 +3305,7 @@ void loop() {
     abortOtaSession();
   }
 
+  aiService();
   updateGatewayUi(now,wifiOnline,cloud,queueDepth,spool.count,cloudRecordingKnown,cloudRecording,backlog,updateActive);
 
   delay(10);

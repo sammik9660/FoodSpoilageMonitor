@@ -222,7 +222,7 @@ struct Continuity {
 struct EnvironmentState {
   Continuity continuity;
   Frame latest={};
-  uint64_t receivedAt=0, nextHistoryAt=0;
+  uint64_t receivedAt=0, capturedAt=0, nextHistoryAt=0;
   bool known=false;
   bool accept(const Frame& f,uint64_t at,bool& historyDue) {
     historyDue=false;

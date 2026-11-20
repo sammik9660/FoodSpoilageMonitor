@@ -1,0 +1,24 @@
+# Capstone demo: assumed food progression
+
+The user authorized a project assumption that each physical food exposure begins in an early condition and ends in a visibly deteriorated condition. `analysis/train_assumed_spoilage.py` labels only the first and last 20% of each exposure as **assumed early/late**; the middle is unlabeled. These labels are not measured spoilage onset or ingestion safety. The source XLSX remains read-only and its SHA-256 is checked against the prior audit.
+
+## Inputs and repeatable training
+
+Read-only inputs: `Food Spoilage Monitor Data (4).xlsx` and `data/gas-ai-20261116/scans.json`. The standard-library XLSX reader extracts the heater-off `EnvironmentHistory`, then joins observations by device and experiment session and requires a recent ambient observation. Ten-step GAS scores are computed causally from each exposure's first six valid scans. Training outputs go only to ignored `data/assumed-spoilage-20261117/model.json`.
+
+```powershell
+python analysis/train_assumed_spoilage.py --scans data/gas-ai-20261116/scans.json --workbook 'C:\Users\user\Downloads\Food Spoilage Monitor Data (4).xlsx' --output data/assumed-spoilage-20261117
+python analysis/export_assumed_progress.py data/assumed-spoilage-20261117/model.json cloud/apps_script/FoodProgressModel.gs
+```
+
+The models use food identity and elapsed time (fallback), plus heater-off temperature and observed >4°C time (A), plus the separate GAS anomaly score (B). Leave-one-physical-exposure-out assessment uses the same 1,139 assumed-label scans across ten exposures: time-only, A and B each classify 1,139/1,139 assumed early/late windows, confusion matrix `[[542,0],[0,597]]`. **This 100% is not spoilage accuracy**: the target is constructed from elapsed position, and even time alone predicts it. GAS provides no measured gain under this evaluation. A is selected over B on the tie; the existing GAS anomaly remains a separate live signal. The middle of exposure was never evaluated as an observed spoilage class.
+
+`FoodProgress.gs` computes the model's weak-label index and returns its input basis. When ambient history has a gap or low coverage it uses the separately trained food/time fallback rather than treating missing temperature exposure as zero. The user-facing color is a separate, simple policy in `FoodReview.gs`: green before 70% of the same-food median completed exposure, yellow from 70% to the reference end as **consume first**, and red from the reference end onward. The model's original stage/index remains available in the collapsed evidence details. A refrigerator temperature excursion does not change this color; it is displayed as a separate condition alert. `FoodProgressModel.gs` contains replaceable coefficients and evaluation metadata; `SensorData`, BLE, ACK, spool, OTA/DFU and ESP firmware do not change.
+
+## Storage time and historical data
+
+`StorageSessions.gs` stores `food_label` and user-entered `placed_at` alongside the existing STO state. Editing those values during an active STO leaves its ID, `started_at`, and the ESP NVS AI baseline identity intact. `FoodReview.gs` uses `placed_at` for display and rules, while retaining `started_at` for gateway AI identity. It joins stored heater-off ENV observations from matching device and food-labeled EXP sessions (or unassigned ENV observations within the selected time window) before STO activation. For a backdated placement, the browser requests `getStorageGasBackfill` once. This reads the full existing SensorData sheet in bounded pages without holding the ingest lock, filters by device, time and matching food-labeled EXP (including the current active EXP), reconstructs complete ten-step scans and stores only a small derived summary. Normal dashboard refreshes still use bounded recent reads. A failed one-time backfill is displayed rather than silently treated as complete. GAS samples received outside EXP were ACKed `not_recording` and cannot be reconstructed; SensorData also lacks a per-row sensor ID, so a historical sensor replacement cannot be proven from that sheet alone. The browser never silently claims that these missing measurements exist.
+
+## Deployment boundary and remaining work
+
+This is local code and mock testing only. Operating Apps Script, Sheets, two live devices, recording sessions and firmware are untouched. Before a supervised demo deployment, include the new `FoodProgress.gs` and `FoodProgressModel.gs` files with updated `Dashboard.html`, `StorageSessions.gs`, `FoodReview.gs`, and `StorageRisk.gs` in one Apps Script version. Confirm both device cards, one-touch food/time editing without STO reset, model basis and timestamp, historical-data limitations, cloud ACK, CSV and OTA controls. A durable historical correction log, measured full-sheet Apps Script backfill latency, true observed-spoilage evaluation and a model-management page remain later work.

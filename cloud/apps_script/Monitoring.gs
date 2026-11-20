@@ -80,7 +80,7 @@ function monitorTick_() {
   const recipients=props.getProperty('MONITOR_RECIPIENTS');
   const ids=JSON.parse(props.getProperty('MONITOR_DEVICE_IDS')||'[]');
   if(!recipients||!Array.isArray(ids)||ids.length>20)throw Error('Configure monitoring recipients and <=20 device IDs');
-  const now=Date.now(), deliveries=[];
+  const now=Date.now(), deliveries=[],canSend=MailApp.getRemainingDailyQuota()>=recipients.split(',').length;
   const lock=LockService.getScriptLock();
   if(!lock.tryLock(0))return {busy:true};
   try {
@@ -96,13 +96,17 @@ function monitorTick_() {
         h.recording_active=recording?recording.state==='RECORDING':null;
         h.recording_started_at=recording&&recording.started_at;
         h.experiment_label=recording&&recording.experiment_label;
+        const storage=typeof storageCurrent_==='function'?storageCurrent_(id):null;
+        const profile=typeof storageRiskProfile_==='function'&&recording?storageRiskProfile_(recording.experiment_label):null;
+        h.storage_temp_applicable=!!(storage&&storage.state==='ACTIVE'&&storage.sensor_id===h.sensor_id&&
+          profile&&profile.max_c===4);
       }
-      const plan=monitorPlan_(old,h,now),state=plan.state;
+      const plan=typeof monitorPlanV2_==='function'?monitorPlanV2_(old,h,now):monitorPlan_(old,h,now),state=plan.state;
       state.outbox=state.outbox||[];
-      plan.events.forEach(e=>state.outbox.push({...e,id:now+':'+e.code+':'+e.status,at:now,next:now}));
-      // Bound outage reminders without losing the latest recovery transition.
-      if(state.outbox.length>10){state.outboxOverflow=(state.outboxOverflow||0)+state.outbox.length-10;state.outbox=state.outbox.slice(-10);}
-      state.outbox.forEach(e=>{if(e.next<=now){e.next=now+300000;deliveries.push({device:id,event:e,health:state.health});}});
+      plan.events.forEach(e=>state.outbox.push({...e,id:now+':'+e.code+':'+e.status,at:now,next:now,
+        related:state.incidents[e.code]&&state.incidents[e.code].related||[],delivery_state:'PENDING'}));
+      state.outbox.forEach(e=>{if(canSend&&e.next<=now&&e.delivery_state!=='CLAIMED'){
+        e.delivery_state='CLAIMED';e.claimed_at=now;deliveries.push({device:id,event:e,health:state.health});}});
       props.setProperty(key,JSON.stringify(state));
     });
   } finally {lock.releaseLock();}
@@ -110,7 +114,6 @@ function monitorTick_() {
   let sent=0;
   for(const item of deliveries) {
     try {
-      if(MailApp.getRemainingDailyQuota()<recipients.split(',').length)break;
       const e=item.event,h=item.health||{};
       const kst=t=>Utilities.formatDate(new Date(t),'Asia/Seoul','yyyy-MM-dd HH:mm:ss');
       MailApp.sendEmail({to:recipients,
@@ -123,13 +126,20 @@ function monitorTick_() {
           '\nLast complete scan: '+(h.last_complete_scan_at?kst(h.last_complete_scan_at):'unknown')+
           '\nLast stored data: '+(h.last_data_stored_at?kst(h.last_data_stored_at):'unknown')+
           '\nSpool error: '+h.spool_error+'; queue drops: '+h.queue_drops+
+          '\nRelated sensor conditions: '+(e.related||[]).join(',')+
           '\nCheck power, sensor progress and pending data. Do not erase storage.\nRecovered means current observed condition cleared; missing samples remain missing.'});
       if(lock.tryLock(0))try {
         const key='MONITOR_V1:'+item.device,state=JSON.parse(props.getProperty(key));
         state.outbox=state.outbox.filter(x=>x.id!==e.id);props.setProperty(key,JSON.stringify(state));
       } finally {lock.releaseLock();}
       ++sent;
-    } catch(error){console.error('Monitor delivery failed; retained for bounded retry: '+String(error));}
+    } catch(error){
+      if(lock.tryLock(0))try{const key='MONITOR_V1:'+item.device,state=JSON.parse(props.getProperty(key));
+        const pending=state.outbox.find(x=>x.id===item.event.id);
+        if(pending){pending.delivery_state='PENDING';pending.next=now+300000;props.setProperty(key,JSON.stringify(state));}
+      }finally{lock.releaseLock();}
+      console.error('Monitor delivery failed; retained for bounded retry: '+String(error));
+    }
   }
   return {sent};
 }
