@@ -475,3 +475,19 @@
 
 - Apps Script 대시보드 본문 최대 너비를 1500px로 넓히고 카드 컨테이너를 CSS Grid로 변경했다. 760px 미만은 1열, 760~1199px는 2열, 1200px 이상은 3열로 표시한다. 카드 사이 간격은 grid gap으로 유지하며 기존 카드 내용·데이터 호출은 바꾸지 않았다.
 - CSS만 변경했으며 브라우저 실기/배포는 수행하지 않았다.
+## 2026-11-21 버전 표기만 바꾼 2.1.0 시험용 공개 Release (장치 미설치)
+
+- ESP32 2.0.29 소스에서 버전/빌드 식별자만 2.1.0/2026112001로 바꾼 별도 스테이징 빌드를 생성했다. 서명된 BIN(1,664,192 bytes, SHA-256 `16cf0855ca9dc19429006a0abe6c7e271c7a8c63d61e32592e53462c17f8d491`)과 manifest의 형식·서명·변조 거부 검증을 통과했다. 3MiB OTA 슬롯을 유지한다.
+- 실기 성공 nRF 2.0.14 소스에서 버전 문자열만 2.1.0으로 바꿔 application-only Legacy DFU ZIP(177,274 bytes, SHA-256 `4598fdf7d7e9905a641779a0c094cd0fc4fe2a44672a8ef69583482eb58821ed`)을 생성하고 DFU 형식/타깃 검증을 통과했다.
+- 사용자 요청에 따라 GitHub Release `esp-v2.1.0-2026112001`, `nrf-v2.1.0`을 공개했다. 업로드 자산 재다운로드 SHA-256과 HTTPS 302→206/Content-Range를 검증했다. 로컬 `data/remote-update-catalog.json`에 두 항목을 추가했다. Git tag는 검증된 OTA/DFU 기준 커밋 `99df839`을 가리키며, 버전만 수정한 스테이징 소스 자체는 커밋·푸시하지 않았다.
+- 운영 Apps Script 카탈로그 등록, 실제 ESP OTA/nRF DFU, 장치 부팅 및 장기 측정 검증은 수행하지 않았다. 기존 장치와 운영 데이터는 변경하지 않았다. Device 2가 2.0.28에서 이 ESP 패키지를 설치하면 2.0.29 기능 변경도 함께 포함된다.
+
+## 2026-11-21 대시보드 버전 45 후보 코드 보존·차이 조사 (배포 변경 없음)
+
+- 사용자가 배포를 버전 45로 되돌린 뒤 제공한 전체 HTML을 `backups/apps-script-v45-candidate-20261121/Dashboard.user-supplied.html`에 원본 바이트 그대로 보존했다. Google 배포 버전과 이 HTML의 동일성은 별도 계정 접근이 필요해 독립적으로 확인하지 못했다.
+- `codex/edge-ai-integration`의 `2e6397d` HTML과 비교한 원본 및 diff를 같은 백업 폴더에 보존했다. 주요 차이는 현장 IP 직접 입력 UI, 사설 IP 검사 함수, DFU 상태 링크다. `getDashboardDevices()` 호출 자체에는 공백 외 동작 변경이 없다. 두 HTML의 스크립트 부분은 템플릿 값 치환 후 `node --check`를 통과했지만, 실제 Apps Script 평가·브라우저 실행·운영 RPC는 검증하지 못했다.
+- 과거 2026-10-26 기록에는 운영 `userHtml`의 로컬 `http://` URL 생성 줄이 끊겨 초기 JavaScript 실행이 중단된 사례가 있다. 최신 HTML은 직접 입력 경로에 리터럴 `http://`를 다시 사용한다. 유사 원인 가능성은 있으나 이번 오류의 브라우저 콘솔 또는 평가된 HTML을 보지 못해 확정할 수 없다.
+- 2026-11-21 파일 목록 확인에서 현재 checkout은 `codex/nrf-dfu-relay-phase1`/`68028da`라 `cloud/apps_script`에 세 파일만 보였다. 최신 AI 작업은 별도 `codex/edge-ai-integration`/`2e6397d`에 있으며 같은 디렉터리에 11개 파일이 남아 있다. 해당 11개 파일을 `backups/edge-ai-integration-2e6397d/cloud/apps_script/`에 커밋 원본 바이트 그대로 추가 보존했다. 활성 브랜치 전환, 운영 배포 및 Sheets 수정은 하지 않았다.
+- 사용자가 이어서 첨부한 두 번째 HTML도 `backups/apps-script-v45-candidate-20261121/Dashboard.newer-user-supplied.html`에 원본 그대로 보존했다. 첫 번째 첨부와의 차이는 수동 IP UI/사설 IP 검사/DFU 상태 링크와 장치 렌더 오류 catch이며, `getDashboardDevices()` 호출은 동일하다. 두 번째 HTML의 템플릿 값을 로컬에서 치환한 JavaScript는 `node --check` 통과, 해당 HTML과 최신 11개 Apps Script 소스를 결합한 mock cloud 테스트 65건 통과. 실제 운영 버전의 평가된 `userHtml` 또는 브라우저 콘솔은 별도 계정 접근이 필요해 미확인이다. 20초 이후에도 원래 `Loading devices…` 문구 그대로라면 코드의 20초 fallback timer까지 실행되지 않은 상태이므로 단순 RPC 지연만으로는 설명되지 않는다.
+- 과거 URL 문자열 절단 사례를 고려해 새 수동 IP URL의 `http://` 리터럴만 기존 작동하는 `http:'+'/'+'/'` 조합으로 바꾼 후보 파일과 한 줄 patch를 같은 백업 폴더에 준비했다. 후보를 적용한 mock cloud 테스트 65건 통과. 이 후보가 실제 운영 로딩 오류를 고친다는 실기 증거는 아직 없으므로 운영 배포는 하지 않았다.
+- 알려진 실기 성공 기준 `99df839`와 최신 `2e6397d`의 `Code.gs`를 비교하면 `getDashboardDevices()`와 `doGet()` 함수 본문은 동일하며, `RemoteUpdates.gs`의 `getRemoteUpdateCatalog()`도 동일하다. 최신 Code의 주요 추가는 AI/건강 상태 처리다. GitHub Release 목록은 자동 조회하지 않고 스크립트 속성 `REMOTE_UPDATE_CATALOG`를 읽는다. 로컬 `data/remote-update-catalog.json`의 4항목(ESP 2.0.28/2.0.29/2.1.0, nRF 2.1.0)을 최신 `remoteCatalog_()`에 넣은 mock 검증은 성공했다. 운영 속성 값은 별도 계정 접근이 없어 직접 조회하지 못했고 변경하지 않았다.

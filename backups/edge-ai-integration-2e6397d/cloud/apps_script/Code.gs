@@ -1,0 +1,665 @@
+// Gas scan v3. Existing SensorData rows and SPREADSHEET_ID are never reset.
+const MAX_BATCH = 32;
+const DASHBOARD_REFRESH_MS = 5000;
+const TRANSPORT_STALE_MS = 15000;
+const ENVIRONMENT_STALE_MS = 150000;
+const HEADERS = ['timestamp','temperature','humidity','pressure','gas_resistance',
+  'sample_uid','session_id','nrf_seq','nrf_ms','capture_quality','received_at','nrf_boot',
+  'sample_schema','scan_seq','heater_step','gas_index','meas_index','sensor_status',
+  'gas_valid','heater_stable','measurement_valid','profile_id','device_id'];
+const LEGACY_WIDTH = 12;
+const SESSION_HEADERS = ['session_id','experiment_label','started_at','stopped_at','device_id'];
+const INGEST_HEADERS = ['gateway_boot_id','ack_high_water','pending_transaction'];
+const DEVICE_HEADERS = ['device_id','first_seen_at','last_seen_at','firmware_version','sensor_id','ota_state'];
+const BATTERY_HEADERS = ['measured_at','device_id','sensor_id','nrf_boot','nrf_ms',
+  'battery_mv','battery_percent','usb_power','measurement_valid','calibration_state','received_at'];
+const BATTERY_HISTORY_INTERVAL_MS = 300000;
+const LEGACY_DEVICE_ID = 'legacy';
+const READ_LOCK_WAIT_MS = 250;
+const DEVICE_LIST_CACHE_KEY = 'DEVICE_LIST_V1';
+
+function locked(fn) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+function tryLocked(fn) {
+  const lock=LockService.getScriptLock();
+  if(!lock.tryLock(READ_LOCK_WAIT_MS))return {acquired:false,value:null};
+  try {return {acquired:true,value:fn()};} finally {lock.releaseLock();}
+}
+function book() {
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (!id) throw new Error('SPREADSHEET_ID missing: select the existing spreadsheet; automatic recreation is forbidden');
+  return SpreadsheetApp.openById(id);
+}
+function auxiliary(b, name, headers) {
+  let s = b.getSheetByName(name);
+  if (!s) { s=b.insertSheet(name); s.getRange(1,1,1,headers.length).setValues([headers]); s.setFrozenRows(1); }
+  if(name==='Unassigned')extendHeaders(s,headers,LEGACY_WIDTH);
+  else {
+    const actual=s.getRange(1,1,1,headers.length).getValues()[0];
+    if (JSON.stringify(actual)!==JSON.stringify(headers)) throw new Error(name+' header mismatch');
+  }
+  return s;
+}
+function extendHeaders(s, headers, legacyWidth) {
+  const usedColumns=s.getLastColumn();
+  if(s.getMaxColumns()<headers.length)s.insertColumnsAfter(s.getMaxColumns(),headers.length-s.getMaxColumns());
+  const actual=s.getRange(1,1,1,headers.length).getValues()[0];
+  for(let i=0;i<legacyWidth;i++) {
+    if(actual[i]!==headers[i] && !(i>=5 && actual[i]==='' && i>=usedColumns))
+      throw new Error(s.getName()+' legacy header mismatch at '+(i+1));
+  }
+  for(let i=legacyWidth;i<headers.length;i++)
+    if((actual[i]!=='' && actual[i]!==headers[i]) || (actual[i]==='' && i<usedColumns))
+      throw new Error('Schema extension would overwrite occupied column');
+  if(actual.some((v,i)=>v!==headers[i]))s.getRange(1,1,1,headers.length).setValues([headers]);
+  return s;
+}
+function sheets() {
+  const b=book(), sensor=b.getSheetByName('SensorData');
+  // Never silently create/reset SensorData on reboot, missing config, or ingest.
+  if (!sensor || !sensor.getLastRow()) throw new Error('Existing SensorData/header missing; manual repair required');
+  extendHeaders(sensor,HEADERS,LEGACY_WIDTH);
+  return {b, sensor, sessions:extendHeaders(auxiliary(b,'Sessions',SESSION_HEADERS.slice(0,4)),SESSION_HEADERS,4),
+    ingest:auxiliary(b,'IngestState',INGEST_HEADERS), unassigned:auxiliary(b,'Unassigned',HEADERS),
+    environment:extendHeaders(auxiliary(b,'EnvironmentHistory',HEADERS.slice(0,22)),HEADERS,22),
+    devices:extendHeaders(auxiliary(b,'DeviceRegistry',DEVICE_HEADERS.slice(0,5)),DEVICE_HEADERS,5),
+    battery:auxiliary(b,'BatteryHistory',BATTERY_HEADERS)};
+}
+function dataRows(s) { return s.getLastRow()<2?[]:s.getRange(2,1,s.getLastRow()-1,s.getLastColumn()).getValues(); }
+function millis(v) { return v instanceof Date?v.getTime():typeof v==='number'?v:Date.parse(v); }
+function sessionsList(s) {
+  return dataRows(s).map(r=>({id:r[0],label:r[1],start:millis(r[2]),stop:r[3]?millis(r[3]):null,device_id:r[4]||LEGACY_DEVICE_ID}));
+}
+function activeSession(list, deviceId) {
+  const active=list.filter(s=>s.stop===null&&(!deviceId||s.device_id===deviceId));
+  if(active.length>1) throw new Error('Multiple active sessions; manual repair required');
+  return active[0]||null;
+}
+function sessionFor(sample, sessions, deviceId) {
+  // DATA INTEGRITY: capture time, NOT HTTP arrival, assigns session membership.
+  // Late retries must not move samples across a subsequent Start/Stop boundary.
+  if(sample.captured_at===null) return null;
+  const matches=sessions.filter(s=>s.device_id===deviceId&&sample.captured_at>=s.start && (s.stop===null || sample.captured_at<s.stop));
+  if(matches.length>1) throw new Error('Overlapping session intervals');
+  return matches[0]||null;  // intervals are [start, stop)
+}
+function ensureRoom(ctx, s, endRow) {
+  if(endRow>320000) throw new Error('Sheet row safety limit reached; archive manually, no overwrite');
+  if(endRow>s.getMaxRows()) {
+    const extra=Math.max(500,endRow-s.getMaxRows());
+    const cells=ctx.b.getSheets().reduce((n,x)=>n+x.getMaxRows()*x.getMaxColumns(),0);
+    if(cells+extra*s.getMaxColumns()>9500000) throw new Error('Spreadsheet cell budget exhausted');
+    s.insertRowsAfter(s.getMaxRows(),extra);
+  }
+}
+function comparable(row) { return JSON.stringify(row.map(v=>v instanceof Date?v.toISOString():v)); }
+function finishTransaction(ctx, row, boot, high, pending) {
+  // Write-ahead journal survives a response loss or interruption between Sheets
+  // write and ACK. Only our reserved empty/identical cells may be written again.
+  for(const group of pending.groups) {
+    const s=group.sheet==='SensorData'?ctx.sensor:group.sheet==='EnvironmentHistory'?ctx.environment:
+      group.sheet==='Unassigned'?ctx.unassigned:null;
+    if(!s)throw new Error('Unknown journal sheet; manual repair required');
+    ensureRoom(ctx,s,group.start+group.rows.length-1);
+    // A v2 write-ahead journal has 12 columns. Pad it without changing its
+    // reserved rows or historical values before recovery into the wider sheet.
+    const rows=group.rows.map(r=>r.concat(Array(HEADERS.length-r.length).fill('')));
+    const existing=s.getRange(group.start,1,group.rows.length,HEADERS.length).getValues();
+    existing.forEach((r,i)=>{
+      if(r.some(v=>v!=='' && v!==null) && comparable(r)!==comparable(rows[i]))
+        throw new Error('Journal conflict: existing data preserved; manual repair required');
+    });
+    s.getRange(group.start,1,group.rows.length,HEADERS.length).setValues(rows);
+  }
+  SpreadsheetApp.flush();
+  ctx.ingest.getRange(row,1,1,3).setValues([[boot,Math.max(high,pending.high),'']]);
+  SpreadsheetApp.flush();
+}
+function recoverTransactions(ctx) {
+  dataRows(ctx.ingest).forEach((r,i)=>{
+    if(r[2]) finishTransaction(ctx,i+2,r[0],Number(r[1]),JSON.parse(r[2]));
+  });
+}
+function setupReliability() { return locked(()=>{const ctx=sheets();recoverTransactions(ctx);return {success:true,spreadsheet_id:ctx.b.getId()};}); }
+function recordingResult(ctx, deviceId) {
+  const list=sessionsList(ctx.sessions).filter(s=>s.device_id===deviceId), active=activeSession(list,deviceId);
+  const latest=active?null:(list.slice().reverse().find(s=>s.stop!==null)||null);
+  const download=active||latest;
+  return {device_id:deviceId,state:active?'RECORDING':'STOPPED',session_id:active?active.id:null,experiment_label:active?active.label:null,
+    started_at:active?active.start:null,
+    download_session_id:download?download.id:null,download_experiment_label:download?download.label:null,
+    download_started_at:download?download.start:null,
+    download_kind:active?'CURRENT':latest?'LATEST':null};
+}
+function cacheRecording(record) {
+  try {CacheService.getScriptCache().put('RECORDING_V1:'+record.device_id,JSON.stringify(record),600);} catch(_) {}
+  return record;
+}
+function unknownRecording(deviceId) {
+  return {device_id:deviceId,state:'UNKNOWN',session_id:null,experiment_label:null,
+    started_at:null,download_session_id:null,download_experiment_label:null,
+    download_started_at:null,download_kind:null};
+}
+function cachedObject(cache,key) {
+  try {const raw=cache.get(key);return raw?JSON.parse(raw):null;} catch(_) {return null;}
+}
+function validDeviceId(value) {
+  if(value===undefined||value===null||value==='')return LEGACY_DEVICE_ID;
+  if(value===LEGACY_DEVICE_ID)return value;
+  if(typeof value!=='string'||! /^[a-f0-9]{12}$/.test(value))throw new Error('Invalid device ID');
+  return value;
+}
+function startRecording(label, requestedDeviceId) {
+  const deviceId=validDeviceId(requestedDeviceId);
+  if(typeof label!=='string' || !label.trim() || label.length>120 || /^[=+@\-]/.test(label)) throw new Error('Invalid experiment label');
+  const cache=CacheService.getScriptCache(), heartbeatStateKey='HEARTBEAT_STATE_V1:'+deviceId;
+  try {cache.remove(heartbeatStateKey);} catch(_) {}
+  return locked(()=>{
+    const ctx=sheets();recoverTransactions(ctx);
+    if(typeof remoteReservationActive_==='function'&&remoteReservationActive_(deviceId))throw new Error('Remote firmware update is reserved for this device');
+    const device=dataRows(ctx.devices).find(r=>r[0]===deviceId);
+    if(device&&(device[5]==='UPDATING'||device[5]==='VERIFYING')) throw new Error('Firmware update is active for this device');
+    if(activeSession(sessionsList(ctx.sessions),deviceId)) throw new Error('A session is already active for this device');
+    const id='EXP-'+Utilities.getUuid(), now=new Date().toISOString();
+    const row=ctx.sessions.getLastRow()+1;ensureRoom(ctx,ctx.sessions,row);
+    ctx.sessions.getRange(row,1,1,5).setValues([[id,label.trim(),now,'',deviceId]]);
+    SpreadsheetApp.flush();
+    try {cache.remove(DEVICE_LIST_CACHE_KEY);} catch(_) {}
+    const record=cacheRecording(recordingResult(ctx,deviceId));
+    try {cache.put(heartbeatStateKey,'IDLE',600);} catch(_) {}
+    return record;
+  });
+}
+function stopRecording(requestedDeviceId) {
+  const deviceId=validDeviceId(requestedDeviceId);
+  const cache=CacheService.getScriptCache(), heartbeatStateKey='HEARTBEAT_STATE_V1:'+deviceId;
+  try {cache.remove(heartbeatStateKey);} catch(_) {}
+  return locked(()=>{
+    const ctx=sheets();recoverTransactions(ctx);
+    const list=sessionsList(ctx.sessions), active=activeSession(list,deviceId);
+    if(active) ctx.sessions.getRange(list.indexOf(active)+2,4).setValue(new Date().toISOString());
+    SpreadsheetApp.flush();
+    const record=cacheRecording(recordingResult(ctx,deviceId));
+    try {cache.put(heartbeatStateKey,'IDLE',600);} catch(_) {}
+    return record;
+  });
+}
+function registerDevice(ctx, deviceId, payload, now) {
+  if(deviceId===LEGACY_DEVICE_ID)return;
+  const rows=dataRows(ctx.devices), index=rows.findIndex(r=>r[0]===deviceId), row=index<0?ctx.devices.getLastRow()+1:index+2;
+  const old=index<0?null:rows[index], health=payload.health||{};
+  ensureRoom(ctx,ctx.devices,row);
+  const otaState=health.ota_state==='UPDATING'||health.ota_state==='VERIFYING'?health.ota_state:'IDLE';
+  ctx.devices.getRange(row,1,1,6).setValues([[deviceId,old?old[1]:new Date(now).toISOString(),
+    new Date(now).toISOString(),typeof health.firmware_version==='string'?health.firmware_version:(old?old[3]:''),
+    typeof payload.sensor_id==='string'?payload.sensor_id:(old?old[4]:''),otaState]]);
+  if(index<0)try {CacheService.getScriptCache().remove(DEVICE_LIST_CACHE_KEY);} catch(_) {}
+}
+function number(v,min,max,name) {
+  if(typeof v!=='number'||!Number.isFinite(v)||v<min||v>max) throw new Error('Invalid '+name);
+  return v;
+}
+function uint(v,name) {number(v,0,4294967295,name);if(!Number.isInteger(v))throw new Error('Invalid '+name);return v;}
+function validateSample(s, now) {
+  if(!s || typeof s!=='object' || Array.isArray(s)) throw new Error('Invalid sample');
+  const match=typeof s.uid==='string' && /^([a-f0-9]{32})-([1-9][0-9]{0,9})$/.exec(s.uid);
+  if(!match) throw new Error('Invalid sample UID');
+  const rx=uint(Number(match[2]),'rx');
+  if(!rx) throw new Error('Invalid rx');
+  uint(s.seq,'seq');uint(s.ms,'ms');uint(s.nrf_boot,'nrf_boot');
+  if(!s.seq) throw new Error('Zero sensor sequence');
+  if(s.quality!=='ntp'&&s.quality!=='unknown'&&s.quality!=='legacy_server') throw new Error('Invalid time quality');
+  if(s.quality==='unknown') {if(s.captured_at!==null)throw new Error('Unknown capture time must be null');}
+  else number(s.captured_at,1577836800000,now+5000,'capture time');
+  return {uid:s.uid,boot:match[1],rx,seq:s.seq,ms:s.ms,nrf_boot:s.nrf_boot,
+    captured_at:s.captured_at,quality:s.quality,t:number(s.t,-40,85,'T'),h:number(s.h,0,100,'H'),
+    p:number(s.p,300,1100,'P'),g:number(s.g,0,1e9,'G'),sample_schema:2};
+}
+function validateV3Sample(s, now) {
+  if(s.sample_schema===2) {
+    return validateSample(s,now); // preserve exact historical v2 ingest semantics
+  }
+  if(s.sample_schema===4) {
+    if(['g','scan_seq','heater_step','gas_index','meas_index','sensor_status',
+        'profile_id','gas_valid','heater_stable','measurement_valid'].some(
+          k=>Object.prototype.hasOwnProperty.call(s,k)))
+      throw new Error('Environment sample has gas metadata');
+    const out=validateSample({...s,g:0},now);
+    out.sample_schema=4;delete out.g;return out;
+  }
+  if(s.sample_schema!==3)throw new Error('Unknown sample schema');
+  const out=validateSample(s,now);
+  out.sample_schema=3;
+  if(out.g<=0)throw new Error('Invalid v3 gas resistance');
+  out.scan_seq=uint(s.scan_seq,'scan sequence');if(!out.scan_seq)throw new Error('Zero scan sequence');
+  out.heater_step=uint(s.heater_step,'heater step');
+  out.gas_index=uint(s.gas_index,'gas index');
+  out.meas_index=uint(s.meas_index,'measurement index');
+  out.sensor_status=uint(s.sensor_status,'sensor status');
+  out.profile_id=uint(s.profile_id,'profile ID');
+  if(out.heater_step>9||out.gas_index!==out.heater_step||out.meas_index>255||
+     out.sensor_status>255||out.profile_id!==354||
+     (out.sensor_status&0xb0)!==0xb0||s.gas_valid!==true||
+     s.heater_stable!==true||s.measurement_valid!==true)throw new Error('Invalid heater-step metadata');
+  return out;
+}
+function normalize(payload, now) {
+  if(!payload||typeof payload!=='object'||Array.isArray(payload)) throw new Error('Object required');
+  if(payload.version===2||payload.version===3) {
+    if(!Array.isArray(payload.samples)||payload.samples.length>MAX_BATCH)throw new Error('Invalid batch size');
+    const samples=payload.samples.map(s=>payload.version===3?validateV3Sample(s,now):validateSample(s,now));
+    for(let i=1;i<samples.length;i++)if(samples[i].boot!==samples[0].boot||samples[i].rx<=samples[i-1].rx)throw new Error('Batch must be strictly FIFO in one gateway boot');
+    return {deviceId:validDeviceId(payload.device_id),sensorId:typeof payload.sensor_id==='string'?payload.sensor_id:'',samples};
+  }
+  // Legacy manual POST has no capture clock or retry identity. Preserve both old
+  // key spellings, explicitly tag arrival-time quality; no retry dedup guarantee.
+  const short=Object.prototype.hasOwnProperty.call(payload,'T');
+  const s={uid:Utilities.getUuid().replace(/-/g,'')+'-1',seq:1,ms:0,nrf_boot:0,
+    captured_at:now,quality:'legacy_server',t:short?payload.T:payload.temperature,
+    h:short?payload.H:payload.humidity,p:short?payload.P:payload.pressure,g:short?payload.G:payload.gas};
+  return {deviceId:LEGACY_DEVICE_ID,sensorId:'',samples:[validateSample(s,now)]};
+}
+function healthSnapshot(h, now, ageDelta) {
+  const out={server_seen_at:now};
+  if(!h||typeof h!=='object')return out;
+  const numeric=['last_valid_age_ms','queue_depth','spool_depth','sensor_failures','sensor_recoveries',
+    'sensor_attempts','ble_gaps','ble_restarts','parse_errors','queue_drops','upload_failures',
+    'last_upload_at','nrf_seq','spool_capacity_bytes','spool_used_bytes','unassigned_count',
+    'gateway_uptime_ms','wifi_connected_ms','ble_connected_ms','first_frame_ms','first_post_ms','sensor_tx_errors',
+    'last_post_ms','last_redirect_ms','last_ack_ms','backlog_drained_ms',
+    'battery_nrf_boot','battery_sample_ms','battery_age_ms'];
+  numeric.forEach(k=>{if(typeof h[k]==='number'&&Number.isFinite(h[k])&&h[k]>=0)out[k]=h[k];});
+  ['ble_connected','sensor_ok','spool_error','spool_full','remote_capable'].forEach(k=>{if(typeof h[k]==='boolean')out[k]=h[k];});
+  if(typeof h.usb_power==='boolean')out.usb_power=h.usb_power;
+  if(typeof h.battery_measurement_valid==='boolean')out.battery_measurement_valid=h.battery_measurement_valid;
+  if(h.usb_power===true&&typeof h.battery_last_percent==='number')
+    out.battery_last_percent=number(h.battery_last_percent,0,100,'last battery percent');
+  if(h.battery_measurement_valid===true&&h.usb_power===false&&typeof h.battery_mv==='number')
+    out.battery_mv=number(h.battery_mv,2500,5500,'battery mV');
+  if(h.battery_measurement_valid===true&&h.usb_power===false&&typeof h.battery_percent==='number')
+    out.battery_percent=number(h.battery_percent,0,100,'battery percent');
+  const batteryStates=['DEFAULT','COLLECTING','CALIBRATED','INSUFFICIENT_DATA','INVALID'];
+  if(batteryStates.includes(h.battery_calibration_state))
+    out.battery_calibration_state=h.battery_calibration_state;
+  if(typeof h.battery_calibrated==='boolean')out.battery_calibrated=h.battery_calibrated;
+  if(typeof h.battery_min_mv==='number')out.battery_min_mv=number(h.battery_min_mv,2500,5500,'battery min mV');
+  if(typeof h.battery_max_mv==='number')out.battery_max_mv=number(h.battery_max_mv,2500,5500,'battery max mV');
+  if(out.battery_min_mv!==undefined&&out.battery_max_mv!==undefined&&out.battery_max_mv<out.battery_min_mv)
+    throw Error('battery extrema order');
+  if(['ENV','GAS','COOL','REC','LEGACY'].includes(h.sensor_mode))out.sensor_mode=h.sensor_mode;
+  if(typeof h.environment_ok==='boolean')out.environment_ok=h.environment_ok;
+  if(typeof h.gas_ok==='boolean')out.gas_ok=h.gas_ok;
+  if(h.environment){const x=h.environment;try {out.environment={t:number(x.t,-40,85,'T'),
+    h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),
+    age_ms:number(x.age_ms,0,1e12,'environment age')+ageDelta};
+    if(Number.isSafeInteger(x.captured_at_ms)&&x.captured_at_ms>0&&x.captured_at_ms<=now+5000)
+      out.environment.captured_at_ms=x.captured_at_ms;
+  }catch(_) {}}
+  if(h.latest) {const x=h.latest;try {out.latest={t:number(x.t,-40,85,'T'),h:number(x.h,0,100,'H'),p:number(x.p,300,1100,'P'),g:number(x.g,0,1e9,'G')};}catch(_) {}}
+  if(typeof h.firmware_version==='string')out.firmware_version=h.firmware_version;
+  if(typeof h.sensor_id==='string')out.sensor_id=h.sensor_id;
+  if(h.ai_shadow&&typeof h.ai_shadow==='object')try{
+    const a=h.ai_shadow;
+    if(a.feature===1&&typeof a.state==='string'&&/^[A-Z_]{1,20}$/.test(a.state)&&
+       typeof a.reason==='string'&&/^[A-Z0-9_]{1,40}$/.test(a.reason)){
+      const shadow={feature:1,state:a.state,reason:a.reason,active:a.active===true,
+        baseline_scans:number(a.baseline_scans,0,3,'AI baseline scans'),
+        complete_scans:number(a.complete_scans,0,1e9,'AI complete scans'),
+        invalid_scans:number(a.invalid_scans,0,1e9,'AI invalid scans'),
+        queue_drops:number(a.queue_drops,0,1e9,'AI queue drops'),persistent:a.persistent===true};
+      if(typeof a.storage_session_id==='string'&&/^STO-[\w-]{32,40}$/.test(a.storage_session_id)&&
+         typeof a.sensor_id==='string'&&/^[a-f0-9]{16}$/.test(a.sensor_id)&&
+         typeof a.storage_started_at==='number'){
+        shadow.storage_session_id=a.storage_session_id;shadow.sensor_id=a.sensor_id;
+        shadow.storage_started_at=number(a.storage_started_at,0,1e13,'storage start');
+      }
+      for(const k of ['baseline_first_at','baseline_ready_at','scored_at'])
+        if(typeof a[k]==='number')shadow[k]=number(a[k],0,1e13,k);
+      if(typeof a.last_complete_scan_at==='number')
+        shadow.last_complete_scan_at=number(a.last_complete_scan_at,0,1e13,'AI scan time');
+      for(const k of ['partial_scans','rejected_fields','last_partial_mask'])
+        if(typeof a[k]==='number')shadow[k]=number(a[k],0,1e9,k);
+      for(const k of ['change_index','shape_change','level_change'])
+        if(typeof a[k]==='number')shadow[k]=number(a[k],0,100,k);
+      out.ai_shadow=shadow;
+    }
+  }catch(_){};
+  if(h.food_ai&&typeof h.food_ai==='object')try{
+    const f=h.food_ai,classes=['banana','chicken','egg','rice','sprouts','tofu'];
+    if(f.model==='centroid-20261116'&&/^[a-f0-9]{16}$/.test(f.sensor_id)&&
+       ['EXPERIMENTAL_ONLY','ABSTAIN_ONE_EXPOSURE','LOW_INFORMATION','INVALID_INPUT'].includes(f.status)){
+      const v={model:f.model,sensor_id:f.sensor_id,status:f.status,
+        inferred_at:number(f.inferred_at,0,1e13,'food inference time'),probability_calibrated:false};
+      if(classes.includes(f.candidate)&&typeof f.distance==='number'&&typeof f.margin==='number'){
+        v.candidate=f.candidate;v.distance=number(f.distance,0,1e9,'food distance');
+        v.margin=number(f.margin,0,1e9,'food margin');}
+      out.food_ai=v;
+    }
+  }catch(_){};
+  if(h.gas_anomaly&&typeof h.gas_anomaly==='object')try{
+    const a=h.gas_anomaly;
+    if(a.model==='diagonal-loggas-six-baseline'&&/^STO-[\w-]{32,40}$/.test(a.storage_session_id)&&
+       /^[a-f0-9]{16}$/.test(a.sensor_id)&&['BASELINE_PENDING','EXPERIMENTAL_INDEX','PERSISTENCE_UNAVAILABLE'].includes(a.status)){
+      const v={model:a.model,storage_session_id:a.storage_session_id,sensor_id:a.sensor_id,status:a.status,
+        baseline_scans:number(a.baseline_scans,0,6,'anomaly baseline'),spoilage_probability:false};
+      if(a.status==='EXPERIMENTAL_INDEX'&&typeof a.index==='number'&&typeof a.inferred_at==='number'){
+        v.index=number(a.index,0,1e9,'anomaly index');v.inferred_at=number(a.inferred_at,0,1e13,'anomaly time');
+        if(typeof a.slope_per_hour==='number')v.slope_per_hour=number(a.slope_per_hour,-1e9,1e9,'anomaly slope');}
+      out.gas_anomaly=v;
+    }
+  }catch(_){};
+  if(h.food_progress&&typeof h.food_progress==='object')try{
+    const p=h.food_progress,foods=['banana','chicken','egg','rice','sprouts','tofu'];
+    if(p.model==='assumed-progress-v1-time'&&/^STO-[\w-]{32,40}$/.test(p.storage_session_id)&&
+       /^[a-f0-9]{16}$/.test(p.sensor_id)&&foods.includes(p.food_code)&&
+       ['EARLY','MIDDLE','LATE'].includes(p.stage)){
+      const v={model:p.model,storage_session_id:p.storage_session_id,sensor_id:p.sensor_id,
+        food_code:p.food_code,stage:p.stage,index:number(p.index,0,100,'progress index'),
+        placed_at:number(p.placed_at,1577836800000,1e13,'placement time'),
+        inferred_at:number(p.inferred_at,1577836800000,1e13,'progress time')};
+      if(Number.isInteger(v.index)&&v.placed_at<=v.inferred_at&&v.inferred_at<=now+5000)
+        out.food_progress=v;
+    }
+  }catch(_){};
+  out.ota_state=h.ota_state==='UPDATING'||h.ota_state==='VERIFYING'?h.ota_state:'IDLE';
+  if(typeof h.local_ip==='string'&&/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h.local_ip))out.local_ip=h.local_ip;
+  if(typeof out.last_valid_age_ms==='number')out.last_valid_age_ms+=ageDelta;
+  if(typeof out.battery_age_ms==='number')out.battery_age_ms+=ageDelta;
+  return out;
+}
+function cacheHealth(payload, normalized, samples, deviceId, receivedAt) {
+  const seenAt=Date.now(), ageDelta=Math.max(0,seenAt-receivedAt);
+  const snap=healthSnapshot(payload.health,seenAt,ageDelta);
+  if(!snap.latest && payload.version!==2 && payload.version!==3 && samples.length) {
+    const s=samples[0];snap.latest={t:s.t,h:s.h,p:s.p,g:s.g};snap.last_valid_age_ms=ageDelta;
+  }
+  snap.device_id=deviceId;snap.sensor_id=normalized.sensorId;
+  try {
+    const cache=CacheService.getScriptCache(), key='LIVE_V2:'+deviceId, previous=cachedObject(cache,key);
+    if(previous&&previous.environment&&snap.environment&&
+       previous.server_seen_at-previous.environment.age_ms>snap.server_seen_at-snap.environment.age_ms) {
+      snap.environment={t:previous.environment.t,h:previous.environment.h,p:previous.environment.p,
+        age_ms:previous.environment.age_ms+Math.max(0,seenAt-previous.server_seen_at)};
+    }
+    cache.put(key,JSON.stringify(snap),600);
+  } catch(_) {}
+  return snap;
+}
+function batteryHistoryRow(deviceId, sensorId, h) {
+  if(!h||typeof h.server_seen_at!=='number'||typeof h.usb_power!=='boolean'||
+     typeof h.battery_measurement_valid!=='boolean')return null;
+  if(!h.usb_power&&!h.battery_measurement_valid)return null;
+  if(h.battery_measurement_valid&&typeof h.battery_mv!=='number')return null;
+  const age=h.battery_measurement_valid&&typeof h.battery_age_ms==='number'?h.battery_age_ms:0;
+  const measured=Math.max(0,h.server_seen_at-age);
+  return [new Date(measured).toISOString(),deviceId,sensorId||'',
+    typeof h.battery_nrf_boot==='number'?h.battery_nrf_boot:'',
+    typeof h.battery_sample_ms==='number'?h.battery_sample_ms:'',
+    h.battery_measurement_valid?h.battery_mv:'',
+    h.battery_measurement_valid&&typeof h.battery_percent==='number'?h.battery_percent:'',
+    h.usb_power,h.battery_measurement_valid,h.battery_calibration_state||'',
+    new Date(h.server_seen_at).toISOString()];
+}
+function appendBatteryHistory(ctx, deviceId, sensorId, h) {
+  const row=batteryHistoryRow(deviceId,sensorId,h);if(!row)return false;
+  const rows=dataRows(ctx.battery), last=rows.slice().reverse().find(r=>r[1]===deviceId);
+  if(last) {
+    const lastMeasured=millis(last[0]);
+    if(Number.isFinite(lastMeasured)&&millis(row[0])-lastMeasured<BATTERY_HISTORY_INTERVAL_MS)return false;
+  }
+  const target=ctx.battery.getLastRow()+1;ensureRoom(ctx,ctx.battery,target);
+  ctx.battery.getRange(target,1,1,BATTERY_HEADERS.length).setValues([row]);
+  return true;
+}
+function maybeRecordBatteryHistory(deviceId, sensorId, h) {
+  if(!batteryHistoryRow(deviceId,sensorId,h))return false;
+  const cache=CacheService.getScriptCache(),key='BATTERY_HISTORY_DUE_V1:'+deviceId;
+  try {if(cache.get(key))return false;} catch(_) {}
+  const attempt=tryLocked(()=>{
+    const ctx=sheets();
+    const stored=appendBatteryHistory(ctx,deviceId,sensorId,h);
+    SpreadsheetApp.flush();return stored;
+  });
+  if(!attempt.acquired)return false;
+  try {cache.put(key,'1',Math.max(60,Math.floor(BATTERY_HISTORY_INTERVAL_MS/1000)));} catch(_) {}
+  return attempt.value;
+}
+function ingest(payload) {
+  const now=Date.now(), normalized=normalize(payload,now), samples=normalized.samples, deviceId=normalized.deviceId; // validate ALL before any mutation
+  const health=payload.health||{}, otaState=health.ota_state==='UPDATING'||health.ota_state==='VERIFYING'?health.ota_state:'IDLE';
+  const cache=CacheService.getScriptCache(), heartbeatStateKey='HEARTBEAT_STATE_V1:'+deviceId;
+  if(samples.length===0&&otaState==='IDLE') {
+    const state=cache.get(heartbeatStateKey), cached=cachedObject(cache,'RECORDING_V1:'+deviceId);
+    if(state==='IDLE'&&cached) {
+      const snap=cacheHealth(payload,normalized,samples,deviceId,now);
+      maybeRecordBatteryHistory(deviceId,normalized.sensorId,snap);
+      return {success:true,version:payload.version===3?3:2,acks:[],stored:0,recording:cached,server_time:Date.now()};
+    }
+    const attempt=tryLocked(()=>{
+      const ctx=sheets();
+      registerDevice(ctx,deviceId,payload,now);
+      const record=cacheRecording(recordingResult(ctx,deviceId));
+      try {cache.put(heartbeatStateKey,'IDLE',600);} catch(_) {}
+      return record;
+    });
+    if(!attempt.acquired)throw new Error('Cloud state busy; heartbeat will retry');
+    const snap=cacheHealth(payload,normalized,samples,deviceId,now);
+    maybeRecordBatteryHistory(deviceId,normalized.sensorId,snap);
+    return {success:true,version:payload.version===3?3:2,acks:[],stored:0,recording:attempt.value,server_time:Date.now()};
+  }
+  if(otaState!=='IDLE')try {cache.remove(heartbeatStateKey);} catch(_) {}
+  return locked(()=>{
+    const ctx=sheets();recoverTransactions(ctx);
+    const active=activeSession(sessionsList(ctx.sessions),deviceId);
+    if(health.ota_state==='UPDATING'&&active)throw new Error('Cannot update firmware while recording');
+    registerDevice(ctx,deviceId,payload,now);
+    const list=sessionsList(ctx.sessions);
+    const acks=[];let saved=0;
+    if(samples.length) {
+      const boot=samples[0].boot, states=dataRows(ctx.ingest);
+      let idx=states.findIndex(r=>r[0]===boot), row=idx<0?ctx.ingest.getLastRow()+1:idx+2;
+      let high=idx<0?0:Number(states[idx][1]);
+      const groups={SensorData:[],EnvironmentHistory:[],Unassigned:[]};
+      samples.forEach(s=>{
+        let status='duplicate';
+        if(s.rx>high) {
+          const session=sessionFor(s,list,deviceId);
+          status=s.captured_at===null?'unassigned_time':s.sample_schema===4||session?'stored':'not_recording';
+          if(status==='stored'||status==='unassigned_time') {
+            const values=[s.captured_at===null?'':new Date(s.captured_at).toISOString(),s.t,s.h,s.p,
+              s.sample_schema===4?'':s.g,
+              s.uid,session?session.id:'',s.seq,s.ms,s.quality,new Date(now).toISOString(),s.nrf_boot,
+              s.sample_schema,s.sample_schema===3?s.scan_seq:'',s.sample_schema===3?s.heater_step:'',
+              s.sample_schema===3?s.gas_index:'',s.sample_schema===3?s.meas_index:'',
+              s.sample_schema===3?s.sensor_status:'',s.sample_schema===3?true:'',
+              s.sample_schema===3?true:'',s.sample_schema===3?true:'',
+              s.sample_schema===3?s.profile_id:'',deviceId];
+            groups[status==='unassigned_time'?'Unassigned':s.sample_schema===4?'EnvironmentHistory':'SensorData'].push(values);++saved;
+          }
+        }
+        acks.push({uid:s.uid,status});
+      });
+      if(samples[samples.length-1].rx>high) {
+        const pending={high:samples[samples.length-1].rx,groups:[]};
+        Object.keys(groups).forEach(name=>{
+          if(groups[name].length)pending.groups.push({sheet:name,start:(name==='SensorData'?ctx.sensor:
+            name==='EnvironmentHistory'?ctx.environment:ctx.unassigned).getLastRow()+1,rows:groups[name]});
+        });
+        const journal=JSON.stringify(pending);
+        if(journal.length>45000)throw new Error('Journal too large');
+        ensureRoom(ctx,ctx.ingest,row);
+        ctx.ingest.getRange(row,1,1,3).setValues([[boot,high,journal]]);
+        SpreadsheetApp.flush();
+        finishTransaction(ctx,row,boot,high,pending);
+      }
+    }
+    const record=cacheRecording(recordingResult(ctx,deviceId));
+    if(typeof monitorStoredProgress_==='function')try{monitorStoredProgress_(deviceId,samples,acks,Date.now());}catch(error){console.error('Monitoring snapshot failed: '+String(error));}
+    try {cache.put(heartbeatStateKey,otaState,600);} catch(_) {}
+    const snap=cacheHealth(payload,normalized,samples,deviceId,now);
+    try {appendBatteryHistory(ctx,deviceId,normalized.sensorId,snap);SpreadsheetApp.flush();} catch(error) {
+      console.error('BatteryHistory append failed: '+String(error&&error.message||error));
+    }
+    return {success:true,version:payload.version===3?3:2,acks,stored:saved,recording:record,server_time:Date.now()};
+  });
+}
+function doPost(e) {
+  let requestVersion=2;
+  try {
+    if (!e || !e.postData ||
+        typeof e.postData.contents !== 'string' ||
+        e.postData.contents.length > 64000) {
+      throw new Error('Invalid request size');
+    }
+
+    const payload=JSON.parse(e.postData.contents);
+    if(payload && payload.version===3)requestVersion=3;
+    const result=ingest(payload);
+    // Optional storage-session activation must not change a committed ACK.
+    if(typeof observeStorageSession_==='function')try{observeStorageSession_(payload,Date.now());}catch(_){}
+    if(typeof observeStorageTelemetry_==='function')try{observeStorageTelemetry_(payload,Date.now());}catch(_){}
+    try{result.storage_session=typeof storageResponse_==='function'?
+      storageResponse_(validDeviceId(payload.device_id),payload,Date.now()):
+      {state:'UNAVAILABLE',reason:'STORAGE_MODULE_MISSING'};
+    }catch(_){result.storage_session={state:'UNAVAILABLE',reason:'STORAGE_STATE_UNAVAILABLE'};}
+    // Remote control failure must never invalidate an already committed sample ACK.
+    if(typeof remoteExchange_==='function'&&payload.remote)try{result.remote=remoteExchange_(payload);}catch(_){result.remote=null;}
+    return json(result);
+
+  } catch (error) {
+    return json({
+      success: false,
+      version: requestVersion,
+      error: String(error.message || error)
+    });
+  }
+}
+function json(v) {return ContentService.createTextOutput(JSON.stringify(v)).setMimeType(ContentService.MimeType.JSON);}
+function getDashboard(requestedDeviceId) {
+  const deviceId=validDeviceId(requestedDeviceId);
+  const cache=CacheService.getScriptCache();
+  const cached=cachedObject(cache,'RECORDING_V1:'+deviceId);
+  const attempt=cached?null:tryLocked(()=>{
+    const ctx=sheets();recoverTransactions(ctx);return cacheRecording(recordingResult(ctx,deviceId));});
+  const recording=cached||(attempt&&attempt.acquired?attempt.value:unknownRecording(deviceId));
+  const h=cachedObject(cache,'LIVE_V2:'+deviceId);
+  const now=Date.now(), transportStale=!h||now-h.server_seen_at>TRANSPORT_STALE_MS;
+  const env=h&&h.environment;
+  const age=env?env.age_ms+now-h.server_seen_at:
+    h&&(!h.sensor_mode||h.sensor_mode==='LEGACY')&&typeof h.last_valid_age_ms==='number'?
+      h.last_valid_age_ms+now-h.server_seen_at:null;
+  let state='WAITING / UNKNOWN';
+  if(transportStale)state='STALE / CLOUD CONTACT UNKNOWN';
+  else if(h.spool_error)state='DATA STORAGE ERROR';
+  else if(h.spool_full)state='DATA BUFFER FULL';
+  else if(h.queue_drops>0)state='DATA LOSS RECORDED';
+  else if(h.ble_connected===false)state='BLE DISCONNECTED';
+  else if(h.sensor_mode==='GAS')state='GAS SCAN / ENVIRONMENT PAUSED';
+  else if(h.sensor_mode==='COOL')state='COOLING / ENVIRONMENT PAUSED';
+  else if(h.sensor_mode==='REC')state='SENSOR RECOVERY';
+  else if(h.sensor_mode==='ENV'&&h.environment_ok===false)state='ENVIRONMENT SENSOR ERROR';
+  else if(h.sensor_ok===false)state='SENSOR ERROR';
+  else if(age===null||age>ENVIRONMENT_STALE_MS)state='STALE';
+  else state='LIVE / ONLINE';
+  const integrity_reason=!h?null:h.spool_error?'SPIFFS/spool fault reported by gateway':
+    h.spool_full?'Spool capacity exhausted; unacknowledged data is retained':
+    h.queue_drops>0?'Gateway reported '+h.queue_drops+' rejected queue item(s) since boot':null;
+  const progress_reason=transportStale?'최근 게이트웨이 heartbeat가 없습니다. Wi-Fi 단절 여부는 확인할 수 없습니다.':
+    state==='STALE'?(age===null?'클라우드 연결은 유지되지만 유효한 환경 측정값이 없습니다.':'클라우드 연결은 유지되지만 환경 측정값이 '+Math.floor(age/1000)+'초 동안 갱신되지 않았습니다.'):
+    h&&typeof h.last_valid_age_ms==='number'&&h.last_valid_age_ms+now-h.server_seen_at>1200000?
+      '유효 GAS 데이터가 20분 이상 갱신되지 않았습니다. 연결 상태만으로 측정 진행을 보장할 수 없습니다.':null;
+  return {device_id:deviceId,state,age,health:h,recording,server_time:now,integrity_reason,progress_reason,
+    remote_update:typeof remoteSummary_==='function'?remoteSummary_(deviceId):null,
+    monitoring:typeof monitorSummaryV2_==='function'?monitorSummaryV2_(deviceId):null,
+    storage_session:typeof storageResponse_==='function'?
+      storageResponse_(deviceId,{health:h,sensor_id:h&&h.sensor_id},now):
+      {state:'UNAVAILABLE',reason:'STORAGE_MODULE_MISSING'}};
+}
+function getBatteryHistory(requestedDeviceId, requestedRange) {
+  const deviceId=validDeviceId(requestedDeviceId), range=requestedRange||'24h';
+  if(!['24h','7d','all'].includes(range))throw new Error('Invalid battery history range');
+  return locked(()=>{
+    const ctx=sheets(),now=Date.now(),cutoff=range==='24h'?now-86400000:range==='7d'?now-604800000:0;
+    let rows=dataRows(ctx.battery).filter(r=>r[1]===deviceId&&millis(r[0])>=cutoff);
+    const total=rows.length,maxPoints=2000;
+    if(rows.length>maxPoints) {
+      const selected=[];for(let i=0;i<maxPoints;i++)selected.push(rows[Math.floor(i*(rows.length-1)/(maxPoints-1))]);
+      rows=selected;
+    }
+    return {device_id:deviceId,range,total,downsampled:total>rows.length,
+      last_received_at:rows.length?millis(rows[rows.length-1][10]):null,
+      points:rows.map(r=>({measured_at:millis(r[0]),battery_mv:r[5]===''?null:Number(r[5]),
+        battery_percent:r[6]===''?null:Number(r[6]),usb_power:r[7]===true,
+        measurement_valid:r[8]===true}))};
+  });
+}
+function getDashboardDevices() {
+  const cache=CacheService.getScriptCache(), cached=cachedObject(cache,DEVICE_LIST_CACHE_KEY);
+  if(cached)return cached;
+  const attempt=tryLocked(()=>{
+    const ctx=sheets(), rows=dataRows(ctx.devices);
+    const ids=rows.map(r=>r[0]).filter(x=>typeof x==='string'&&/^[a-f0-9]{12}$/.test(x));
+    sessionsList(ctx.sessions).forEach(s=>{if(s.device_id===LEGACY_DEVICE_ID||/^[a-f0-9]{12}$/.test(s.device_id))ids.push(s.device_id);});
+    const unique=Array.from(new Set(ids));if(!unique.length)unique.push(LEGACY_DEVICE_ID);
+    const result=unique.map(id=>({device_id:id,first_seen_at:(rows.find(r=>r[0]===id)||[])[1]||null}));
+    try {cache.put(DEVICE_LIST_CACHE_KEY,JSON.stringify(result),600);} catch(_) {}
+    return result;
+  });
+  if(attempt.acquired)return attempt.value;
+  const retry=cachedObject(cache,DEVICE_LIST_CACHE_KEY);
+  if(retry)return retry;
+  throw new Error('Device list temporarily busy; retry');
+}
+function getSensorData(deviceId) {return getDashboard(deviceId);}
+function csvCell(v) {if(v instanceof Date)v=v.toISOString();return '"'+String(v===null?'':v).replace(/"/g,'""')+'"';}
+function csvFilename(label, sessionId) {
+  if(label===null)return 'food-spoilage-all.csv';
+  let name=String(label);
+  if(name.normalize)name=name.normalize('NFC');
+  const hadNonAscii=/[^\x20-\x7E]/.test(name);
+  name=name.replace(/[\u0000-\u001F\u007F<>:"/\\|?*]/g,'_').replace(/\s+/g,' ').trim().replace(/[. ]+$/g,'');
+  name=name.replace(/\.csv$/i,'').replace(/[. ]+$/g,'');
+  // TextOutput.downloadAsFile() rejects some Unicode filenames in production.
+  // Keep readable ASCII labels, otherwise use the stable session identity; the
+  // original Unicode experiment label remains unchanged in Sheets/session data.
+  name=name.replace(/[^\x20-\x7E]/g,'_').replace(/_+/g,'_').replace(/^_+|_+$/g,'');
+  if(hadNonAscii||!/[A-Za-z0-9]/.test(name)) {
+    const safeId=String(sessionId||'session').replace(/[^A-Za-z0-9_-]/g,'_').slice(0,80);
+    name='food-spoilage-session-'+(safeId||'session');
+  }
+  if(/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name))name='_'+name;
+  name=Array.from(name).slice(0,100).join('');
+  return name+'.csv';
+}
+function getCsvPage(sessionId, offset, limit, requestedDeviceId) {
+  const deviceId=requestedDeviceId===undefined||requestedDeviceId===null||requestedDeviceId===''?null:validDeviceId(requestedDeviceId);
+  return locked(()=>{
+    const ctx=sheets();recoverTransactions(ctx);
+    const session=sessionId?sessionsList(ctx.sessions).find(s=>s.id===sessionId):null;
+    if(sessionId&&!session)throw new Error('Unknown session');
+    const total=ctx.sensor.getLastRow()-1;
+    if(offset===undefined && total>10000)throw new Error('CSV exceeds 10000 rows: use explicit offset/limit pages (see dashboard)');
+    offset=offset===undefined?0:Number(offset);limit=limit===undefined?10000:Number(limit);
+    if(!Number.isInteger(offset)||offset<0||!Number.isInteger(limit)||limit<1||limit>10000)throw new Error('Invalid CSV page');
+    const n=Math.max(0,Math.min(limit,total-offset));
+    const rows=n?ctx.sensor.getRange(offset+2,1,n,HEADERS.length).getValues():[];
+    const selected=[HEADERS].concat(rows.filter(r=>(!sessionId||r[6]===sessionId)&&
+      (deviceId===null||(deviceId===LEGACY_DEVICE_ID?(r[22]||LEGACY_DEVICE_ID)===LEGACY_DEVICE_ID:r[22]===deviceId))));
+    return {csv:selected.map(r=>r.map(csvCell).join(',')).join('\r\n'),
+      filename:session?csvFilename(session.label,session.id):csvFilename(null)};
+  });
+}
+function getCsvData(sessionId, offset, limit, deviceId) {return getCsvPage(sessionId,offset,limit,deviceId).csv;}
+function doGet(e) {
+  if(e&&e.parameter&&e.parameter.download==='csv') {
+    const page=getCsvPage(e.parameter.session||'',e.parameter.offset,e.parameter.limit,e.parameter.device);
+    return ContentService.createTextOutput('\uFEFF'+page.csv).setMimeType(ContentService.MimeType.CSV).downloadAsFile(page.filename);
+  }
+  const template=HtmlService.createTemplateFromFile('Dashboard');
+  template.webAppUrl=ScriptApp.getService().getUrl();
+  template.refreshMs=DASHBOARD_REFRESH_MS;
+  return template.evaluate().setTitle('Food Spoilage Monitor');
+}

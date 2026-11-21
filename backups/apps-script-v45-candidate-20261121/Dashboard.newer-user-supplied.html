@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font:16px system-ui;background:#f3f5f6;color:#172b36;max-width:1500px;margin:32px auto;padding:0 18px}
+#devices{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;align-items:start}
+section.device{min-width:0;box-sizing:border-box;background:white;padding:20px;margin:0;border-radius:12px}button,a{padding:10px;display:inline-block;margin:4px}
+@media(min-width:760px){#devices{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(min-width:1200px){#devices{grid-template-columns:repeat(3,minmax(0,1fr))}}
+input{padding:10px;max-width:90%}pre{white-space:pre-wrap;font-size:14px}.error{color:#b42318}.values{font-size:22px}
+.field-recovery{background:white;border:1px solid #d8e0e4;border-radius:10px;padding:12px;margin:14px 0}.field-recovery p{margin:7px 0}.field-recovery input{width:190px;max-width:100%;box-sizing:border-box}
+h1{font-size:clamp(26px,7vw,36px);overflow-wrap:anywhere}section.device pre{overflow-wrap:anywhere}section.device p,section.device a{overflow-wrap:anywhere}
+.battery-chart{width:100%;height:150px;background:#f8fafb;border:1px solid #d8e0e4;border-radius:8px}.muted{color:#526773;font-size:14px}
+[hidden]{display:none!important}
+.food-status{border:2px solid #d8e0e4;border-radius:16px;padding:20px;background:#f1f4f6;margin:12px 0}.food-status.fresh{background:#e7f7ec;border-color:#27854b}.food-status.suspect{background:#fff7d6;border-color:#b58b00}.food-status.signs{background:#ffebe8;border-color:#bd4238}.food-icon{font-size:48px;line-height:1}.food-title{font-size:28px;margin:8px 0}.food-kind{font-size:22px;font-weight:700}.food-session{width:100%;max-width:100%;padding:10px;box-sizing:border-box} .food-note{font-size:13px;color:#526773}
+.food-analysis{margin-top:22px;border-top:1px solid #d8e0e4;padding-top:12px}.food-status{padding:16px;overflow-wrap:anywhere}.food-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0}.food-metrics div{background:white;border-radius:9px;padding:10px;min-width:0}.food-metrics small{display:block;color:#526773}.food-metrics strong{display:block;font-size:20px;line-height:1.3}.food-measure{font-weight:700;color:#226242}.food-measure.stale{color:#a05a00}.food-measure.error{color:#b42318}@media(max-width:390px){.food-title{font-size:25px}.food-metrics strong{font-size:18px}}
+.food-risk{background:#fff;border:1px solid #d8e0e4;border-radius:10px;padding:12px;margin:12px 0;box-sizing:border-box;max-width:100%;overflow-wrap:anywhere}.food-risk strong{font-size:25px}.food-risk small{display:block;color:#526773}.food-temp-warning{font-weight:700;color:#a05a00}
+.food-signal{border:2px solid #d8e0e4;border-radius:10px;padding:12px;margin:12px 0;background:#f3f5f6;font-size:21px;font-weight:700;box-sizing:border-box;max-width:100%;overflow-wrap:anywhere;white-space:normal}.food-signal.watch{background:#fff5cf;border-color:#b58b00}.food-signal.high{background:#ffebe8;border-color:#bd4238}.food-signal strong{display:block;font-size:25px}.food-signal small{display:block;color:#526773}.food-signal p{margin:7px 0 0}
+.food-analysis>input,.food-analysis>select,.food-analysis>label>input{display:block;width:100%;max-width:100%;box-sizing:border-box;margin:6px 0 10px}.food-analysis>button{width:100%;box-sizing:border-box;margin:5px 0}.dev-panel{margin-top:18px}
+</style></head><body>
+<h1>Food Spoilage Monitor</h1><details><summary>원격 업데이트 관리 인증</summary><label>관리 토큰 <input id="remoteToken" type="password" autocomplete="off" maxlength="64" onkeydown="if(event.key==='Enter'){event.preventDefault();saveRemoteToken()}"></label><button type="button" onclick="saveRemoteToken()">토큰 확인·이 브라우저에 저장</button><button type="button" onclick="clearRemoteToken()">저장된 토큰 삭제</button><p id="remoteTokenStatus" role="status" class="muted">저장을 선택하면 이 브라우저에만 남습니다. 공용 PC에서는 저장하지 마세요.</p></details><div class="field-recovery"><strong>현장 장치 직접 접속</strong><p>장치 목록이 늦어도 같은 LAN에서 현재 장치 IP로 접속할 수 있습니다.</p><label>장치 IP <input id="fieldRecoveryIp" inputmode="decimal" placeholder="예: 192.168.1.124"></label><button type="button" onclick="openFieldRecovery('/')">현장 OTA</button><button type="button" onclick="openFieldRecovery('/remote-config')">원격 설정</button><button type="button" onclick="openFieldRecovery('/nrf-dfu/status')">DFU 상태</button><p id="fieldRecoveryStatus" role="status"></p></div><p id="loading">Loading devices…</p><div id="devices"></div>
+<script>
+const refreshMs=<?= refreshMs ?>,base='<?= webAppUrl ?>';
+const panels=new Map(),polling=new Set(),remoteCatalog=new Map(),pollFailures=new Map();let deviceListBusy=false,listRetryAt=0,listFailures=0;
+const foodReviewPoll=new Map();
+const remoteTokenStorageKey='foodmonitor.remote.operator.v1';
+function remoteTokenStatus(message,error=false){const s=document.getElementById('remoteTokenStatus');s.textContent=message;s.className=error?'error':'muted';}
+function saveRemoteToken(){
+ const token=document.getElementById('remoteToken').value.trim();
+ if(!/^[a-fA-F0-9]{64}$/.test(token)){remoteTokenStatus('64자리 관리 토큰을 입력하세요.',true);return;}
+ google.script.run.withSuccessHandler(()=>{
+  try{if(typeof localStorage==='undefined')throw Error('storage unavailable');localStorage.setItem(remoteTokenStorageKey,token);remoteTokenStatus('관리 토큰을 확인하고 이 브라우저에 저장했습니다.');}
+  catch(_){remoteTokenStatus('인증은 성공했지만 브라우저 저장이 차단됐습니다. 이 탭에서는 입력한 토큰을 계속 사용할 수 있습니다.',true);}
+ }).withFailureHandler(e=>remoteTokenStatus('관리 토큰 확인 실패: '+String(e&&e.message||e),true)).getRemoteUpdateCatalog(token);
+}
+function clearRemoteToken(){
+ try{if(typeof localStorage!=='undefined')localStorage.removeItem(remoteTokenStorageKey);}catch(_){}
+ document.getElementById('remoteToken').value='';remoteTokenStatus('이 브라우저의 저장된 관리 토큰을 삭제했습니다.');
+}
+function restoreRemoteToken(){
+ try{const token=typeof localStorage==='undefined'?'':localStorage.getItem(remoteTokenStorageKey);if(token&&/^[a-fA-F0-9]{64}$/.test(token)){document.getElementById('remoteToken').value=token;remoteTokenStatus('이 브라우저에 저장한 관리 토큰을 불러왔습니다.');}}catch(_){}
+}
+function panelMarkup(id,index){return `<section class="device" id="panel-${id}"><h2>Device ${index+1} · ${id}</h2>
+ <div class="food-analysis"><h3>음식 분석</h3>
+<div id="foodCard-${id}" class="food-status unknown" role="status" aria-live="polite"><div id="foodIcon-${id}" class="food-icon" aria-hidden="true">⚪</div><h3 id="foodTitle-${id}" class="food-title">보관 조건 확인 중</h3><div id="foodName-${id}" class="food-kind">음식 확인 중</div><p id="foodReason-${id}">측정 자료를 불러오고 있습니다.</p><div class="food-risk"><small>ESP32-S3 AI가 GAS 지문으로 추정한 음식 · 참고용</small><strong id="foodAiCandidate-${id}">최근 추론 대기</strong><p id="foodAiCandidateDetail-${id}">완성 GAS 측정 후 결과가 표시됩니다.</p></div><div class="food-risk"><small>규칙 기반 보관 위험도 · 높을수록 위험</small><strong id="foodRiskScore-${id}">보관 상태 확인 중</strong><p id="foodRiskReason-${id}">보관 기록 확인 중</p><details><summary>보관 조건 계산 근거</summary><small id="foodRiskParts-${id}"></small></details></div><p id="foodTempWarning-${id}" class="food-temp-warning"></p><p id="foodIncident-${id}" class="muted">장애 알림: 상태 확인 중</p><div class="food-metrics"><div><small>기록 경과</small><strong id="foodTime-${id}">--</strong></div><div><small>온도</small><strong id="foodTemp-${id}">--</strong></div><div><small>습도</small><strong id="foodHumidity-${id}">--</strong></div><div><small>마지막 환경 측정</small><strong id="foodLastData-${id}">--</strong></div><div><small>마지막 완성 GAS</small><strong id="foodGasTime-${id}">--</strong></div><div><small>서버 마지막 수신</small><strong id="foodCloudTime-${id}">--</strong></div>
+
+</div><p id="foodMeasure-${id}" class="food-measure stale">환경 측정 확인 중</p><p id="foodGasState-${id}" class="food-measure stale">GAS 측정 확인 중</p><details><summary>GAS·음식 모델 상세</summary><p id="foodGasChange-${id}" class="muted">GAS 변화 분석: 확인 중</p><p id="foodEdge-${id}" class="muted">ESP 음식 추정: 확인 중</p></details><p id="foodAnomaly-${id}" class="muted">GAS 이상 탐지: 확인 중</p><div class="food-risk" id="foodAiPanel-${id}" hidden><small>보관 진행 추정</small><strong id="foodAiState-${id}">보관 상태 확인 중</strong><p id="foodAiReason-${id}">보관 정보를 확인하고 있습니다.</p><p id="foodJudged-${id}">AI 마지막 판정: 없음</p><p id="foodConfidence-${id}" class="muted"></p></div><details><summary>판정 근거·모델 정보</summary><p id="foodModelEvidence-${id}" class="muted">모델 정보 확인 중</p></details><p class="food-note">규칙 점수는 식품안전 확률이 아니며 AI 변질 추정과 별개입니다. 섭취 안전을 보증하지 않습니다.</p></div>
+<button type="button" onclick="loadFoodReview('${id}',true)">최신 판정 확인</button><label>이전 실험 보기 <select id="foodSession-${id}" class="food-session" onchange="loadFoodReview('${id}',true)"><option value="">현재 보관 음식</option></select></label>
+
+<h3>내 음식 보관</h3><p id="storageState-${id}">보관 세션 확인 중</p><details><summary>AI Shadow Mode 상세 진단</summary><p id="aiShadow-${id}" class="muted">AI Shadow Mode: 보관 세션 대기</p></details><input id="containerName-${id}" maxlength="80" placeholder="용기 이름 (예: 냉장 용기 1)" aria-label="${id} 용기 이름"><select id="storageFood-${id}" aria-label="${id} 보관 음식"><option value="">음식 종류 선택</option><option value="생숙주">생숙주</option><option value="익힌숙주">익힌 숙주</option><option value="삶은계란">삶은 계란</option><option value="생달걀 껍질">껍질째 생달걀</option><option value="밥">익힌 밥</option><option value="생닭">생닭</option><option value="익힌닭">익힌 닭</option><option value="두부">두부</option><option value="바나나">바나나</option></select><label>실제 음식 투입 시각 <input id="storagePlaced-${id}" type="datetime-local" aria-label="${id} 실제 음식 투입 시각"></label><button id="storageStart-${id}" onclick="storageControl('${id}',true)">보관 설정 저장</button><button id="storageStop-${id}" onclick="storageControl('${id}',false)">보관 종료</button><p id="storageMessage-${id}" role="status"></p>
+</div>
+
+  <strong id="state-${id}">WAITING / UNKNOWN</strong><p id="integrity-${id}" class="error" hidden></p><p id="measurement-${id}">Measurement mode: unknown</p><p id="age-${id}">No confirmed sample</p><p id="updated-${id}">Last update: unknown</p><div class="values" id="values-${id}">—</div><p id="gas-${id}">No valid gas sample</p><p id="battery-${id}">BAT --</p>
+ <details class="dev-panel"><summary>관리·개발 기능 (실험 기록·다운로드·OTA·진단)</summary><details><summary>배터리 이력</summary><p><button onclick="loadBatteryHistory('${id}','24h')">최근 24시간</button><button onclick="loadBatteryHistory('${id}','7d')">최근 7일</button><button onclick="loadBatteryHistory('${id}','all')">전체</button></p><p id="batteryHistoryStatus-${id}" class="muted">이력 조회 전</p><p>배터리 전압 (실측)</p><svg id="batteryVoltageChart-${id}" class="battery-chart" viewBox="0 0 760 150" role="img" aria-label="배터리 전압 이력"></svg><p>배터리 잔량 (센서 추정)</p><svg id="batteryPercentChart-${id}" class="battery-chart" viewBox="0 0 760 150" role="img" aria-label="배터리 추정 잔량 이력"></svg></details>
+<p>Values are live telemetry, not a food-safety verdict. Stale values remain labeled as stale.</p>
+  <h3 id="recording-${id}">실험 상태 확인 중</h3><h2 id="sessionName-${id}">실험 기록 없음</h2><p id="sessionDate-${id}"></p><details id="sessionDetails-${id}" hidden><summary>세션 ID 보기</summary><small id="sessionId-${id}"></small></details>
+  <input id="label-${id}" maxlength="120" placeholder="새 실험 이름" aria-label="${id} 장치의 새 실험 이름">
+  <button id="start-${id}" onclick="control('${id}',true)">새 실험 시작</button><button id="stop-${id}" onclick="control('${id}',false)">실험 종료</button><p id="message-${id}" role="status"></p>
+  <details><summary>용기별 온도·습도·가스 변화 이력</summary><button onclick="loadStorageHistory('${id}')">이력 불러오기</button><p id="storageHistoryStatus-${id}" class="muted">조회 전</p><p>온도 °C</p><svg id="storageTemp-${id}" class="battery-chart" viewBox="0 0 760 150"></svg><p>상대습도 %</p><svg id="storageHumidity-${id}" class="battery-chart" viewBox="0 0 760 150"></svg><p>가스 변화 지표 (Shadow Mode)</p><svg id="storageChange-${id}" class="battery-chart" viewBox="0 0 760 150"></svg></details>
+  <h3>데이터 다운로드</h3><p>페이지당 최대 10,000행입니다. 데이터가 더 있으면 다음 페이지 번호를 선택해 추가 데이터를 다운로드하세요.</p><label>다운로드 페이지 <input id="page-${id}" type="number" min="1" step="1" value="1" aria-label="${id} 장치 CSV 페이지" onchange="csvLinks('${id}')"></label>
+  <p><a id="sessionCsv-${id}" hidden target="_blank" rel="noopener">최근 실험 데이터 다운로드 (CSV)</a><a id="all-${id}" href="${base}?download=csv" target="_blank" rel="noopener">장치 전체 데이터 다운로드 (CSV)</a></p>
+  <p>측정 시각을 기준으로 실험 데이터를 구분합니다. 실험 종료 후 늦게 도착한 데이터도 해당 실험에 포함될 수 있습니다. 측정 시각이 불명확한 데이터는 별도로 분류됩니다.</p>
+  <h3>Firmware</h3><p id="firmware-${id}">Version: unknown</p><p id="ota-${id}">OTA: unavailable</p><p class="muted">현장 복구 링크는 스마트폰과 게이트웨이가 같은 LAN에 있을 때만 열립니다. 인터넷 원격 업데이트는 아래에서 진행합니다.</p><a id="espOtaLink-${id}" hidden target="_blank" rel="noopener">현장 복구: ESP32 OTA — gateway firmware</a><a id="nrfDfuLink-${id}" hidden target="_blank" rel="noopener">현장 복구: nRF52840 DFU — sensor firmware</a><a id="nrfDfuStatusLink-${id}" hidden target="_blank" rel="noopener">현장 DFU 상태 확인</a><p id="localLinkStatus-${id}" class="muted"></p><label>장치의 현재 IP <input id="manualLocalIp-${id}" inputmode="decimal" placeholder="예: 192.168.1.124" aria-label="${id} 현장 장치 IP"></label><button type="button" onclick="openManualLocal('${id}','/')">현장 OTA 열기</button><button type="button" onclick="openManualLocal('${id}','/remote-config')">원격 설정 열기</button><button type="button" onclick="openManualLocal('${id}','/nrf-dfu/status')">DFU 상태 열기</button><p id="manualLocalStatus-${id}" role="status"></p>
+<details><summary>인터넷 원격 업데이트 (다른 Wi-Fi·모바일 데이터 가능)</summary><p>등록된 HTTPS 패키지를 ESP32가 직접 내려받습니다. 브라우저가 로컬 IP에 접속할 필요는 없습니다.</p><p>최초 장치 키 설정은 같은 LAN에서 아래 현장 복구 페이지의 <b>Remote update provisioning</b> 링크로 이동합니다. 주소를 외울 필요가 없으며, 다른 Wi-Fi에서는 이 로컬 페이지에 접속할 수 없습니다.</p><p id="remotePrereq-${id}" class="muted">장치 상태 확인 중</p>
+  <button onclick="loadRemoteCatalog('${id}')">패키지 목록 불러오기</button><select id="remoteRelease-${id}" aria-label="원격 업데이트 패키지"></select>
+  <label><input id="remoteRollback-${id}" type="checkbox"> ESP32 이전 버전/빌드로 복구 승인</label>
+  <button id="remoteStart-${id}" onclick="approveRemoteUpdate('${id}')" disabled>선택 장치 업데이트 승인</button>
+  <p id="remoteState-${id}">원격 상태 확인 중</p><progress id="remoteProgress-${id}" max="100" value="0"></progress><p id="remoteMessage-${id}" role="status"></p><details><summary>최근 업데이트 결과</summary><pre id="remoteHistory-${id}"></pre></details></details>
+<h3>Diagnostics</h3><p id="transport-${id}">Wi-Fi / BLE / cloud ACK: unknown</p><details><summary>상세 진단 JSON 보기</summary><pre id="health-${id}">Waiting for gateway heartbeat</pre></details>
+</details></section>`;}
+function el(id,suffix){return document.getElementById(suffix+'-'+id);}
+function privateLanIp(value){const parts=String(value||'').trim().split('.').map(Number);
+ if(parts.length!==4||parts.some(x=>!Number.isInteger(x)||x<0||x>255))return false;
+ return parts[0]===10||parts[0]===192&&parts[1]===168||
+   parts[0]===172&&parts[1]>=16&&parts[1]<=31;}
+function openLocalIp(ip,status,path){ip=String(ip||'').trim();
+ if(!privateLanIp(ip)){status.textContent='장치에서 확인한 사설 IPv4 주소를 입력하세요.';return;}
+ const route=['/','/remote-config','/nrf-dfu/status'].includes(path)?path:'/';
+ const url='http://'+ip+':8080'+route;
+ status.textContent='직접 주소: '+url+' · 현재 장치의 IP인지 확인하세요.';
+ window.open(url,'_blank','noopener');}
+function openManualLocal(id,path){openLocalIp(el(id,'manualLocalIp').value,el(id,'manualLocalStatus'),path);}
+function openFieldRecovery(path){openLocalIp(document.getElementById('fieldRecoveryIp').value,
+ document.getElementById('fieldRecoveryStatus'),path);}
+function csvLinks(id){const page=Math.max(1,Math.floor(Number(el(id,'page').value)||1)),offset=(page-1)*10000,session=panels.get(id)?.sessionId||'';
+ el(id,'all').href=base+'?download=csv&offset='+offset+'&limit=10000&device='+encodeURIComponent(id);
+ el(id,'sessionCsv').href=base+'?download=csv&offset='+offset+'&limit=10000&session='+encodeURIComponent(session)+'&device='+encodeURIComponent(id);}
+function deviceError(message){const loading=document.getElementById('loading');loading.textContent=message;loading.className='error';}
+function koreanDateTime(value){if(typeof value!=='number'||!Number.isFinite(value))return '';return new Intl.DateTimeFormat('ko-KR',{year:'numeric',month:'long',day:'numeric',hour:'numeric',minute:'numeric'}).format(new Date(value));}
+function chartSvg(points,key,min,max){
+ const valid=points.filter(p=>Number.isFinite(p[key])&&Number.isFinite(p.measured_at));if(!valid.length)return '<text x="20" y="75" fill="#526773">기록 없음</text>';
+ const first=valid[0].measured_at,last=valid[valid.length-1].measured_at,span=Math.max(1,last-first),segments=[];let current=[];
+ for(const p of valid){if(current.length&&p.measured_at-current[current.length-1].measured_at>900000){segments.push(current);current=[];}current.push(p);}if(current.length)segments.push(current);
+ const lines=segments.map(s=>'<polyline fill="none" stroke="#087f5b" stroke-width="2" points="'+s.map(p=>`${20+720*(p.measured_at-first)/span},${130-110*(Math.max(min,Math.min(max,p[key]))-min)/(max-min)}`).join(' ')+'"/>').join('');
+ return `<text x="4" y="16" fill="#526773">${max}</text><text x="4" y="138" fill="#526773">${min}</text>${lines}`;
+}
+function renderBatteryHistory(id,data){const points=Array.isArray(data.points)?data.points:[];
+ el(id,'batteryVoltageChart').innerHTML=chartSvg(points,'battery_mv',2500,4300);
+ el(id,'batteryPercentChart').innerHTML=chartSvg(points,'battery_percent',0,100);
+ const last=data.last_received_at?new Date(data.last_received_at).toLocaleString():'없음';
+ el(id,'batteryHistoryStatus').textContent=`${data.range} · ${data.total||0}개 기록 · 마지막 수신 ${last}${data.downsampled?' · 표시용 실제 점 일부 선택':''}`;}
+function loadBatteryHistory(id,range){el(id,'batteryHistoryStatus').textContent='배터리 이력 조회 중…';google.script.run.withSuccessHandler(d=>renderBatteryHistory(id,d)).withFailureHandler(e=>{el(id,'batteryHistoryStatus').textContent='배터리 이력 오류: '+String(e.message||e);}).getBatteryHistory(id,range);}
+function loadStorageHistory(id){el(id,'storageHistoryStatus').textContent='용기 이력 조회 중…';
+ google.script.run.withSuccessHandler(d=>{const points=(d.points||[]).filter(x=>Number.isFinite(x.at)).map(x=>({...x,measured_at:x.at}));
+  el(id,'storageTemp').innerHTML=chartSvg(points,'t',-40,85);
+  el(id,'storageHumidity').innerHTML=chartSvg(points,'h',0,100);
+  const max=Math.max(0.2,...points.map(x=>Number.isFinite(x.change)?x.change:0));
+  el(id,'storageChange').innerHTML=chartSvg(points,'change',0,max);
+  el(id,'storageHistoryStatus').textContent=`${points.length}개 기록 · 최근 288개까지 표시 · 변질 확률이 아닙니다.`;
+ }).withFailureHandler(e=>{el(id,'storageHistoryStatus').textContent='용기 이력 오류: '+String(e.message||e);}).getStorageTelemetry(id);}
+function renderDevices(list){
+ if(!Array.isArray(list)||list.some(x=>!x||typeof x.device_id!=='string'||!/^(legacy|[a-f0-9]{12})$/.test(x.device_id))){deviceError('CLOUD ERROR: Invalid device list response');return;}
+ const root=document.getElementById('devices'),ids=list.map(x=>x.device_id);
+ for(const id of panels.keys())if(!ids.includes(id)){document.getElementById('panel-'+id)?.remove();panels.delete(id);}
+ ids.forEach((id,index)=>{if(!panels.has(id)){root.insertAdjacentHTML('beforeend',panelMarkup(id,index));panels.set(id,{sessionId:null});loadBatteryHistory(id,'24h');}pollDevice(id);});
+ ids.forEach(id=>{try{loadFoodReview(id,false);}catch(e){foodUnavailable(id,'음식 분석을 불러오지 못했습니다. '+String(e.message||e));}});
+ const loading=document.getElementById('loading');loading.textContent=ids.length?'':'No devices registered yet';loading.className='';}
+function show(id,d){el(id,'state').textContent=d.state;const h=d.health||{};
+ const incident=d.monitoring;
+ el(id,'foodIncident').textContent=!incident?'장애 알림: 새 감시 정책 미적용':
+  '장애 알림: '+incident.state+(incident.code?' · '+incident.code:'')+
+  (Number.isFinite(incident.first_at)?' · 최초 '+koreanDateTime(incident.first_at):'')+
+  (Number.isFinite(incident.last_notice_at)?' · 마지막 알림 '+koreanDateTime(incident.last_notice_at):'')+
+  (Number.isFinite(incident.recovered_at)?' · 복구 '+koreanDateTime(incident.recovered_at):'')+
+  (incident.delivery_uncertain?' · 메일 발송 결과 확인 필요 '+incident.delivery_uncertain+'건':'');
+ const storage=d.storage_session||{state:'NONE'};
+  if(panels.has(id))panels.get(id).storage=storage;
+  const placedAt=Number.isFinite(storage.placed_at)?storage.placed_at:storage.started_at;
+  el(id,'storageState').textContent=storage.state==='ACTIVE'?`${storage.food_label||storage.container_name} · 보관 ${((d.server_time-placedAt)/3600000).toFixed(1)}시간 · 음식 투입 ${koreanDateTime(placedAt)}`:storage.state==='PENDING'?`${storage.container_name} · 첫 유효 환경 측정 대기 (${storage.reason||'WAIT_NEW_VALID_ENV'})`:storage.state==='UNAVAILABLE'?'보관 세션 모듈 미배포 · 운영 Apps Script 파일 확인':storage.state==='ENDED'?`${storage.container_name} · 보관 종료`:'활성 보관 세션 없음';
+  if(storage.state==='ACTIVE'||storage.state==='PENDING'){
+   if(!el(id,'containerName').value)el(id,'containerName').value=storage.container_name||'';
+   if(!el(id,'storageFood').value)el(id,'storageFood').value=storage.food_label||'';
+   if(!el(id,'storagePlaced').value&&Number.isFinite(storage.placed_at)){
+    const date=new Date(storage.placed_at);el(id,'storagePlaced').value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);
+   }
+  }
+ const ai=h.ai_shadow,matched=storage.state==='ACTIVE'&&ai&&ai.storage_session_id===storage.storage_session_id&&ai.sensor_id===storage.sensor_id;
+ el(id,'aiShadow').textContent=!matched?`AI Shadow Mode: ${ai&&ai.feature===1?ai.state+' · '+ai.reason+' · 완성 스캔 '+ai.complete_scans:'펌웨어 상태 필드 없음'} · 동일 용기·센서의 추론 대기`:
+  ai.baseline_scans<3?`AI Shadow Mode: 초기 가스 지문 ${ai.baseline_scans}/3 · 점수 보류${ai.baseline_first_at?' · 첫 지문까지 '+((ai.baseline_first_at-storage.started_at)/60000).toFixed(1)+'분':''}`:
+  !Number.isFinite(ai.change_index)||!Number.isFinite(ai.shape_change)||!Number.isFinite(ai.level_change)||
+  !Number.isFinite(ai.baseline_first_at)||!Number.isFinite(ai.baseline_ready_at)?'AI Shadow Mode: 초기 기준 확보 · 다음 완성 스캔 대기':
+  `AI Shadow Mode: 변화 지표 ${ai.change_index.toFixed(3)} (형태 ${ai.shape_change.toFixed(3)}, 수준 ${ai.level_change.toFixed(3)}) · 첫 지문까지 ${((ai.baseline_first_at-storage.started_at)/60000).toFixed(1)}분 · 기준 확정까지 ${((ai.baseline_ready_at-storage.started_at)/60000).toFixed(1)}분 · 마지막 스캔 ${koreanDateTime(ai.scored_at)} · 유효성 제외 ${ai.invalid_scans}, Shadow 큐 누락 ${ai.queue_drops}. 변질 확률 또는 식품 안전 판정이 아닙니다.`;
+  el(id,'storageStart').disabled=storage.state==='UNKNOWN'||storage.state==='UNAVAILABLE';
+ el(id,'storageStop').disabled=storage.state!=='ACTIVE'&&storage.state!=='PENDING';
+ el(id,'state').title=d.progress_reason||'';
+ const integrity=el(id,'integrity');integrity.hidden=!d.integrity_reason;integrity.textContent=d.integrity_reason||'';
+ const modes={ENV:'Environment sampling',GAS:'HP-354 gas scan',COOL:'Cooling / settling',REC:'Sensor recovery',LEGACY:'Legacy gas stream'};
+ el(id,'measurement').textContent='Measurement mode: '+(modes[h.sensor_mode]||'unknown')+(d.progress_reason?' · '+d.progress_reason:'');
+ el(id,'age').textContent=d.age===null?'Last environment sample: unknown':'Last environment sample: '+(d.age/1000).toFixed(1)+' s ago';
+ el(id,'updated').textContent=d.age===null?'Last update: unknown':'Last update: '+new Date(d.server_time-d.age).toLocaleString();
+ const v=h.environment||(!h.sensor_mode||h.sensor_mode==='LEGACY'?h.latest:null);
+ el(id,'values').textContent=v?`${v.t.toFixed(2)} °C · ${v.h.toFixed(2)} % · ${v.p.toFixed(2)} hPa`:'No valid environment sample';
+ const gasAge=h.last_valid_age_ms!=null&&h.server_seen_at!=null?h.last_valid_age_ms+d.server_time-h.server_seen_at:null;
+ el(id,'gas').textContent=h.latest&&h.latest.g>0&&gasAge!=null?`Last valid gas: ${h.latest.g.toFixed(2)} kΩ · ${(gasAge/1000).toFixed(0)} s ago`:'No valid gas sample';
+ const battery=el(id,'battery');
+ if(h.usb_power===true)battery.textContent=Number.isFinite(h.battery_last_percent)?`BAT USB · last ${Math.round(h.battery_last_percent)}%`:'BAT USB';
+ else if(h.battery_measurement_valid===true&&Number.isFinite(h.battery_mv)){
+   const pct=Number.isFinite(h.battery_percent)?` · ${Math.round(h.battery_percent)}%`:'';
+   battery.textContent=`BAT ${(h.battery_mv/1000).toFixed(2)} V${pct}`;
+ } else battery.textContent='BAT --';
+ const cal=h.battery_calibration_state||'상태 정보 없음',min=Number.isFinite(h.battery_min_mv)?(h.battery_min_mv/1000).toFixed(2)+' V':'--',max=Number.isFinite(h.battery_max_mv)?(h.battery_max_mv/1000).toFixed(2)+' V':'--';
+ battery.title=h.usb_power===true&&Number.isFinite(h.battery_last_percent)?
+   `USB 연결 중에는 현재 배터리 전압을 측정할 수 없습니다. ${Math.round(h.battery_last_percent)}%는 마지막 배터리 단독 추정치입니다.`:
+   `잔량은 전압 기반 추정치 · 보정 ${cal} · 관측 ${min}–${max}`;
+ const r=d.recording,active=r.state==='RECORDING',stopped=r.state==='STOPPED',sessionId=active?r.session_id:r.download_session_id,label=active?r.experiment_label:r.download_experiment_label,startedAt=active?r.started_at:r.download_started_at;
+ el(id,'recording').textContent=active?'실험 기록 중':stopped?'실험 종료됨':'실험 상태 확인 불가';
+ el(id,'sessionName').textContent=label||'실험 기록 없음';el(id,'sessionDate').textContent=startedAt?'실험 시작: '+koreanDateTime(startedAt):'';
+ const details=el(id,'sessionDetails');details.hidden=!sessionId;el(id,'sessionId').textContent=sessionId||'';
+ const updating=h.ota_state==='UPDATING'||h.ota_state==='VERIFYING',recordingKnown=r.state==='RECORDING'||r.state==='STOPPED';
+ el(id,'start').disabled=!recordingKnown||r.state==='RECORDING'||updating;el(id,'stop').disabled=!recordingKnown||r.state!=='RECORDING';
+ panels.get(id).sessionId=r.download_session_id;const link=el(id,'sessionCsv');link.hidden=!r.download_session_id;
+ link.textContent=r.download_kind==='CURRENT'?'현재 실험 데이터 다운로드 (CSV)':'최근 실험 데이터 다운로드 (CSV)';csvLinks(id);
+ const seen=h.server_seen_at?new Date(h.server_seen_at).toLocaleString():'unknown',ackAge=h.gateway_uptime_ms&&h.last_ack_ms?((h.gateway_uptime_ms-h.last_ack_ms)/1000).toFixed(1)+' s at last contact':'unknown';
+ el(id,'firmware').textContent='Version: '+(h.firmware_version||'unknown');
+ el(id,'ota').textContent='OTA: '+(h.ota_state||'unknown');
+ const remote=d.remote_update||{state:'IDLE'};
+ const contactFresh=Number.isFinite(h.server_seen_at)&&d.server_time-h.server_seen_at<90000;
+ el(id,'remotePrereq').textContent=!contactFresh?'장치의 최근 클라우드 응답이 없어 원격 명령을 보낼 수 없습니다.':
+  h.remote_capable!==true?'이 게이트웨이의 원격 수신기 또는 장치 키·HTTPS 저장소 설정이 확인되지 않았습니다. 최초 설정은 같은 LAN의 관리 페이지에서 수행합니다.':
+  !remote.authenticated?'장치와 클라우드의 원격 명령 키가 일치하는 인증된 heartbeat를 기다리는 중입니다.':
+  !stopped?'실험을 종료하고 기존 미전송 데이터를 비운 뒤 업데이트할 수 있습니다.':'원격 인증 완료. 릴리스 목록을 불러와 대상과 버전을 확인하세요.';
+ const remoteStates={IDLE:'대기',QUEUED:'명령 전달 대기',RECEIVED:'장치가 명령을 받음',PREPARING:'기존 데이터 전송 대기',DOWNLOADING:'HTTPS 다운로드',VERIFYING:'이미지/부팅 확인',UPDATING:'펌웨어 기록/DFU 전송',RECONNECTING:'센서 재연결·버전·측정 확인',SUCCESS:'업데이트 검증 성공',FAILED:'업데이트 실패',UNCONFIRMED:'장치 결과 미확인'};
+ el(id,'remoteState').textContent=(!remote.authenticated?'인증된 장치 응답 대기 · ':'')+(remoteStates[remote.state]||remote.state)+(remote.version?' · '+remote.kind+' '+remote.version:'')+(remote.error?' · '+remoteErrorMessage(remote.error):'')+(remote.updated_at?' · 마지막 보고 '+new Date(remote.updated_at).toLocaleString():'');
+ el(id,'remoteHistory').textContent=(remote.history||[]).map(x=>x.kind+' '+x.version+' · '+x.state+(x.error?' · '+x.error:'')).join('\n')||'이전 결과 없음';
+ if(remote.peer)el(id,'remoteState').textContent+=' · ESP '+remote.peer.firmware+' / '+remote.peer.build+' · nRF '+(remote.peer.sensor_version||'확인 불가');
+ el(id,'remoteProgress').value=remote.percent||0;
+ el(id,'remoteStart').disabled=!stopped||!contactFresh||h.remote_capable!==true||remote.reserved||!remoteCatalog.has(id)||!remote.authenticated;
+ if(remote.reserved)el(id,'start').disabled=true;
+  const espOtaLink=el(id,'espOtaLink'),nrfDfuLink=el(id,'nrfDfuLink'),statusLink=el(id,'nrfDfuStatusLink');const ip=privateLanIp(h.local_ip);
+  espOtaLink.hidden=nrfDfuLink.hidden=statusLink.hidden=!ip;if(ip){const local='http:'+'/'+'/'+h.local_ip+':8080';espOtaLink.href=local+'/';nrfDfuLink.href=local+'/nrf-dfu';statusLink.href=local+'/nrf-dfu/status';}
+ el(id,'localLinkStatus').textContent=!ip?'클라우드에서 장치 IP를 확인할 수 없습니다. 같은 LAN에서 장치의 현재 IP를 아래에 입력하세요.':
+  contactFresh?'현장 복구는 같은 LAN에서만 접속됩니다.':'마지막 보고된 로컬 주소입니다. 공유기가 바뀌었다면 현재 주소와 다를 수 있습니다.';
+  espOtaLink.title=nrfDfuLink.title=statusLink.title=contactFresh?'같은 LAN에서만 열립니다.':'마지막 보고된 로컬 IP입니다. 현재 주소가 바뀌었을 수 있습니다.';
+ el(id,'transport').textContent=`Wi-Fi: ${h.wifi_connected_ms?'connected at gateway uptime '+Math.round(h.wifi_connected_ms/1000)+' s':'unknown'} · BLE: ${h.ble_connected===true?'connected':h.ble_connected===false?'disconnected':'unknown'} · cloud ACK age: ${ackAge} · last cloud contact: ${seen}`;
+ el(id,'health').textContent=JSON.stringify(h,null,2);}
+function remoteErrorMessage(code){const reasons={
+ LOCAL_UPDATE_BUSY:'다른 업데이트 또는 로컬 안전 조건 확인 필요',TARGET_NOT_PAIRED:'명시적으로 페어링한 센서가 아님',PREPARATION_STOPPED:'준비가 중단됨: STOPPED·클라우드·Wi-Fi·spool 확인',COMMAND_EXPIRED:'명령 유효 시간 만료',CLOUD_STOPPED_UNCONFIRMED:'클라우드에서 실험 종료 상태를 확인하지 못함',SPOOL_RESERVE_SPACE:'spool 보호 공간을 제외한 저장 공간 부족',DOWNLOAD_AUTH:'파일 저장소 인증 실패',DOWNLOAD_NOT_FOUND:'저장소에서 파일을 찾을 수 없음',DOWNLOAD_TLS_OR_CONNECT:'저장소 연결 또는 TLS 인증서 확인 실패',DOWNLOAD_REDIRECT_REJECTED:'저장소의 리다이렉트 거부',HTTP_RANGE_OR_SIZE:'다운로드 범위 또는 파일 크기 불일치',DOWNLOAD_INTERRUPTED:'다운로드 연결 중단',DOWNLOAD_TIMEOUT:'다운로드 시간 초과',DOWNLOAD_OFFLINE:'Wi-Fi 연결 끊김',IMAGE_HASH:'파일 SHA-256 불일치',MANIFEST_HASH:'manifest SHA-256 불일치',SIGNED_MANIFEST_REJECTED:'서명·버전·manifest 검증 거부',OTA_WRITE:'OTA 슬롯 쓰기 실패',PACKAGE_WRITE:'DFU 임시 파일 쓰기 실패',IMAGE_COMMIT:'이미지 검증 또는 부팅 슬롯 선택 실패',DFU_PACKAGE_INVALID:'Legacy DFU ZIP 호환성 검증 실패',DFU_START_BLOCKED:'DFU 시작 안전 조건 불충족',DFU_FAILED:'BLE DFU 전송 실패',DFU_VERSION_MISMATCH:'재연결된 센서의 대상/버전 불일치',VERSION_MISMATCH:'장치가 보고한 설치 버전 불일치',BOOT_INTERRUPTED:'업데이트 중 재부팅 또는 기존 슬롯으로 복구됨',NVS_WRITE:'명령 실행 기록 저장 실패',UPDATE_TIMEOUT:'업데이트 전체 시간 초과',WAIT_SENSOR:'페어링된 센서 재연결 대기',PAIRED_SENSOR_UNAVAILABLE:'센서 재연결 시간 초과',REMOTE_STATE_UNAVAILABLE:'클라우드 업데이트 상태 조회 실패'};return (reasons[code]||code)+(reasons[code]?' ('+code+')':'');}
+function loadRemoteCatalog(id){
+ const token=document.getElementById('remoteToken').value;
+ el(id,'remoteMessage').textContent='패키지 목록 확인 중';
+ google.script.run.withSuccessHandler(list=>{
+  remoteCatalog.set(id,list);const select=el(id,'remoteRelease');select.innerHTML='';
+  for(const item of list){const option=document.createElement('option');option.value=item.id;option.textContent=item.kind+' · '+item.version+' · '+item.bytes+' bytes'+(item.remote_capable===false?' · 원격 미지원 대상':'');select.appendChild(option);}
+  el(id,'remoteMessage').textContent=list.length?'패키지를 선택한 뒤 업데이트를 승인하세요.':'등록된 원격 패키지가 없습니다.';pollDevice(id);
+ }).withFailureHandler(e=>{el(id,'remoteMessage').textContent=String(e.message||e);}).getRemoteUpdateCatalog(token);
+}
+function approveRemoteUpdate(id){
+ const release=(remoteCatalog.get(id)||[]).find(x=>x.id===el(id,'remoteRelease').value);if(!release)return;
+ const rollback=el(id,'remoteRollback').checked;
+ if(!confirm('장치 '+id+'\n'+release.kind+' '+release.version+' / build '+release.build+'\nSHA-256: '+release.sha256+'\n측정이 일시 중지됩니다. '+(rollback?'이전 ESP32 버전 복구도 승인합니다. ':'')+(release.remote_capable===false?'이 대상은 설치 후 원격 제어/결과 보고가 불가능할 수 있습니다. ':'')+'업데이트를 승인하시겠습니까?'))return;
+ const bytes=crypto.getRandomValues(new Uint8Array(16)),approval=Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');
+ el(id,'remoteStart').disabled=true;
+ google.script.run.withSuccessHandler(()=>{el(id,'remoteMessage').textContent='명령을 예약했습니다. 다운로드 완료만으로 성공 처리하지 않습니다.';pollDevice(id);})
+  .withFailureHandler(e=>{el(id,'remoteMessage').textContent=String(e.message||e);pollDevice(id);})
+  .queueRemoteUpdate(id,release.id,rollback,approval,Date.now(),document.getElementById('remoteToken').value);
+}
+function pollDevice(id){if(polling.has(id)||Date.now()<(pollFailures.get(id)?.at||0))return;polling.add(id);google.script.run.withSuccessHandler(d=>{polling.delete(id);pollFailures.delete(id);if(panels.has(id))show(id,d);}).withFailureHandler(e=>{polling.delete(id);const n=(pollFailures.get(id)?.n||0)+1;pollFailures.set(id,{n,at:Date.now()+Math.min(60000,5000*2**Math.min(n,4))});if(panels.has(id)){el(id,'state').textContent='CLOUD/UPLOAD ERROR (dashboard request)';el(id,'message').textContent=String(e.message||e);el(id,'message').className='error';}}).getDashboard(id);}
+function poll(){if(deviceListBusy||Date.now()<listRetryAt)return;deviceListBusy=true;
+ const fail=e=>{deviceListBusy=false;listFailures++;listRetryAt=Date.now()+Math.min(60000,5000*2**Math.min(listFailures,4));deviceError('CLOUD ERROR: '+String(e&&e.message||e));};
+  try{google.script.run.withSuccessHandler(list=>{deviceListBusy=false;listFailures=0;listRetryAt=0;
+   try{renderDevices(list);}catch(e){deviceError('장치 화면 초기화 오류: '+String(e&&e.message||e));}
+  }).withFailureHandler(fail).getDashboardDevices();}catch(e){fail(e);}}
+function control(id,start){const runner=google.script.run.withSuccessHandler(()=>{el(id,'message').textContent=start?'새 실험을 시작했습니다.':'실험을 종료했습니다.';el(id,'message').className='';pollDevice(id);}).withFailureHandler(e=>{el(id,'message').textContent=String(e.message||e);el(id,'message').className='error';});
+ if(start)runner.startRecording(el(id,'label').value,id);else runner.stopRecording(id);}
+function storageControl(id,start){const message=el(id,'storageMessage'),storage=panels.get(id)?.storage||{};
+ if(start){
+  const name=el(id,'containerName').value.trim()||storage.container_name||'';
+  const food=el(id,'storageFood').value||storage.food_label||'';
+  const entered=el(id,'storagePlaced').value;
+  const placed=entered?Date.parse(entered):Number.isFinite(storage.placed_at)?storage.placed_at:Date.now();
+  if(!name||!food||!Number.isFinite(placed)){message.textContent='용기 이름·음식 종류·투입 시각을 확인하세요.';return;}
+  const existing=storage.state==='ACTIVE'||storage.state==='PENDING';
+  if(!existing&&!confirm('장치 '+id+'의 새 음식 보관을 시작할까요? 기존 실험 기록은 변경하지 않습니다.')){message.textContent='취소됨';return;}
+  message.textContent='보관 정보 저장 중…';
+  const runner=google.script.run.withSuccessHandler(()=>{message.textContent=existing?'음식과 실제 투입 시각을 저장했습니다. 기존 보관·AI 기준선은 유지됩니다.':'보관을 요청했습니다. 첫 유효 환경 측정을 기다립니다.';pollDevice(id);
+    if(placed<Date.now()-600000){message.textContent+=' 저장된 과거 GAS 기록을 확인 중입니다…';
+      google.script.run.withSuccessHandler(result=>{message.textContent='보관 설정 완료 · 과거 완성 GAS '+result.complete_scans+'개 확인 ('+result.status+').';loadFoodReview(id,true);})
+        .withFailureHandler(e=>{message.textContent='보관 설정은 저장됐지만 과거 GAS 조회 실패: '+String(e.message||e);}).getStorageGasBackfill(id);}
+    else loadFoodReview(id,true);})
+   .withFailureHandler(e=>{message.textContent=String(e.message||e);message.className='error';});
+  if(existing)runner.updateStorageDetails(id,name,food,placed);
+  else runner.startStorageSession(name,id,food,placed);
+  return;
+ }
+ message.textContent='처리 중…';
+ google.script.run.withSuccessHandler(()=>{message.textContent='보관을 종료했습니다.';pollDevice(id);})
+  .withFailureHandler(e=>{message.textContent=String(e.message||e);message.className='error';}).endStorageSession(id);}
+function foodUnavailable(id,reason,loading=false){el(id,'foodCard').className='food-status unknown';el(id,'foodIcon').textContent='⚪';el(id,'foodTitle').textContent='보관 조건 확인 중';el(id,'foodName').textContent='음식 정보 확인 중';el(id,'foodAiCandidate').textContent='확인 불가';el(id,'foodAiCandidateDetail').textContent=loading?'최근 추론 확인 중':'조회 실패 · 이전 후보는 현재 결과로 표시하지 않습니다.';for(const key of ['foodTime','foodTemp','foodHumidity','foodLastData','foodGasTime','foodCloudTime'])el(id,key).textContent='--';el(id,'foodRiskScore').textContent='온도 이력 확인 중';el(id,'foodRiskReason').textContent='자료 조회 대기';el(id,'foodRiskParts').textContent='';el(id,'foodTempWarning').textContent='';el(id,'foodGasChange').textContent='GAS 변화 분석: 확인 중';el(id,'foodEdge').textContent='ESP 음식 추정: 확인 중';el(id,'foodAnomaly').className='food-signal';el(id,'foodAnomaly').textContent='⚪ 가스 변화 신호 확인 중';el(id,'foodAiPanel').hidden=true;el(id,'foodAiState').textContent='';el(id,'foodAiReason').textContent='자료 조회 대기';el(id,'foodMeasure').textContent=loading?'환경 측정 확인 중':'환경 조회 실패';el(id,'foodMeasure').className='food-measure'+(loading?' stale':' error');el(id,'foodGasState').textContent=loading?'GAS 측정 확인 중':'GAS 조회 실패';el(id,'foodGasState').className='food-measure'+(loading?' stale':' error');el(id,'foodReason').textContent=reason;el(id,'foodJudged').textContent='AI 현재 판정: 보류';el(id,'foodConfidence').textContent='신뢰도: 확인할 수 없음';el(id,'foodModelEvidence').textContent='자료 조회 대기';}
+// The cutoffs describe reference GAS change, not learned spoilage or safety labels.
+function foodGasSignal(d,h,now){
+ const a=h.gas_anomaly,s=d.storage_session||{};
+ if(!d.live||s.state!=='ACTIVE'||!a||a.storage_session_id!==s.storage_session_id||
+    a.sensor_id!==s.sensor_id||a.sensor_id!==h.sensor_id||!Number.isFinite(h.server_seen_at)||
+    now-h.server_seen_at>90000||h.ble_connected!==true||!Number.isFinite(d.storage_started_at))
+   return {tone:'',text:'⚪ 가스 변화 신호 확인 대기 · 현재 보관 세션의 최근 측정이 필요합니다.'};
+ if(a.status==='BASELINE_PENDING')return {tone:'',text:'⚪ 초기 가스 기준 수집 '+a.baseline_scans+'/6'};
+ if(a.status!=='EXPERIMENTAL_INDEX'||!Number.isFinite(a.index)||!Number.isFinite(a.inferred_at)||
+    a.inferred_at<d.storage_started_at||a.inferred_at>now+5000||now-a.inferred_at>1200000)
+   return {tone:'',text:'⚪ 최근 가스 변화 결과 없음 · 다음 완성 스캔을 기다립니다.'};
+ const level=a.index>=4.20?'high':a.index>=1.12?'watch':'';
+ const label=level==='high'?'🔴 가스 패턴 큰 변화':level==='watch'?'🟡 가스 패턴 변화 관찰':'⚪ 가스 패턴 변화 작음';
+  return {tone:level,text:label+' · 지표 '+a.index.toFixed(2)+' · '+koreanDateTime(a.inferred_at)};
+}
+function loadFoodReview(id,force){
+ const previous=foodReviewPoll.get(id)||{at:0,busy:false};if(previous.busy){if(force)foodUnavailable(id,'선택한 실험을 확인하고 있습니다.',true);return;}
+ if(!force&&Date.now()-previous.at<60000)return;
+ foodReviewPoll.set(id,{at:Date.now(),busy:true});foodUnavailable(id,'새 측정 자료를 확인하고 있습니다.',true);
+ const selected=el(id,'foodSession').value;
+ const failure=e=>{foodReviewPoll.set(id,{at:Date.now(),busy:false});if(!panels.has(id))return;
+  if(el(id,'foodSession').value!==selected){loadFoodReview(id,true);return;}
+  foodUnavailable(id,'자료를 받지 못했습니다. '+String(e&&e.message||e));};
+ try{google.script.run.withSuccessHandler(d=>{foodReviewPoll.set(id,{at:Date.now(),busy:false});if(!panels.has(id))return;
+  if(el(id,'foodSession').value!==selected){loadFoodReview(id,true);return;}
+  try{const select=el(id,'foodSession');select.innerHTML='';
+  const current=document.createElement('option');current.value='';current.textContent='현재 보관 음식';select.appendChild(current);
+  for(const s of d.choices||[]){const option=document.createElement('option');option.value=s.id;option.textContent=s.label+(s.stopped_at?' · 종료':' · 기록 중');select.appendChild(option);}
+  select.value=selected;
+   const r=d.decision||{code:'UNKNOWN',title:'판정 불가',icon:'⚪',tone:'unknown',reasons:['판정 엔진을 확인해 주세요.']};
+   const risk=d.storage_risk||{},progress=d.progress||null;
+   const progressReasons={PROGRESS_RUNTIME_MISSING:'보관 진행 모델 실행 파일이 운영 Apps Script에 없습니다.',
+     PROGRESS_MODEL_MISSING:'보관 진행 모델 계수 파일이 운영 Apps Script에 없습니다.',
+     NO_CURRENT_STORAGE_OR_RECORDING:'현재 보관 세션을 확인할 수 없습니다.',
+     FOOD_TYPE_NOT_SET:'보관 음식 종류를 선택해 저장하세요.',PLACEMENT_TIME_UNKNOWN:'실제 음식 투입 시각을 저장하세요.',
+     CLOUD_CONTACT_STALE:'최근 장치 연락이 없어 현재 진행을 표시하지 않습니다.',
+     PROGRESS_INPUT_UNAVAILABLE:'보관 진행 입력을 확인해 주세요.'};
+   const progressMissing=progressReasons[d.progress_unavailable]||'현재 보관 진행 추정 없음';
+   const stages={EARLY:['신선 단계 추정','🟢','fresh'],MIDDLE:['소비 우선 권장','🟡','suspect'],LATE:['변질 징후 추정','🔴','signs']};
+   const stage=progress&&stages[progress.display_code||progress.code];
+   const condition=stage?stage[0]:'음식 보관 중';
+   el(id,'foodCard').className='food-status '+(stage?stage[2]:'unknown');
+   el(id,'foodIcon').textContent=stage?stage[1]:'⚪';el(id,'foodTitle').textContent=condition;
+  el(id,'foodName').textContent=(d.food_name||'음식 확인 필요')+' · '+(d.food_source||'미확인');
+   el(id,'foodReason').textContent=stage&&(progress.display_code||progress.code)==='LATE'?
+     '음식 종류와 보관 경과를 기준으로 소비 전 상태 확인을 권합니다.':
+     stage?progress.reason:'현재 보관 시간과 측정값을 계속 갱신하고 있습니다.';
+   el(id,'foodRiskScore').textContent=Number.isFinite(risk.score)?risk.score+' / 100':
+     Number.isFinite(risk.temperature_score)?'온도 노출 '+risk.temperature_score+' / 100':'온도 이력 확인 중';
+   el(id,'foodRiskReason').textContent=Number.isFinite(risk.score)?'보관 시간과 관측 온도를 반영했습니다.':
+     Number.isFinite(risk.over_4c_h)?'관측된 4°C 초과 '+risk.over_4c_h.toFixed(1)+'시간 · 확인 가능한 온도 결과입니다.':
+     '온도 기록을 확인하고 있습니다.';
+   el(id,'foodRiskParts').textContent='보관기간 '+(Number.isFinite(risk.period_score)?risk.period_score:'미평가')+' · 온도노출 '+(Number.isFinite(risk.temperature_score)?risk.temperature_score:'미평가')+' · 관측 '+(Number.isFinite(risk.observed_h)?risk.observed_h.toFixed(1):'--')+'시간 / 4°C 초과 '+(Number.isFinite(risk.over_4c_h)?risk.over_4c_h.toFixed(1):'--')+'시간'+
+     (risk.history_source?' · 과거 ENV '+risk.history_source.older_env_rows+'건 / 현재 보관 ENV '+risk.history_source.sto_env_rows+'건 · 일치 실험 '+risk.history_source.matching_experiments+'개':'')+
+     (Number.isFinite(risk.coverage)?' · 관측률 '+(risk.coverage*100).toFixed(0)+'%':'');
+  el(id,'foodTempWarning').textContent=risk.temperature_warning||risk.temperature_note||'';
+   el(id,'foodAiPanel').hidden=!stage;
+   el(id,'foodAiState').textContent=stage?stage[0]:'';
+   el(id,'foodAiReason').textContent=stage?progress.reason+
+     (Number.isFinite(progress.display_ratio)?' · 보관 경과 '+Math.min(100,Math.round(progress.display_ratio*100))+'%':''):'';
+  el(id,'foodTime').textContent=Number.isFinite(d.elapsed_ms)?(d.elapsed_ms/3600000).toFixed(1)+'시간':'--';
+  const h=d.health||{},env=h.environment||{},seen=h.server_seen_at,age=Number.isFinite(env.age_ms)&&Number.isFinite(seen)?env.age_ms+Date.now()-seen:null;
+  const connected=Number.isFinite(seen)&&Date.now()-seen<90000&&h.ble_connected===true;
+  const fresh=connected&&age!==null&&age>=0&&age<=300000&&Number.isFinite(env.t)&&Number.isFinite(env.h);
+  el(id,'foodTemp').textContent=fresh?env.t.toFixed(1)+' °C':'--';el(id,'foodHumidity').textContent=fresh?env.h.toFixed(1)+' %':'--';
+  el(id,'foodLastData').textContent=age!==null&&age>=0?koreanDateTime(seen-env.age_ms):'확인 불가';
+  el(id,'foodCloudTime').textContent=Number.isFinite(seen)?koreanDateTime(seen):'확인 불가';
+  const gas=d.gas_status||{code:'NO_COMPLETE_SCAN',text:'완성 GAS 측정 대기',at:null};
+  el(id,'foodGasTime').textContent=Number.isFinite(gas.at)?koreanDateTime(gas.at)+' · '+((Date.now()-gas.at)/60000).toFixed(1)+'분 전':'확인 불가';
+  el(id,'foodGasState').textContent=gas.text;
+   const change=d.gas_change,history=d.historical_gas;
+   el(id,'foodGasChange').textContent=(change&&Number.isFinite(change.index)?'GAS 변화 분석(실험 지표): 초기 대비 '+change.index.toFixed(3)+(Number.isFinite(change.delta)?' · 직전 대비 '+(change.delta>=0?'+':'')+change.delta.toFixed(3):'')+(Number.isFinite(change.at)?' · '+koreanDateTime(change.at)+' 측정':''):'GAS 변화 분석: 유효한 점수 기록 없음')+
+     (history?' · 지정 투입 시각 이후 저장된 '+history.complete_scans+'개 완성 스캔: 초기 대비 '+history.index.toFixed(3)+' · 마지막 '+koreanDateTime(history.at):
+       d.gas_history_status==='BASELINE_PENDING'?' · 과거 완성 GAS '+d.gas_history_scans+'개 · 초기 기준 수집 중':
+       d.gas_history_status==='NO_STORED_GAS'?' · 해당 투입 구간에 저장된 GAS 없음':'')+
+     (d.gas_history_limited?' · 투입 시각까지의 과거 GAS 조회 범위 부족':'');
+   const edge=h.food_ai,names={banana:'바나나',chicken:'닭가슴살',egg:'삶은계란',rice:'밥',sprouts:'숙주나물',tofu:'두부'};
+   const candidateCurrent=d.live===true&&connected&&edge&&edge.sensor_id===h.sensor_id&&
+     Number.isFinite(edge.inferred_at)&&edge.inferred_at<=Date.now()+5000&&Date.now()-edge.inferred_at<=1200000&&
+     (!Number.isFinite(d.storage_started_at)||edge.inferred_at>=d.storage_started_at);
+   const candidateValid=candidateCurrent&&['EXPERIMENTAL_ONLY','ABSTAIN_ONE_EXPOSURE'].includes(edge.status)&&names[edge.candidate];
+   el(id,'foodAiCandidate').textContent=candidateValid?names[edge.candidate]+' (추정)':'최근 추론 결과 없음';
+   el(id,'foodAiCandidateDetail').textContent=candidateValid?
+     'ESP32 최근 GAS 측정 '+koreanDateTime(edge.inferred_at):
+     !d.live?'이전 실험 기록을 보고 있습니다.':!connected?'장치 연결 확인 중':
+     '다음 GAS 완성 측정에서 갱신됩니다.';
+   el(id,'foodEdge').textContent=candidateCurrent?
+    ['EXPERIMENTAL_ONLY','ABSTAIN_ONE_EXPOSURE'].includes(edge.status)&&names[edge.candidate]?
+      'ESP 음식 후보: '+names[edge.candidate]+' (실험 모델 · '+(edge.status==='ABSTAIN_ONE_EXPOSURE'?'독립 검증 부족':'확률 미보정')+' · '+koreanDateTime(edge.inferred_at)+')':
+    'ESP 음식 분류 보류: '+edge.status:'ESP 음식 추정: 최근 검증 가능한 결과 없음';
+   const signal=foodGasSignal(d,h,Date.now());
+   el(id,'foodAnomaly').className='food-signal '+signal.tone;
+   el(id,'foodAnomaly').textContent=signal.text;
+  el(id,'foodGasState').className='food-measure'+(['NORMAL','RECORDING_PENDING'].includes(gas.code)?'':['DISCONNECTED','STALLED','CLOCK_INVALID'].includes(gas.code)?' error':' stale');
+  el(id,'foodMeasure').textContent=fresh?'환경 측정 정상':connected?'환경 측정 갱신 대기':'환경 통신 정체 또는 센서 연결 확인';
+  el(id,'foodMeasure').className='food-measure'+(fresh?'':' stale');
+   el(id,'foodJudged').textContent=stage?'진행 추정 갱신: '+koreanDateTime(progress.at)+' · 근거 '+progress.basis:
+     'AI 마지막 판정: '+(r.judged_at?koreanDateTime(r.judged_at):'없음 (보류)')+(d.scan?' · 마지막 완성 측정 '+koreanDateTime(d.scan.at):'');
+   el(id,'foodConfidence').textContent='시연용 추정 · 자세한 근거는 아래에서 확인';
+   el(id,'foodModelEvidence').textContent=stage?
+     '모델 '+progress.model+' · 사용 '+progress.basis+' · '+progress.label_basis+
+       (progress.display_policy?' · 화면 상태 기준: '+progress.display_policy+' · 모델 원점수 '+progress.index+'/100':'')+
+       (Number.isFinite(progress.groups)&&Number.isFinite(progress.evaluated)?
+         ' · 독립 노출 '+progress.groups+'그룹의 가정 라벨 '+progress.evaluated+'개 평가.':'')+
+       ' 실측 부패 정확도는 측정하지 않았습니다.'+
+       (d.progress_fallback_reason?' · 대체 계산 사유: '+d.progress_fallback_reason:'')+
+       ((risk.reasons||[]).length?' · 보관 기준 상세: '+risk.reasons.join(' · '):'')+
+       (d.gas_history_limited?' · 입력한 투입 시각까지의 GAS 기록은 조회 창 밖에 있습니다.':''):
+     '진행 추정 진단: '+progressMissing+' ('+(d.progress_unavailable||'UNSPECIFIED')+')'+
+       ' · 위험도 계산 사유: '+(risk.reasons||[]).join(' · ');
+  }catch(e){failure(e);}
+ }).withFailureHandler(failure).getFoodReview(id,selected);}catch(e){failure(e);}
+}
+setTimeout(()=>{if(document.getElementById('loading').textContent==='Loading devices…')deviceError('Device lookup is taking longer than expected; check Apps Script execution log and browser console');},20000);
+restoreRemoteToken();setInterval(poll,refreshMs);poll();
+</script></body></html>

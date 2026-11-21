@@ -1,0 +1,11 @@
+--- newer-user-supplied/Dashboard.html
++++ candidate-url-fix/Dashboard.html
+@@ -75,7 +75,7 @@
+ function openLocalIp(ip,status,path){ip=String(ip||'').trim();
+  if(!privateLanIp(ip)){status.textContent='장치에서 확인한 사설 IPv4 주소를 입력하세요.';return;}
+  const route=['/','/remote-config','/nrf-dfu/status'].includes(path)?path:'/';
+- const url='http://'+ip+':8080'+route;
++ const url='http:'+'/'+'/'+ip+':8080'+route;
+  status.textContent='직접 주소: '+url+' · 현재 장치의 IP인지 확인하세요.';
+  window.open(url,'_blank','noopener');}
+ function openManualLocal(id,path){openLocalIp(el(id,'manualLocalIp').value,el(id,'manualLocalStatus'),path);}
